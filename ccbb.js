@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 'use strict';
-// ccbb — a read-only browser and live remote for your Claude Code sessions.
+// ccbb — a browser and live remote for your Claude Code sessions.
 //
 //   ccbb ls [options]         column-adaptive session listing for the terminal
-//   ccbb web [-p port]        clean, read-only web UI (drive live sessions in tmux)
+//   ccbb web [-p port]        clean web UI (drive live sessions in tmux)
 //   ccbb webex                Webex bot front-end (drive a live session from Webex)
 //   ccbb confluence           Confluence page front-end (drive a live session there)
 //
@@ -318,11 +318,11 @@ function runLs(args) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 function topHelp() {
-  console.log(`ccbb — read-only Claude Code session browser + live remote
+  console.log(`ccbb — Claude Code session browser + live remote
 
 Usage:
   ccbb ls [options]        list sessions in the terminal (see: ccbb ls --help)
-  ccbb web [-p port]       start the read-only web UI (default port ${DEFAULT_PORT})
+  ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
   ccbb webex               start the Webex bot front-end
   ccbb confluence          start the Confluence page front-end
 

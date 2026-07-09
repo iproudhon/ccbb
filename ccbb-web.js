@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// ccbb web — a clean, read-only web UI for browsing Claude Code sessions, with an
+// ccbb web — a clean web UI for browsing Claude Code sessions, with an
 // optional live composer that can drive a session running in a local tmux pane.
 //
 // Started via `ccbb web` (see ccbb.js) or directly with `node ccbb-web.js`.
@@ -390,7 +390,7 @@ document.getElementById('out').addEventListener('click', function(e) {
 load();
 `;
 
-// ── Web: session transcript page (read-only) ──────────────────────────────────
+// ── Web: session transcript page ──────────────────────────────────
 
 const SESSION_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1222,7 +1222,7 @@ function runWeb(args) {
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) port = parseInt(args[++i], 10);
     else if (args[i] === '-h' || args[i] === '--help') {
-      console.log(`ccbb web — read-only web UI\n\nUsage: ccbb web [-p port]   (default ${DEFAULT_PORT})`);
+      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port]   (default ${DEFAULT_PORT})`);
       return;
     }
   }
@@ -1301,7 +1301,7 @@ function runWeb(args) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`ccbb (read-only)  http://127.0.0.1:${port}`);
+    console.log(`ccbb http://127.0.0.1:${port}`);
   });
 
   let WS;

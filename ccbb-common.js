@@ -4,7 +4,7 @@
 // It owns everything the front-ends must agree on so they can't drift:
 //   • Pricing — LiteLLM-sourced model prices, refreshed daily.
 //   • Session discovery + per-session usage/cost stats, with a size+mtime cache.
-//   • The read-only transcript/history layer.
+//   • The transcript/history layer.
 //   • tmux pane location + keystroke injection (driving a live session).
 //   • Permission-prompt parsing (the shared bit; each front-end keeps its own
 //     watch/answer loop since those are transport-shaped).
@@ -626,7 +626,7 @@ function injectToPane(pane, text, buffer) {
   tmux(['send-keys', '-t', pane, 'Enter']);
 }
 
-// ── Transcript / history (read-only) ──────────────────────────────────────────
+// ── Transcript / history ──────────────────────────────────────────
 // Reduce a raw JSONL entry to a display entry, or null if it isn't a shown turn.
 function transcriptEntry(d) {
   if ((d.type !== 'user' && d.type !== 'assistant') || !d.message) return null;
