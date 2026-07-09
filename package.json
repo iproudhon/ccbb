@@ -1,0 +1,41 @@
+{
+  "name": "ccbb",
+  "version": "0.1.0",
+  "description": "Read-only browser and live remote for your Claude Code sessions — terminal, web, Webex, and Confluence front-ends.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cli",
+    "tui",
+    "sessions",
+    "cost",
+    "tokens"
+  ],
+  "license": "MIT",
+  "bin": {
+    "ccbb": "ccbb.js"
+  },
+  "main": "ccbb-common.js",
+  "files": [
+    "ccbb.js",
+    "ccbb-common.js",
+    "ccbb-web.js",
+    "ccbb-webex.js",
+    "ccbb-confluence.js",
+    "ccbb-embed.js",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node ccbb.js"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^5.0.1",
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "webex-node-bot-framework": "^2.5.1"
+  }
+}
