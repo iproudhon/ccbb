@@ -12,12 +12,13 @@
 // <script> is inside that fetched HTML but innerHTML-inserted scripts don't execute, so the
 // original watcher keeps running and never spawns a duplicate.
 //
-// The watcher also turns the single root page into a two-view app (like `ccbb web`): the
-// bridge renders either a session LIST or one session's TRANSCRIPT into the body. Because
-// it's one page (no navigation), a session row is an <a href="#ccbb-attach-<id>">; the
-// watcher intercepts that click and POSTs a `/attach <id>` comment same-origin, which the
-// bridge reads and answers by rewriting the body to that session. The comment POST needs
-// the Confluence XSRF header `X-Atlassian-Token: no-check` (verified) but no token/proxy.
+// The watcher also turns the single root page into a stacked-views app (like `ccbb web`):
+// the bridge renders the session LIST plus each attached session's TRANSCRIPT, stacked
+// vertically, into the body. Because it's one page (no navigation), every view control is
+// an <a href="#ccb-<verb>[-<arg>]"> (attach/detach/max/normal/refresh); the watcher
+// intercepts the click and POSTs the matching /command comment same-origin, which the
+// bridge reads and answers by rewriting the body. The comment POST needs the Confluence
+// XSRF header `X-Atlassian-Token: no-check` (verified) but no token/proxy.
 //
 // liveMacro() is exported so the bridge can re-embed the watcher on every body rewrite;
 // running this file directly still embeds it into one page as a CLI.
@@ -74,19 +75,24 @@ function liveJs(pollMs) { return `
   if(!id){document.getElementById('ccbbStat').textContent='no page id';return;}
   // The container Confluence renders the page body into.
   function bodyEl(){return document.getElementById('main-content')||document.querySelector('.wiki-content');}
-  // Session-row click → post "/attach <id>" as a comment; the bridge rewrites the body.
-  // Delegated on document so it survives body innerHTML swaps. href is "#ccbb-attach-<id>".
+  // View-control click → post the matching /command as a comment; the bridge rewrites
+  // the body. Delegated on document so it survives body innerHTML swaps. hrefs are
+  // "#ccb-<verb>[-<arg>]" (single b — the bridge's markup kept the old ccb prefix):
+  //   #ccb-attach-<id> → /attach <id>     #ccb-detach-<id> → /detach <id>
+  //   #ccb-max-<id|list> → /max <id>      #ccb-normal → /normal    #ccb-refresh → /refresh
   document.addEventListener('click',function(ev){
-    var a=ev.target&&ev.target.closest?ev.target.closest('a[href^="#ccbb-attach-"]'):null;
+    var a=ev.target&&ev.target.closest?ev.target.closest('a[href^="#ccb-"]'):null;
     if(!a)return;
     ev.preventDefault();
-    var sid=a.getAttribute('href').slice('#ccbb-attach-'.length);
-    var s=document.getElementById('ccbbStat');if(s)s.textContent='opening '+sid.slice(0,8)+'…';
+    var raw=a.getAttribute('href').slice('#ccb-'.length);
+    var m=raw.match(/^(attach|detach|max)-(.*)$/);
+    var cmd=m?('/'+m[1]+(m[2]?' '+m[2]:'')):('/'+raw);
+    var s=document.getElementById('ccbbStat');if(s)s.textContent=cmd+' …';
     fetch('/rest/api/content',{method:'POST',credentials:'same-origin',
       headers:{'Content-Type':'application/json','Accept':'application/json','X-Atlassian-Token':'no-check'},
-      body:JSON.stringify({type:'comment',container:{id:id,type:'page'},body:{storage:{value:'<p>/attach '+sid+'</p>',representation:'storage'}}})})
-    .then(function(r){if(!r.ok&&s)s.textContent='open failed '+r.status;})
-    .catch(function(e){if(s)s.textContent='open err '+e.message;});
+      body:JSON.stringify({type:'comment',container:{id:id,type:'page'},body:{storage:{value:'<p>'+cmd+'</p>',representation:'storage'}}})})
+    .then(function(r){if(!r.ok&&s)s.textContent=cmd+' failed '+r.status;})
+    .catch(function(e){if(s)s.textContent=cmd+' err '+e.message;});
   });
   // A single Claude turn appends many times (text, tool_use, tool_result…), bumping the
   // version repeatedly. Rather than swap on each bump, we swap once the version has held
@@ -96,9 +102,9 @@ function liveJs(pollMs) { return `
   function now(){return (performance&&performance.now)?performance.now():+new Date();}
   // Scroll handling is container-agnostic: we don't assume the window is the scroller
   // (Confluence may put the scrollbar on an inner wrapper). Instead we act on the LAST
-  // transcript element. Only the session view has a .transcript; the list view doesn't
-  // auto-scroll.
-  function transcript(){return document.querySelector('.ccbb-app .transcript');}
+  // transcript element — with stacked views the bottom-most expanded session is the one
+  // that grows. Only session views have a .transcript; the list view doesn't auto-scroll.
+  function transcript(){var ts=document.querySelectorAll('.ccb-app .transcript');return ts.length?ts[ts.length-1]:null;}
   function isSession(){return !!transcript();}
   function lastTurn(){var t=transcript();return t&&t.lastElementChild;}
   // "Near the bottom" = the last turn's bottom edge is at or just past the viewport

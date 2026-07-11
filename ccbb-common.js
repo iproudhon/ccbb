@@ -759,7 +759,14 @@ function _readNewLines(sessionId) {
 // The permission dialog is drawn only in the terminal — it never reaches the JSONL. The
 // front-ends scrape it from the pane and mirror it. Detection keys on Claude Code's prompt
 // strings; a version bump that rewords them needs these patterns re-tuned.
-const PROMPT_RE = /Do you want to (?:proceed\?|make this edit|create|run|.+\?)/i;
+// Title lines across Claude Code's permission dialogs:
+//   "Do you want to proceed?" / "…make this edit to X?" / "…create X?" / "…run X?"   (built-in tools)
+//   "Would you like to proceed?"                                                      (plan mode)
+//   "<Server> wants to <action>"                    (MCP tools, e.g. "Claude in Chrome wants to open a new browser tab")
+//   "Do you trust the files in this folder?"                                          (workspace trust)
+// Precision comes from parsePrompt, not the regex: a title only counts when a
+// "1. …" option list starts within a few lines below it.
+const PROMPT_RE = /Do you want to .+|Would you like to .+|\bwants to\b .+|Do you trust .+\?/i;
 const OPTION_RE = /^\s*(?:[❯>]\s*)?(\d+)\.\s+(.*\S)\s*$/;   // "  1. Yes"  /  "❯ 2. Yes, and ..."
 
 function capturePane(pane) {
@@ -770,26 +777,66 @@ function capturePane(pane) {
 // Parse a permission box out of a pane capture. Returns { title, options } or null.
 function parsePrompt(text) {
   const lines = String(text || '').split('\n');
-  let titleIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {   // scan bottom-up: newest box wins
-    if (PROMPT_RE.test(lines[i])) { titleIdx = i; break; }
+  for (let t = lines.length - 1; t >= 0; t--) {   // scan bottom-up: newest box wins
+    if (!PROMPT_RE.test(lines[t])) continue;
+    const title = lines[t].replace(/^[\s│|]+/, '').replace(/[\s│|]+$/, '').trim();
+    const options = [];
+    for (let i = t + 1; i < lines.length; i++) {
+      const m = OPTION_RE.exec(lines[i].replace(/[│|]/g, ' '));
+      if (m) options.push({ n: Number(m[1]), label: m[2].replace(/\s+/g, ' ').trim() });
+      else if (!options.length && i - t > 6) break;   // a real dialog lists options right under its title
+      // non-matching lines between/after options are tolerated (wrapped labels, blank rows)
+    }
+    // Need a real choice list starting at 1 — otherwise this title line was ordinary
+    // transcript text (the widened PROMPT_RE matches prose like "X wants to …"), so
+    // keep scanning upward for an actual dialog.
+    if (options.length >= 2 && options[0].n === 1) return { title, options };
   }
-  if (titleIdx === -1) return null;
-  const title = lines[titleIdx].replace(/^[\s│|]+/, '').replace(/[\s│|]+$/, '').trim();
-  const options = [];
-  for (let i = titleIdx + 1; i < lines.length; i++) {
-    const m = OPTION_RE.exec(lines[i].replace(/[│|]/g, ' '));
-    if (m) options.push({ n: Number(m[1]), label: m[2].replace(/\s+/g, ' ').trim() });
-    else if (options.length && !lines[i].trim()) continue;  // tolerate blank lines between options
-  }
-  if (options.length < 2) return null;   // need a real choice list
-  return { title, options };
+  return null;
 }
 
 function promptFingerprint(p) {
   return crypto.createHash('sha1')
     .update(p.title + '|' + p.options.map(o => o.n + o.label).join('|'))
     .digest('hex').slice(0, 12);
+}
+
+// ── AskUserQuestion (shared; each front-end renders + answers its own way) ─────
+// Like the permission box, the question dialog is drawn in the terminal — but unlike it,
+// the questions ride in the JSONL tool_use input, so front-ends render from the
+// transcript (no pane scraping) and answer by injecting the option number.
+function askQuestions(input) {
+  const qs = (input && Array.isArray(input.questions)) ? input.questions : [];
+  return qs.map(q => ({
+    header: String((q && q.header) || ''),
+    question: String((q && q.question) || ''),
+    multiSelect: !!(q && q.multiSelect),
+    options: (Array.isArray(q && q.options) ? q.options : []).map((o, i) => ({
+      n: i + 1,
+      label: typeof o === 'string' ? o : String((o && o.label) || ''),
+      description: (o && o.description) ? String(o.description) : '',
+    })),
+  }));
+}
+
+// Plain-text rendering of an AskUserQuestion input (tool cards, card fallbacks).
+function formatAskText(input) {
+  return askQuestions(input).map(q => {
+    const head = (q.header ? `[${q.header}] ` : '') + q.question + (q.multiSelect ? ' (multi-select)' : '');
+    return head + '\n' + q.options.map(o =>
+      `  ${o.n}. ${o.label}${o.description ? ' — ' + o.description : ''}`).join('\n');
+  }).join('\n\n');
+}
+
+// The AskUserQuestion tool_use whose dialog is open right now, or null. Open means the
+// transcript's LAST entry is the assistant line carrying the tool_use: answering appends
+// its tool_result, and an interrupt appends a user line, so any later entry closes it.
+function openAskEntry(history) {
+  const last = history[history.length - 1];
+  if (!last || last.role !== 'assistant') return null;
+  const arr = (last.message && Array.isArray(last.message.content)) ? last.message.content : [];
+  const asks = arr.filter(b => b.type === 'tool_use' && b.name === 'AskUserQuestion');
+  return asks.length ? asks[asks.length - 1] : null;
 }
 
 // ── Custom "//" commands (shared primitives) ──────────────────────────────────
@@ -1092,6 +1139,8 @@ module.exports = {
   startTail, stopTail,
   // permission parsing
   PROMPT_RE, OPTION_RE, capturePane, parsePrompt, promptFingerprint,
+  // AskUserQuestion
+  askQuestions, formatAskText, openAskEntry,
   // commands + aws
   BUILTIN_COMMANDS, loadCommands, truncTitle, expandRun, looksLikeDiff, langForFile,
   awsWhoami, awsIdText, awsLoginStream,

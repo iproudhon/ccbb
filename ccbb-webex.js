@@ -42,6 +42,7 @@ const {
   CONFIG_FILE, readConfig, findSessionJsonl, getSessionStats,
   listSessions, getSessionHistory, getSessionCwd,
   paneForSession, injectToPane, tmux, capturePane, parsePrompt, promptFingerprint,
+  askQuestions, formatAskText, openAskEntry,
   startTail, stopTail, loadCommands, expandRun, truncTitle, langForFile,
   awsIdText, awsLoginStream, priceForModel,
 } = common;
@@ -109,6 +110,7 @@ function unsubscribe(spaceId) {
       emitted.delete(sessionId);
       sentByBot.delete(sessionId);
       sessionCwd.delete(sessionId);
+      pendingAsks.delete(sessionId);
       stopWatching(sessionId);
       stopPaneWatch(sessionId);
     }
@@ -407,6 +409,88 @@ function sendPermissionCard(sessionId, parsed, rec) {
   }
 }
 
+// ── AskUserQuestion mirroring ───────────────────────────────────────────────────
+// Same idea as the permission card, but the questions ride in the JSONL tool_use, so
+// there's no pane scraping: post an answerable card when the tool call lands in the
+// tail, clear it when its tool_result lands (answered here or at the terminal).
+const pendingAsks = new Map();  // sessionId → { toolUseId, questions, msgIds }
+
+function openAsk(sessionId, block) {
+  const questions = askQuestions(block.input);
+  if (!questions.length) return;
+  const prev = pendingAsks.get(sessionId);
+  if (prev) clearPromptMessages(sessionId, prev);
+  const rec = { toolUseId: block.id, questions, msgIds: [] };
+  pendingAsks.set(sessionId, rec);
+  sendAskCard(sessionId, rec);
+}
+
+// The open question for a session: the live-tracked record, else (asked before this
+// space attached) derived from the transcript.
+function openAskFor(sessionId) {
+  const rec = pendingAsks.get(sessionId);
+  if (rec) return rec;
+  const block = openAskEntry(getSessionHistory(sessionId));
+  return block ? { toolUseId: block.id, questions: askQuestions(block.input), msgIds: [] } : null;
+}
+
+// Render the question(s) as an Adaptive Card. Buttons answer the FIRST question (the one
+// the TUI dialog focuses); with several questions the rest are answered by replying with
+// numbers as the dialog advances.
+function sendAskCard(sessionId, rec) {
+  console.log(`[ask] ${sessionId.slice(0,8)} question: ${rec.questions[0].question}`);
+  flushNow(sessionId);   // land the turn's content above the question card
+  const body = [{ type: 'TextBlock', text: '❓ Claude asks', weight: 'Bolder', size: 'Medium' }];
+  for (const q of rec.questions) {
+    body.push({ type: 'TextBlock', text: (q.header ? `**${q.header}** — ` : '') + q.question + (q.multiSelect ? ' _(multi-select)_' : ''), wrap: true });
+    for (const o of q.options) {
+      body.push({ type: 'TextBlock', text: `${o.n}. ${o.label}${o.description ? ' — ' + o.description : ''}`,
+        wrap: true, isSubtle: true, size: 'Small', spacing: 'None' });
+    }
+  }
+  if (rec.questions.length > 1) {
+    body.push({ type: 'TextBlock', text: '_Buttons answer the first question; reply with numbers for the rest._',
+      wrap: true, isSubtle: true, size: 'Small' });
+  }
+  const actions = rec.questions[0].options.map(o => ({
+    type: 'Action.Submit',
+    title: `${o.n}. ${truncate(o.label, 60)}`,
+    data: { action: 'ask', choice: o.n, sessionId },
+  }));
+  const card = { $schema: 'http://adaptivecards.io/schemas/adaptive-card.json', type: 'AdaptiveCard', version: '1.2', body, actions };
+  const fallback = `❓ **Claude asks**\n` +
+    rec.questions.map(q => `**${q.question}**\n` + q.options.map(o => `${o.n}. ${o.label}`).join('\n')).join('\n\n') +
+    `\n\n_Tap a button or reply with the number._`;
+  const track = id => { if (rec && id) rec.msgIds.push(id); };
+  for (const spaceId of spacesFor(sessionId)) {
+    tx.sendCard(spaceId, card, fallback)
+      .then(track, () => {})
+      .then(() => {   // skip the waiting line if the question was answered mid-post
+        if (pendingAsks.get(sessionId) !== rec) return;
+        return sayToSpace(spaceId, '⌛ _waiting for your answer…_').then(track, () => {});
+      });
+  }
+}
+
+// Answer the open question by injecting the option number, exactly like a permission
+// answer. The card is cleared when the tool_result lands in the JSONL, not here — the
+// dialog may have more questions to go.
+function answerAsk(sessionId, choice) {
+  const p = openAskFor(sessionId);
+  if (!p) return false;
+  if (!p.questions.some(q => q.options.some(o => o.n === choice))) return false;
+  const loc = paneForSession(sessionId);
+  if (!loc) return false;
+  try {
+    withPromptHeight(loc.pane, () => {
+      tmux(['send-keys', '-t', loc.pane, String(choice)]);
+      tmux(['send-keys', '-t', loc.pane, 'Enter']);
+      sleepSync(150);                     // let the keystrokes register before we restore
+    });
+  } catch (e) { console.error('[ask] inject failed:', e.message); return false; }
+  return true;
+}
+
 // Answer the currently-open prompt for a session by injecting the option number.
 // Returns true if a prompt was open and the choice was valid.
 function answerPrompt(sessionId, choice) {
@@ -584,6 +668,11 @@ function emitUserPrompt(sessionId, msg, uuid) {
   const seen = emitted.get(sessionId);
   const key = dedupKey(msg, uuid);
   if (Array.isArray(content) && content.some(b => b.type === 'tool_result')) {
+    const ask = pendingAsks.get(sessionId);
+    if (ask && content.some(b => b.type === 'tool_result' && b.tool_use_id === ask.toolUseId)) {
+      clearPromptMessages(sessionId, ask, '✔️ Answered.');
+      pendingAsks.delete(sessionId);
+    }
     if (seen && key) { if (seen.has(key)) { dbg(`[emit] ${sessionId.slice(0,8)} DUP tool_result key=${key}`); return; } seen.add(key); }
     for (const b of content) {
       if (b.type !== 'tool_result') continue;
@@ -645,7 +734,9 @@ function emitAssistant(sessionId, msg, uuid) {
   if (text) bufferSection(sessionId, { content: text, mono: false });
 
   for (const b of msg.content || []) {
-    if (b.type === 'tool_use') emitToolCall(sessionId, b);
+    if (b.type !== 'tool_use') continue;
+    emitToolCall(sessionId, b);
+    if (b.name === 'AskUserQuestion') openAsk(sessionId, b);
   }
 }
 
@@ -669,6 +760,7 @@ function toolCallArg(name, inp) {
     case 'TodoWrite':   return '(updated task list)';
     case 'WebFetch':    return inp.url || '';
     case 'WebSearch':   return inp.query || '';
+    case 'AskUserQuestion': return formatAskText(inp);
     default:            return JSON.stringify(inp, null, 2);
   }
 }
@@ -720,7 +812,7 @@ const HELP = [
   '`/help` — this help',
   '',
   'Anything else you type is pasted into the attached session and submitted.',
-  'When Claude asks permission, tap a button on the card or reply with the option number.',
+  'When Claude asks permission or a question, tap a button on the card or reply with the option number.',
 ].join('\n');
 
 function fmtCost(v) { return v != null ? '$' + Number(v).toFixed(2) : '$0.00'; }
@@ -733,7 +825,11 @@ async function attachSession(spaceId, id) {
   ensureBridge(id);
   startPaneWatch(id, loc.pane);
   await sayToSpace(spaceId, `🔗 Attached to \`${id.slice(0, 8)}\` (pane \`${loc.pane}\`).`);
-  return syncHistory(spaceId, id).catch(() => {});
+  return syncHistory(spaceId, id).catch(() => {}).then(() => {
+    // A question already open at attach time predates the tail — surface its card now.
+    const blk = openAskEntry(getSessionHistory(id));
+    if (blk && !pendingAsks.has(id)) openAsk(id, blk);
+  });
 }
 
 // Render the /list session picker as an Adaptive Card (+ markdown fallback).
@@ -819,10 +915,14 @@ async function onText(spaceId, text) {
   const sessionId = spaceSession.get(spaceId);
   if (!sessionId) return sayToSpace(spaceId, 'Not attached. Use `/attach ID` first. `/help` for more.');
 
-  // Typed permission answer: a bare number while a prompt is open.
+  // Typed answer: a bare number while a permission prompt or question dialog is open.
   const numMatch = /^\s*(\d+)\s*$/.exec(text);
   if (numMatch && activePrompts.has(sessionId)) {
     const ok = answerPrompt(sessionId, Number(numMatch[1]));
+    return sayToSpace(spaceId, ok ? `✅ Chose option ${numMatch[1]}.` : `⚠️ Not a valid option.`);
+  }
+  if (numMatch && openAskFor(sessionId)) {
+    const ok = answerAsk(sessionId, Number(numMatch[1]));
     return sayToSpace(spaceId, ok ? `✅ Chose option ${numMatch[1]}.` : `⚠️ Not a valid option.`);
   }
 
@@ -843,6 +943,10 @@ async function onAction(spaceId, inputs, who) {
   who = who || 'someone';
   if (inputs.action === 'attach') {
     return attachSession(spaceId, inputs.sessionId).catch(e => sayToSpace(spaceId, `⚠️ ${e.message}`));
+  }
+  if (inputs.action === 'ask') {
+    const ok = answerAsk(inputs.sessionId, Number(inputs.choice));
+    return sayToSession(inputs.sessionId, ok ? `✅ Option ${inputs.choice} chosen by ${who}` : `_(question already answered)_`);
   }
   if (inputs.action !== 'perm') return;
   const { choice, sessionId } = inputs;
@@ -954,6 +1058,8 @@ module.exports = {
   paneForSession, getSessionHistory, runCommand,
   // permission internals (so tests can drive the scraper without a live prompt)
   parsePrompt, checkPrompt, activePrompts, capturePane,
+  // AskUserQuestion internals (confluence renders pending questions; tests drive answers)
+  pendingAsks, openAskFor, answerAsk,
   handleTranscript, collapsibleCard,
   subscribe, unsubscribe, spaceSession, sessionSpaces,
   startWebex, stopWatchers,
