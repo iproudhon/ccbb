@@ -157,6 +157,23 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .view.unseen .unseen-ind{display:inline-flex;align-items:center;background:var(--accent);color:#fff;border-radius:10px;padding:2px 10px;font-size:11px;font-weight:600;flex-shrink:0;animation:pulse 1.2s ease-in-out infinite}
 .view-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 .bar-name{font-weight:600;font-size:13px;color:var(--ink);white-space:nowrap}
+.bar-tab{display:none}
+/* ── horizontal: a traditional tab bar. All view headers sit in one top row (the tabs);
+   their bodies sit in the content row below, column-aligned. Maximizing one view makes
+   its body span the whole content row while the others' bodies hide and their tabs shrink
+   to an abbreviated label. Implemented as a 2-row grid over #views, with each .view
+   flattened via display:contents so its bar and body become direct grid items — the bar
+   auto-places into row 1, the body into row 2, same column. grid-template-columns and the
+   maxed body's column span are set per-relayout in JS. ── */
+#views.horizontal{display:grid;grid-template-rows:auto minmax(0,1fr)}
+#views.horizontal .view{display:contents}
+#views.horizontal .view-bar{grid-row:1;border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+#views.horizontal .view:last-child .view-bar{border-right:none}
+#views.horizontal .view-body{grid-row:2;min-width:0;border-right:1px solid var(--line)}
+#views.horizontal .view:last-child .view-body{border-right:none}
+#views.horizontal .view.collapsed .view-body{display:none}
+#views.horizontal .bar-main{display:none!important}
+#views.horizontal .bar-tab{display:block;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:13px;color:var(--ink)}
 /* ── list view ── */
 .lv{font-family:ui-monospace,'Cascadia Code',Menlo,monospace;font-size:13px;background:#fff}
 .lv .view-body{display:block;overflow-y:auto}
@@ -380,6 +397,19 @@ function toggleTool(hdr) {
 //   { kind:'list'|'session', sessionId?, el, barEl, maxed, unseen, refresh(), destroy?() }
 var views = [];
 var viewsEl = document.getElementById('views');
+var orientation = 'vertical';   // 'vertical' (stacked) or 'horizontal' (columns)
+function toggleOrientation(){
+  orientation = orientation === 'vertical' ? 'horizontal' : 'vertical';
+  viewsEl.classList.toggle('horizontal', orientation === 'horizontal');
+  relayout();
+}
+// A view's side-tab title: full when expanded, first 4 chars + ellipsis when collapsed
+// in horizontal mode (per spec). No-op for the (bar-less) vertical layout, which hides it.
+function applyTab(v){
+  if (!v.barTabEl) return;
+  var collapsed = orientation === 'horizontal' && v.el.classList.contains('collapsed');
+  v.barTabEl.textContent = collapsed ? (v.fullTabText||'').slice(0,4)+'…' : (v.fullTabText||'');
+}
 
 function relayout(){
   var maxed = null;
@@ -392,7 +422,24 @@ function relayout(){
     if (mx) { mx.innerHTML = v.maxed ? '&#10064;' : '&#9633;'; mx.title = v.maxed ? 'Normal (equal heights)' : 'Maximize'; }
     // A view that just became visible while following its bottom counts as seen.
     if (was && !collapsed && v.onExpanded) v.onExpanded();
+    applyTab(v);
+    var ob = v.barEl && v.barEl.querySelector('[data-act="orient"]');
+    if (ob) {
+      ob.innerHTML = orientation === 'horizontal' ? '&#9636;' : '&#9637;';
+      ob.title = orientation === 'horizontal' ? 'Stack vertically' : 'Stack horizontally';
+    }
   });
+  // Horizontal grid sizing: equal columns normally; when one view is maxed its content
+  // spans the whole row and the collapsed tabs shrink to fit their abbreviated labels.
+  if (orientation === 'horizontal') {
+    viewsEl.style.gridTemplateColumns = maxed
+      ? views.map(function(v){ return v === maxed ? '1fr' : 'auto'; }).join(' ')
+      : 'repeat(' + views.length + ',1fr)';
+    views.forEach(function(v){ v.bodyEl.style.gridColumn = (maxed && v === maxed) ? '1 / -1' : ''; });
+  } else {
+    viewsEl.style.gridTemplateColumns = '';
+    views.forEach(function(v){ v.bodyEl.style.gridColumn = ''; });
+  }
 }
 function toggleMax(v){
   if (v.maxed) { v.maxed = false; }
@@ -419,11 +466,17 @@ function makeViewBar(v, barMain, buttons){
   var ind = document.createElement('span');
   ind.className = 'unseen-ind'; ind.textContent = '● new';
   bar.appendChild(ind);
+  barMain.classList.add('bar-main');
   bar.appendChild(barMain);
+  var tab = document.createElement('span');
+  tab.className = 'bar-tab';
+  bar.appendChild(tab);
+  v.barTabEl = tab;
   var btns = document.createElement('div');
   btns.className = 'bar-btns';
   btns.innerHTML = '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
     '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
+    (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
     (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
   bar.appendChild(btns);
   bar.addEventListener('click', function(e){
@@ -432,6 +485,7 @@ function makeViewBar(v, barMain, buttons){
       e.stopPropagation();
       if (b.dataset.act === 'refresh') v.refresh();
       else if (b.dataset.act === 'max') toggleMax(v);
+      else if (b.dataset.act === 'orient') toggleOrientation();
       else if (b.dataset.act === 'close') closeView(v);
       return;
     }
@@ -467,7 +521,8 @@ function createListView(){
   var barMain = document.createElement('span');
   barMain.className = 'bar-name';
   barMain.textContent = 'ccbb — sessions';
-  el.appendChild(makeViewBar(v, barMain, { close:false }));
+  el.appendChild(makeViewBar(v, barMain, { close:false, orient:true }));
+  v.fullTabText = 'Sessions';
   var body = document.createElement('div');
   body.className = 'view-body';
   body.innerHTML =
@@ -479,6 +534,7 @@ function createListView(){
     '<div class="foot" id="foot"></div>';
   el.appendChild(body);
   v.el = el;
+  v.bodyEl = body;
 
   var sessions = [], totals = {}, costSummary = null;
   var sortStack = [{col:'lastActivity', dir:'desc'}];
@@ -706,6 +762,7 @@ function createSessionView(INFO){
     '</div></div>'+
     '<div class="input-hint">Enter to send &nbsp;&#183;&nbsp; Shift+Enter for newline &nbsp;&#183;&nbsp; //help for commands</div></div>';
   el.appendChild(body);
+  v.bodyEl = body;
   var projEl = body.querySelector('.hdr-proj');
   var statsEl = body.querySelector('.hdr-stats');
   var transcript = body.querySelector('.transcript');
@@ -729,6 +786,8 @@ function createSessionView(INFO){
     titleEl.textContent = INFO.title || '(untitled — ' + INFO.sessionId.slice(0,8) + ')';
     titleEl.className = 'hdr-title' + (INFO.title ? '' : ' empty');
     titleEl.title = 'Click to rename';
+    v.fullTabText = INFO.title || INFO.sessionId.slice(0,8);
+    applyTab(v);
   }
   titleEl.addEventListener('click', function(e){
     if (el.classList.contains('collapsed')) return;   // bar handler expands instead
