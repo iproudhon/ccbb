@@ -307,8 +307,8 @@ function computeSessionStats(sessionId, opts) {
   const modelMap = {};
   const providerMap = {};
   const s = { startedAt: null, lastActivity: null, totalTokens: 0, cost: 0, turns: 0,
-    categories, models: [], providers: [], context: null, subTurns: 0, hasUsage: false, title: '' };
-  let lastCtxTs = null, lastCtx = null;
+    categories, models: [], providers: [], context: null, contextMax: null, subTurns: 0, hasUsage: false, title: '' };
+  let lastCtxTs = null, lastCtx = null, maxCtx = null;
   let lastCompactTs = null, lastCompactTokens = 0;
   let aiTitle, customTitle, firstTs = null;
   const seenMsgIds = new Set();
@@ -411,10 +411,15 @@ function computeSessionStats(sessionId, opts) {
             }
           }
         }
+        const ctxTok = inp + cr + cw + out;
         if (!lastCtxTs || (d.timestamp && d.timestamp >= lastCtxTs)) {
           lastCtxTs = d.timestamp || lastCtxTs;
-          const ctxTok = inp + cr + cw + out;
           lastCtx = { tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6, model: d.message.model || null, max: contextMaxFor(d.message.model) };
+        }
+        // Peak context the session ever reached — differs from the current context after a
+        // /compact (which resets it) or when the final turn is smaller than an earlier one.
+        if (!maxCtx || ctxTok > maxCtx.tokens) {
+          maxCtx = { tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6, model: d.message.model || null, max: contextMaxFor(d.message.model) };
         }
       }
     }
@@ -429,6 +434,7 @@ function computeSessionStats(sessionId, opts) {
     };
   }
   s.context = periodFilter ? null : lastCtx;
+  s.contextMax = periodFilter ? null : maxCtx;
   s.models = Object.values(modelMap).sort((a, b) => b.cost - a.cost);
   s.providers = Object.values(providerMap).sort((a, b) => b.cost - a.cost);
   s.title = customTitle !== undefined ? customTitle : (aiTitle || '');
@@ -451,9 +457,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 2 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 3 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 2, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 3, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 function saveStatsCache() {
@@ -928,7 +934,7 @@ function periodView(st, kind, key) {
     cacheWrite: { tokens: 0, cost: 0 }, cacheMiss: { tokens: 0, cost: 0 }, output: { tokens: 0, cost: 0 } };
   return {
     title: st.title, startedAt: st.startedAt, lastActivity: st.lastActivity,
-    hasUsage: st.hasUsage, context: null,
+    hasUsage: st.hasUsage, context: st.context, contextMax: st.contextMax,
     cost: b ? b.cost : 0, totalTokens: b ? b.tokens : 0,
     turns: b ? b.turns : 0, subTurns: b ? b.subTurns : 0,
     categories: b ? b.categories : emptyCats,
@@ -936,9 +942,10 @@ function periodView(st, kind, key) {
   };
 }
 
-// One row per top-level session file. Skips sessions that never had billable usage.
+// One row per top-level session file. Skips sessions with no billable usage in scope
+// (all-time, or the selected period) unless includeEmpty is set.
 // periodFilter (optional) scopes each session's cost/tokens to one day/week/month.
-function getSessions(periodFilter) {
+function getSessions(periodFilter, includeEmpty) {
   maybeRefreshPricing();
   sessionPathIndex(true);
   const live = liveSessionIds();
@@ -952,7 +959,7 @@ function getSessions(periodFilter) {
     const stats = periodFilter
       ? periodView(getSessionStats(sessionId, { mainPath: filePath }), periodFilter.period, periodFilter.key)
       : getSessionStats(sessionId, { mainPath: filePath });
-    if (periodFilter ? !stats.hasUsage : !stats.totalTokens) continue;
+    if (!stats.totalTokens && !includeEmpty) continue;
     const cat = stats.categories;
     const modelBreakdowns = stats.models
       .filter(m => m.tokens > 0)
@@ -971,6 +978,7 @@ function getSessions(periodFilter) {
       turns: stats.turns,
       subTurns: stats.subTurns,
       context: stats.context,
+      contextMax: stats.contextMax,
       inputTokens: cat.input.tokens,
       cacheReadTokens: cat.cacheRead.tokens,
       cacheCreationTokens: cat.cacheWrite.tokens,

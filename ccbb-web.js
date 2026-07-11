@@ -570,12 +570,7 @@ function createListView(){
       return 0;
     });
   }
-  function load() {
-    loadSummary();
-    var sel = body.querySelector('#sumScope');
-    var val = sel ? sel.value : 'all';
-    loadSessions(val && val.indexOf('m:') === 0 ? val.slice(2) : null);
-  }
+  function load() { loadSummary(); }   // loadSummary sets the default scope, then loads the list
   async function loadSessions(month) {
     var out = body.querySelector('#out');
     out.className = 'lmsg'; out.textContent = 'Loading…';
@@ -598,6 +593,11 @@ function createListView(){
       costSummary = d; buildScopeOptions(); renderSummary();
       body.querySelector('#summary').style.display = '';
     } catch(e) { body.querySelector('#summary').style.display = 'none'; }
+    // Drive the list from the selected scope (default: latest month). On summary failure
+    // the selector is empty, so this falls back to the all-time list.
+    var sel = body.querySelector('#sumScope');
+    var val = sel ? sel.value : '';
+    loadSessions(val && val.indexOf('m:') === 0 ? val.slice(2) : null);
   }
   var PROV_LABEL = { bedrock:'Bedrock', anthropic:'Sub' };
   function gsub(s){ return '<span class="c-sub">'+s+'</span>'; }
@@ -608,7 +608,8 @@ function createListView(){
     var opts = ['<option value="all">All time</option>'];
     opts = opts.concat(months.map(function(mk){ return '<option value="m:'+mk+'">'+fmtMonth(mk)+'</option>'; }));
     sel.innerHTML = opts.join('');
-    sel.value = (prev && sel.querySelector('option[value="'+prev+'"]')) ? prev : 'all';
+    sel.value = (prev && sel.querySelector('option[value="'+prev+'"]')) ? prev
+      : (months.length ? 'm:'+months[0] : 'all');
   }
   function onScopeChange() {
     renderSummary();
@@ -669,9 +670,11 @@ function createListView(){
     var titleHtml = s.title
       ? '<a class="ttl-text" href="/session/'+sid+'" title="'+esc(s.title)+'">'+esc(trunc(s.title,44))+'</a>'
       : '<a class="ttl-text empty" href="/session/'+sid+'">(no title)</a>';
-    var ctx = s.context;
+    var ctx = s.context, cmax = s.contextMax;
     var ctxHtml = ctx
-      ? (ctx.postCompact?'~':'')+fmtTokK(ctx.tokens)+'<span class="ctx-tag">'+fc(ctx.cost)+'</span>'
+      ? (ctx.postCompact?'~':'')+fmtTokK(ctx.tokens)
+        +(cmax && fmtTokK(cmax.tokens)!==fmtTokK(ctx.tokens)?'<span class="ctx-tag">'+fmtTokK(cmax.tokens)+'</span>':'')
+        +'<span class="ctx-tag">'+fc(ctx.cost)+'</span>'
       : '—';
     var sub = s.subTurns ? '<span class="ctx-tag">+'+s.subTurns+'</span>' : '';
     return '<tr>'

@@ -81,12 +81,14 @@ const SORT_KEYS = {
 
 const GROUP_ALIAS = { day: 'day', daily: 'day', week: 'week', weekly: 'week', month: 'month', monthly: 'month' };
 function parseLsArgs(args) {
-  const opt = { sort: 'activity', dir: null, reverse: false, all: false, wide: false, limit: 0, group: null };
+  // Default scope is the current month; -a widens to all time. -z keeps empty sessions.
+  const opt = { sort: 'activity', dir: null, reverse: false, includeEmpty: false, wide: false, limit: 0, group: 'month' };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '-s' || a === '--sort') { opt.sort = args[++i]; }
     else if (a === '-r' || a === '--reverse') { opt.reverse = true; }
-    else if (a === '-a' || a === '--all') { opt.all = true; }
+    else if (a === '-a' || a === '--all') { opt.group = null; }
+    else if (a === '-z' || a === '--empty') { opt.includeEmpty = true; }
     else if (a === '-x' || a === '--wide') { opt.wide = true; }
     else if (a === '-n' || a === '--limit') { opt.limit = parseInt(args[++i], 10) || 0; }
     else if (a === '-h' || a === '--help') { opt.help = true; }
@@ -114,21 +116,23 @@ Sorting (default: activity, descending):
   -s, --sort <key>   activity | start | cost | turns | tokens | name
   -r, --reverse      reverse the sort direction
 
-Scope to a period (same list, but each session's cost/tokens count only
-messages in the current day/week/month; idle sessions are dropped):
+Scope (default: this month; each session's cost/tokens count only messages in
+the period; sessions with no usage in scope are dropped):
+  -a, --all          all time (no period scope)
   -d, --daily        only today's usage
   -w, --weekly       only this week's usage (Mon-anchored)
-  -m, --monthly      only this month's usage
+  -m, --monthly      only this month's usage (the default)
   -g, --group <unit> day | week | month   (periods use local time)
 
 Display:
   -x, --wide         force extended columns
-  -a, --all          include zero-cost / empty sessions
+  -z, --empty        include sessions with no usage in scope
   -n, --limit <n>    show only the first n rows
   -h, --help         this help
 
-Columns adapt to terminal width. A wide terminal (or -w) adds turns and the
-current context size / cost (context is omitted in period-scoped views).`);
+Columns adapt to terminal width. A wide terminal (or -x) adds turns and the
+context column: current / largest / would-be cost (largest is shown only when
+it differs). Context is all-time, shown even in period-scoped views.`);
 }
 
 function sortSessions(sessions, opt) {
@@ -251,7 +255,7 @@ function runLs(args) {
     process.exit(1);
   }
   const periodFilter = opt.group ? currentPeriod(opt.group) : null;
-  const { sessions, totals } = getSessions(periodFilter);
+  const { sessions, totals } = getSessions(periodFilter, opt.includeEmpty);
   let rows = sortSessions(sessions, opt);
   if (opt.limit > 0) rows = rows.slice(0, opt.limit);
   if (!rows.length) {
@@ -289,13 +293,18 @@ function runLs(args) {
       get: s => fmtTokK(s.outputTokens || 0), color: c.gray });
     cols.push({ head: 'IN', align: 'r', w: 7,
       get: s => fmtTokK(s.inputTokens || 0), color: c.gray });
-    if (!periodFilter) {
-      cols.push({ head: 'CONTEXT', align: 'r', w: 9,
-        get: s => s.context ? (s.context.postCompact ? '~' : '') + fmtTokK(s.context.tokens) : '—',
-        color: c.yellow });
-      cols.push({ head: 'CTX$', align: 'r', w: 7,
-        get: s => s.context ? fmtCost(s.context.cost) : '—', color: c.green });
-    }
+    // current [/ largest] / would-be cost. Largest is shown only when it differs from
+    // current (after a /compact, or when the last turn was smaller than an earlier peak).
+    // Context is an all-time property of the session, so it shows even in period-scoped views.
+    cols.push({ head: 'CONTEXT', align: 'r', w: 20, color: c.yellow,
+      get: s => {
+        const ctx = s.context;
+        if (!ctx) return '—';
+        const cur = (ctx.postCompact ? '~' : '') + fmtTokK(ctx.tokens);
+        const mx = s.contextMax;
+        const showMax = mx && fmtTokK(mx.tokens) !== fmtTokK(ctx.tokens);
+        return cur + (showMax ? '/' + fmtTokK(mx.tokens) : '') + '/' + fmtCost(ctx.cost);
+      } });
   }
   cols.push({ head: 'ACTIVITY', align: 'l', w: 12,
     get: s => fmtDate(s.lastActivity), color: c.cyan });

@@ -157,7 +157,9 @@ function usageText(sessionId) {
   const models = (st.models || []).filter(m => m.cost >= 0.005);
   const modelStr = models.length ? ' (' + models.map(m => `${prettyModel(m.model)}: ${fmtCost(m.cost)}`).join(' · ') + ')' : '';
   const subStr = st.subTurns > 0 ? ` +${st.subTurns}` : '';
-  const ctxStr = st.context ? `\nctx ${fmtTok(st.context.tokens)} / ${fmtCost(st.context.cost)}` : '';
+  const cmax = st.contextMax;
+  const maxStr = st.context && cmax && fmtTok(cmax.tokens) !== fmtTok(st.context.tokens) ? ` ${fmtTok(cmax.tokens)}` : '';
+  const ctxStr = st.context ? `\nctx ${fmtTok(st.context.tokens)}${maxStr} / ${fmtCost(st.context.cost)}` : '';
   return `**${title}**\n` +
     `**${st.turns}**${subStr} turn${st.turns === 1 ? '' : 's'} · **${fmtCost(st.cost)}**${modelStr} · **${fmtTok(st.totalTokens)}** tok\n` +
     `${cat('cr', 'cacheRead')}  ${cat('cw', 'cacheWrite')}  ${cat('cm', 'cacheMiss')}  ${cat('out', 'output')}  ${cat('in', 'input')}` +
