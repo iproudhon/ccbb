@@ -310,6 +310,16 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .perm-opt:disabled{opacity:.45;cursor:default}
 .perm-opt:disabled:hover{border-color:var(--line);background:var(--surface)}
 .ask-multi{color:var(--ink-faint);font-size:12px}
+.ask-opt.sel{background:var(--accent);border-color:var(--accent);color:#fff}
+.ask-opt.sel:hover{background:var(--accent-hover,#a84f34)}
+.ask-card .ask-q{border-top:none;padding-bottom:6px}
+.ask-custom{padding:0 16px 10px;background:var(--bg-alt)}
+.ask-text{width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;font-family:inherit;background:var(--surface);color:var(--ink)}
+.ask-text:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.ask-foot{justify-content:flex-end;border-top:1px solid var(--line)}
+.ask-submit{background:var(--accent);border:none;color:#fff;padding:7px 18px;border-radius:8px;font-size:13px;font-family:inherit;cursor:pointer;font-weight:600}
+.ask-submit:disabled{opacity:.45;cursor:default}
+.ask-submit:hover:not(:disabled){background:var(--accent-hover,#a84f34)}
 .ask-card .tool-output{padding:0 16px 12px;background:var(--bg-alt)}
 .ask-card .tool-output:empty{display:none}
 .ask-card .tool-output pre{background:var(--code-bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;white-space:pre-wrap;word-break:break-word;margin:0}
@@ -1013,42 +1023,99 @@ function createSessionView(INFO){
     }
     scrollBottom();   // results grow an existing card in place — keep following
   }
+  // A question dialog: each question gets radio-select options plus a "Type something" custom
+  // field; a single question answers on one click, a series collects one pick per question and
+  // sends them together via Submit. The server (answerAsk) turns the picks into pane keystrokes.
   function renderAskCard(block, hist) {
     var id = block.id;
     if (toolEls[id]) return;
+    var qs = (block.input && block.input.questions) || [];
+    // A Submit button is needed for a series, or whenever a question is multi-select (you pick
+    // several then submit). A lone single-select question keeps its one-click answer.
+    var showSubmit = qs.length > 1 || qs.some(function(q){ return q && q.multiSelect; });
+    // per-question state: multiSelect → {choices:[…]}; single → {choice:n} | {text:s} | null
+    var sel = qs.map(function(q){ return (q && q.multiSelect) ? { choices: [] } : null; });
+    function isMulti(qi){ return !!(qs[qi] && qs[qi].multiSelect); }
+
     var card = document.createElement('div');
     card.className = 'perm-card ask-card'+(hist?' hist':''); card.id = 'tool-'+id;
-    var qs = (block.input && block.input.questions) || [];
-    var html = '<div class="perm-hdr">&#10067; Claude asks</div>';
-    qs.forEach(function(q){
-      html += '<div class="perm-body">'+(q.header?'<b>'+esc(q.header)+'</b> &mdash; ':'')+esc(q.question||'')+
-        (q.multiSelect?' <span class="ask-multi">(multi-select)</span>':'')+'</div>';
-      html += '<div class="perm-acts">'+(q.options||[]).map(function(o,i){
+    var html = '<div class="perm-hdr">&#10067; Claude asks'+(qs.length>1?' &middot; '+qs.length+' questions':'')+'</div>';
+    qs.forEach(function(q, qi){
+      var ms = !!(q && q.multiSelect);
+      html += '<div class="perm-body">'+(qs.length>1?'<b>'+(qi+1)+'.</b> ':'')+(q.header?'<b>'+esc(q.header)+'</b> &mdash; ':'')+esc(q.question||'')+
+        (ms?' <span class="ask-multi">(pick any)</span>':'')+'</div>';
+      html += '<div class="perm-acts ask-q">'+(q.options||[]).map(function(o,i){
         var lbl = typeof o==='string' ? o : (o.label||'');
         var desc = (o&&o.description)||'';
-        return '<button class="perm-opt ask-opt" data-n="'+(i+1)+'" title="'+esc(desc)+'">'+(i+1)+'. '+esc(lbl)+'</button>';
+        return '<button class="perm-opt ask-opt" data-qi="'+qi+'" data-n="'+(i+1)+'" title="'+esc(desc)+'">'+(i+1)+'. '+esc(lbl)+'</button>';
       }).join('')+'</div>';
+      if (!ms) html += '<div class="ask-custom"><input class="ask-text" data-qi="'+qi+'" placeholder="Type something…"></div>';
     });
-    html += '<div class="perm-note" id="an-'+id+'">Tap an option or type the number below. Also answerable at the terminal.</div>';
+    html += '<div class="perm-acts ask-foot"><button class="ask-submit"'+(showSubmit?'':' style="display:none"')+' disabled>Submit</button></div>';
+    html += '<div class="perm-note" id="an-'+id+'">'+(showSubmit?'Choose your answer'+(qs.length>1?'s':'')+', then Submit.':'Tap an option, or type a custom answer.')+' Also answerable at the terminal.</div>';
     html += '<div class="tool-output" id="to-'+id+'"></div>';
     card.innerHTML = html;
+
+    var submitBtn = card.querySelector('.ask-submit');
+    function qReady(qi){
+      var s = sel[qi];
+      if (isMulti(qi)) return !!(s && s.choices && s.choices.length);
+      return s != null;
+    }
+    function ready(){ return qs.every(function(_, qi){ return qReady(qi); }); }
+    function refresh(){ if (submitBtn) submitBtn.disabled = !ready(); }
+    function markOpts(qi){
+      var s = sel[qi], ms = isMulti(qi);
+      card.querySelectorAll('.ask-opt[data-qi="'+qi+'"]').forEach(function(b){
+        var n = +b.dataset.n;
+        var on = ms ? !!(s && s.choices && s.choices.indexOf(n) !== -1) : !!(s && s.choice === n);
+        b.classList.toggle('sel', on);
+      });
+    }
+    function doSubmit(){ if (!ready()) return; settleAsk(id); submitAsk(id, sel.slice()); }
     card.querySelectorAll('.ask-opt').forEach(function(b){
-      b.addEventListener('click', function(){ answerAsk(+b.dataset.n); });
+      b.addEventListener('click', function(){
+        var qi = +b.dataset.qi, n = +b.dataset.n;
+        if (isMulti(qi)) {
+          var arr = (sel[qi] && sel[qi].choices) || [];
+          var idx = arr.indexOf(n);
+          if (idx === -1) arr.push(n); else arr.splice(idx, 1);
+          sel[qi] = { choices: arr };
+        } else {
+          sel[qi] = { choice: n };
+          var inp = card.querySelector('.ask-text[data-qi="'+qi+'"]'); if (inp) inp.value = '';
+        }
+        markOpts(qi); refresh();
+        if (!showSubmit) doSubmit();   // lone single-select → one click answers
+      });
     });
+    card.querySelectorAll('.ask-text').forEach(function(inp){
+      inp.addEventListener('input', function(){
+        var qi = +inp.dataset.qi;
+        sel[qi] = inp.value.length ? { text: inp.value } : null;
+        markOpts(qi); refresh();
+      });
+      inp.addEventListener('keydown', function(e){
+        if (e.key === 'Enter') { e.preventDefault(); if (ready()) doSubmit(); }
+      });
+    });
+    if (submitBtn) submitBtn.addEventListener('click', doSubmit);
+
     toolEls[id] = card; askCards[id] = card;
     transcript.appendChild(card);
     scrollBottom();
   }
   function settleAsk(id) {
     var card = askCards[id];
-    card.querySelectorAll('.ask-opt').forEach(function(b){ b.disabled = true; });
+    if (!card) return;
+    card.querySelectorAll('.ask-opt, .ask-text, .ask-submit').forEach(function(b){ b.disabled = true; });
     var note = document.getElementById('an-'+id);
     if (note) note.textContent = 'Answered.';
   }
-  function answerAsk(choice) {
+  function submitAsk(id, answers) {
     qfetch('/api/session/'+INFO.sessionId+'/ask', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ choice: choice })
+      body: JSON.stringify({ answers: answers })
     }).then(function(r){ return r.json(); })
       .then(function(d){ if (!(d&&d.ok)) toast((d&&d.error)||'Answer failed'); })
       .catch(function(e){ toast(String(e)); });
@@ -1188,12 +1255,14 @@ function createSessionView(INFO){
       clearPermission(msg.fp);
     } else if (msg.type==='command') {
       showCmd(msg); noteUpdate();
+    } else if (msg.type==='ask_block') {
+      renderAskCard(msg.block, false); noteUpdate();   // hook-pushed question (dedups by id)
     }
   }
 
-  // — permission prompt (scraped from the tmux pane) —
+  // — permission prompt (from a hook, or scraped from the pane) —
   function showPermission(msg) {
-    clearPermission(msg.fp);
+    clearPermission();   // only ever one prompt at a time — drop any prior card (hook/scrape race)
     var card = document.createElement('div');
     card.className = 'perm-card'; card.id = 'perm-' + msg.fp;
     var opts = (msg.options||[]).map(function(o, i){
@@ -1406,14 +1475,64 @@ function stopWatching(sessionId) {
   stopTail(sessionId);
 }
 
+// ── Claude Code hooks: peek at prompts (structured, replaces the pane scrape) ────
+// When the hook installer has wired settings.json, Claude Code POSTs each interactive
+// prompt to /api/hook the instant it appears — structured, no regex. We turn a
+// PermissionRequest into the same {title, options} permission card the scrape produced, and
+// a PreToolUse(AskUserQuestion) into the same ask card the transcript renders. Answering is
+// unchanged (inject the option digit into the pane). The scrape stays as a fallback: it
+// still SHOWS prompts the hooks don't cover (plan-mode, trust-folder) and CLEARS any card
+// when the dialog vanishes — but it never overrides a card the hook already put up (see
+// checkPrompt), so gating is per-prompt, not per-session.
+
+// Reconstruct the permission dialog's option list from the hook payload. Claude's dialog
+// always leads with the affirmative and ends with "No"; the middle "don't ask again" option
+// exists exactly when the payload offers an allow-rule suggestion. The digit we send is the
+// option's position, so this ordering must match the TUI.
+function buildPermissionPrompt(evt) {
+  const ti = evt.tool_input || {};
+  const detail = ti.command || ti.file_path || ti.path || ti.url || ti.description || '';
+  const title = evt.tool_name + (detail ? ': ' + String(detail) : '');
+  const hasRule = Array.isArray(evt.permission_suggestions) && evt.permission_suggestions.length > 0;
+  const options = hasRule
+    ? [{ n: 1, label: 'Yes' }, { n: 2, label: "Yes, and don't ask again" }, { n: 3, label: 'No' }]
+    : [{ n: 1, label: 'Yes' }, { n: 2, label: 'No' }];
+  return { title, options };
+}
+
+function applyHookEvent(evt) {
+  const sid = evt && evt.session_id;
+  if (!sid) return;
+  // AskUserQuestion → reuse the transcript's ask card; tool_use_id matches the block .id,
+  // so the client's renderAskCard dedups against any inline copy and it self-settles.
+  if (evt.hook_event_name === 'PreToolUse' && evt.tool_name === 'AskUserQuestion') {
+    if (!evt.tool_use_id || !evt.tool_input) return;
+    wsBroadcast(sid, { type: 'ask_block', block: { id: evt.tool_use_id, name: 'AskUserQuestion', input: evt.tool_input } });
+    return;
+  }
+  if (evt.hook_event_name === 'PermissionRequest') {
+    if (evt.tool_name === 'AskUserQuestion') return;   // handled via PreToolUse above
+    const loc = paneForSession(sid);
+    if (!loc) return;   // not drivable here → can't answer, so don't show a dead card
+    const { title, options } = buildPermissionPrompt(evt);
+    const fp = promptFingerprint({ title, options });
+    const prev = activePrompts.get(sid);
+    if (prev && prev.fp === fp) return;
+    if (prev) wsBroadcast(sid, { type: 'permission_clear', fp: prev.fp });
+    activePrompts.set(sid, { fp, title, options, pane: loc.pane, source: 'hook' });
+    wsBroadcast(sid, { type: 'permission', fp, title, options });
+  }
+}
+
 // ── Permission prompt scraping (tmux pane → WebSocket push) ─────────────────────
 // The permission dialog is drawn only in the terminal — it never reaches the JSONL. We
 // stream the pane via `tmux pipe-pane` and watch the log with fs.watch (push, not
 // polling); on output we capture the pane once, detect the box, and broadcast it to the
 // browser as a permission frame. The browser answers by POSTing an option number, which
 // we inject back into the pane.
-const activePrompts = new Map();   // sessionId → { fp, title, options:[{n,label}], pane }
+const activePrompts = new Map();   // sessionId → { fp, title, options:[{n,label}], pane, source }
 const paneWatchers = new Map();    // sessionId → { pane, logPath, watcher, debounce }
+const scrapeDeferred = new Map();  // sessionId → timer: scrape waiting to see if a hook claims it
 
 function watchLogPath(sessionId) {
   return path.join(os.tmpdir(), `ccbb-pane-${sessionId}.log`);
@@ -1424,14 +1543,27 @@ function checkPrompt(sessionId, pane) {
   const parsed = parsePrompt(capturePane(pane));
   const prev = activePrompts.get(sessionId);
   if (!parsed) {
+    // Dialog gone → clear whatever's showing, hook-sourced or scraped (covers a terminal
+    // answer). This is the scrape's job even when hooks put the card up.
+    const t = scrapeDeferred.get(sessionId);
+    if (t) { clearTimeout(t); scrapeDeferred.delete(sessionId); }
     if (prev) { activePrompts.delete(sessionId); wsBroadcast(sessionId, { type: 'permission_clear', fp: prev.fp }); }
     return;
   }
-  const fp = promptFingerprint(parsed);
-  if (prev && prev.fp === fp) return;
-  const rec = { fp, title: parsed.title, options: parsed.options, pane };
-  activePrompts.set(sessionId, rec);
-  wsBroadcast(sessionId, { type: 'permission', fp, title: parsed.title, options: parsed.options });
+  if (prev || scrapeDeferred.has(sessionId)) return;   // a card is up, or we're already waiting
+  // Defer: give an installed hook ~300ms to claim this prompt with richer, structured
+  // content (making the hook primary). If none does — plan-mode / trust-folder prompts the
+  // hook doesn't fire for, or hooks not installed — the scrape shows it as the fallback.
+  const timer = setTimeout(() => {
+    scrapeDeferred.delete(sessionId);
+    if (activePrompts.has(sessionId)) return;   // a hook claimed it
+    const p2 = parsePrompt(capturePane(pane));
+    if (!p2) return;
+    const fp = promptFingerprint(p2);
+    activePrompts.set(sessionId, { fp, title: p2.title, options: p2.options, pane, source: 'scrape' });
+    wsBroadcast(sessionId, { type: 'permission', fp, title: p2.title, options: p2.options });
+  }, 300);
+  scrapeDeferred.set(sessionId, timer);
 }
 
 // Start (or re-point) the pane watcher for a session. Idempotent per pane.
@@ -1459,6 +1591,8 @@ function stopPaneWatch(sessionId) {
   if (!rec) return;
   paneWatchers.delete(sessionId);
   clearTimeout(rec.debounce);
+  const st = scrapeDeferred.get(sessionId);
+  if (st) { clearTimeout(st); scrapeDeferred.delete(sessionId); }
   if (rec.watcher) { try { rec.watcher.close(); } catch {} }
   try { tmux(['pipe-pane', '-t', rec.pane]); } catch {}
   try { fs.unlinkSync(rec.logPath); } catch {}
@@ -1476,6 +1610,57 @@ function answerPrompt(sessionId, choice) {
   } catch (e) { return { error: e.message }; }
   activePrompts.delete(sessionId);
   wsBroadcast(sessionId, { type: 'permission_clear', fp: p.fp });
+  return { ok: true };
+}
+
+// Answer an open AskUserQuestion by driving the pane. `answers` is one entry per question:
+//   { choice:n }    pick one predefined option (single-select)
+//   { choices:[…] } toggle several options (multiSelect question)
+//   { text:"…" }    a custom "Type something" answer
+// Protocol verified against the TUI: a single-select digit picks + auto-advances; a
+// multiSelect toggles each digit then Right advances; "<options+1>" + text + Enter enters a
+// custom answer. A lone single-select question submits on Enter; anything else — a series, or
+// any multiSelect question — ends on the Submit tab, confirmed with "1". Keystrokes are sent
+// in question order from the fresh dialog.
+function answerAsk(sessionId, answers) {
+  const ask = openAskEntry(getSessionHistory(sessionId));
+  if (!ask) return { error: 'No question is open (already answered?)' };
+  const qs = askQuestions(ask.input);
+  if (!Array.isArray(answers) || answers.length !== qs.length)
+    return { error: `Answer all ${qs.length} question${qs.length === 1 ? '' : 's'}` };
+  const submitViaTab = qs.length > 1 || qs.some(q => q.multiSelect);
+  const ops = [];   // ordered keystrokes: { key } (a key/digit) or { text } (literal text)
+  for (let i = 0; i < qs.length; i++) {
+    const a = answers[i] || {}, q = qs[i];
+    if (q.multiSelect) {
+      const choices = Array.isArray(a.choices) ? a.choices.map(Number)
+        : a.choice != null ? [Number(a.choice)] : [];
+      if (!choices.length) return { error: 'Pick at least one option for question ' + (i + 1) };
+      for (const c of choices) {
+        if (!q.options.some(o => o.n === c)) return { error: 'Invalid option for question ' + (i + 1) };
+        ops.push({ key: String(c) });                    // toggle the checkbox
+      }
+      ops.push({ key: 'Right' });                        // done toggling → advance to next tab
+    } else if (a.text != null && String(a.text).length) {
+      ops.push({ key: String(q.options.length + 1) });   // "Type something" is after the options
+      ops.push({ text: String(a.text) });
+      ops.push({ key: 'Enter' });                        // confirm the custom answer (advance/submit)
+    } else {
+      const n = Number(a.choice);
+      if (!q.options.some(o => o.n === n)) return { error: 'Invalid option for question ' + (i + 1) };
+      ops.push({ key: String(n) });                      // pick + auto-advance
+      if (!submitViaTab) ops.push({ key: 'Enter' });     // lone single-select submits on Enter
+    }
+  }
+  if (submitViaTab) ops.push({ key: '1' });               // confirm on the Submit tab
+  const loc = paneForSession(sessionId);
+  if (!loc) return { error: 'Session is not running in a tmux pane on this host' };
+  try {
+    for (const op of ops) {
+      if (op.text != null) tmux(['send-keys', '-t', loc.pane, '-l', op.text]);
+      else tmux(['send-keys', '-t', loc.pane, op.key]);
+    }
+  } catch (e) { return { error: e.message }; }
   return { ok: true };
 }
 
@@ -1524,6 +1709,15 @@ function runWeb(args) {
       return send(res, 200, getSessionInfo(m[1]));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/history$/)))
       return send(res, 200, { history: getSessionHistory(m[1]) });
+    // Claude Code prompt-capture hooks POST here (permission dialogs, AskUserQuestion).
+    if (method === 'POST' && pathname === '/api/hook') {
+      readBody(req, body => {
+        let evt; try { evt = JSON.parse(body || '{}'); } catch { evt = null; }
+        if (evt) { try { applyHookEvent(evt); } catch (e) { console.error('[hook]', e.message); } }
+        send(res, 200, { ok: true });
+      });
+      return;
+    }
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/live$/)))
       return send(res, 200, sessionLiveness(m[1]));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/stats$/)))
@@ -1549,20 +1743,14 @@ function runWeb(args) {
     // so a stale button can't type digits into the session's composer.
     if (method === 'POST' && (m = pathname.match(/^\/api\/session\/([^/]+)\/ask$/))) {
       readBody(req, body => {
-        let choice;
-        try { choice = Number(JSON.parse(body || '{}').choice); } catch { choice = NaN; }
-        if (!Number.isFinite(choice) || choice < 1) return send(res, 400, { error: 'choice required' });
-        const ask = openAskEntry(getSessionHistory(m[1]));
-        if (!ask) return send(res, 409, { error: 'No question is open (already answered?)' });
-        if (!askQuestions(ask.input).some(q => q.options.some(o => o.n === choice)))
-          return send(res, 409, { error: 'Not a valid option' });
-        const loc = paneForSession(m[1]);
-        if (!loc) return send(res, 409, { error: 'Session is not running in a tmux pane on this host' });
-        try {
-          tmux(['send-keys', '-t', loc.pane, String(choice)]);
-          tmux(['send-keys', '-t', loc.pane, 'Enter']);
-          send(res, 200, { ok: true });
-        } catch (e) { send(res, 500, { error: e.message }); }
+        let b; try { b = JSON.parse(body || '{}'); } catch { b = {}; }
+        // {answers:[…]} is the full per-question form; {choice}/{text} stay valid for one question.
+        const answers = Array.isArray(b.answers) ? b.answers
+          : b.choice != null ? [{ choice: Number(b.choice) }]
+          : b.text != null ? [{ text: String(b.text) }] : null;
+        if (!answers) return send(res, 400, { error: 'answers required' });
+        const r = answerAsk(m[1], answers);
+        send(res, r.ok ? 200 : 409, r);
       });
       return;
     }

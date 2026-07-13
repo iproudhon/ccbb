@@ -334,6 +334,7 @@ Usage:
   ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
   ccbb webex               start the Webex bot front-end
   ccbb confluence          start the Confluence page front-end
+  ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
 
 With no command, 'ls' is assumed.`);
 }
@@ -345,6 +346,7 @@ function main() {
   if (cmd === 'help' || cmd === '-h' || cmd === '--help') return topHelp();
   if (!cmd || cmd.startsWith('-')) { cmd = 'ls'; rest = argv; } // no command / bare flags → ls
   if (cmd === 'ls') return runLs(rest);
+  if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);
   if (cmd === 'web') return require('./ccbb-web').runWeb(rest);
   if (cmd === 'webex') {
     let startWebex;
