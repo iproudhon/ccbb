@@ -129,6 +129,7 @@ const APP_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ccbb</title>
+<link rel="shortcut icon" href="data:image/svg+xml,%3Csvg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='16' y='12' width='32' height='28' rx='4' fill='%23FF6B35'/%3E%3Ccircle cx='24' cy='20' r='4' fill='%23fff'/%3E%3Ccircle cx='40' cy='20' r='4' fill='%23fff'/%3E%3Crect x='20' y='28' width='24' height='2' fill='%23fff' rx='1'/%3E%3Crect x='18' y='42' width='28' height='16' rx='2' fill='%23FF6B35'/%3E%3Crect x='8' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3Crect x='46' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3C/svg%3E" />
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
@@ -173,7 +174,9 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 #views.horizontal .view:last-child .view-body{border-right:none}
 #views.horizontal .view.collapsed .view-body{display:none}
 #views.horizontal .bar-main{display:none!important}
-#views.horizontal .bar-tab{display:block;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:13px;color:var(--ink)}
+#views.horizontal .bar-tab{display:flex;align-items:center;gap:6px;flex:1 1 auto;min-width:0;font-weight:600;font-size:13px;color:var(--ink)}
+#views.horizontal .bar-tab .status-dot{flex-shrink:0}
+#views.horizontal .bar-tab .bar-tab-text{flex:1 1 auto;min-width:0}
 /* ── list view ── */
 .lv{font-family:ui-monospace,'Cascadia Code',Menlo,monospace;font-size:13px;background:#fff}
 .lv .view-body{display:block;overflow-y:auto}
@@ -422,7 +425,15 @@ function toggleOrientation(){
 function applyTab(v){
   if (!v.barTabEl) return;
   var collapsed = orientation === 'horizontal' && v.el.classList.contains('collapsed');
-  v.barTabEl.textContent = collapsed ? (v.fullTabText||'').slice(0,4)+'…' : (v.fullTabText||'');
+  var text = collapsed ? (v.fullTabText||'').slice(0,4)+'…' : (v.fullTabText||'');
+  var textEl = v.barTabEl.querySelector('.bar-tab-text');
+  if (!textEl) {
+    textEl = document.createElement('span');
+    textEl.className = 'bar-tab-text';
+    textEl.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    v.barTabEl.appendChild(textEl);
+  }
+  textEl.textContent = text;
 }
 
 function relayout(){
@@ -754,6 +765,10 @@ function createSessionView(INFO){
   el.appendChild(makeViewBar(v, barMain, { close:true }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
+  var tabDotEl = document.createElement('div');
+  tabDotEl.className = 'status-dot';
+  tabDotEl.style.cssText = 'margin-right:6px';
+  v.barTabEl.insertBefore(tabDotEl, v.barTabEl.firstChild);
 
   // — body —
   var body = document.createElement('div');
@@ -877,8 +892,12 @@ function createSessionView(INFO){
   function setStatus(d) {
     var live = !!(d && d.live), status = d && d.status;
     var idle = live && status === 'idle';
-    dotEl.className = 'status-dot' + (live ? (idle ? ' idle' : ' live') : '');
-    dotEl.title = !live ? 'Not running' : (idle ? 'Waiting for input' : 'Working');
+    var className = 'status-dot' + (live ? (idle ? ' idle' : ' live') : '');
+    dotEl.className = className;
+    tabDotEl.className = className;
+    var title = !live ? 'Not running' : (idle ? 'Waiting for input' : 'Working');
+    dotEl.title = title;
+    tabDotEl.title = title;
     if (idle) {
       var at = d.statusUpdatedAt, since = relSince(at);
       statusRow.innerHTML = '⏸ finished responding' + (at ? ' at <b>'+esc(fd(at))+'</b>' : '') +
@@ -939,9 +958,9 @@ function createSessionView(INFO){
 
   // — entry rendering —
   function processEntry(entry, hist) {
+    if (entry.uuid) { if (seenUuids[entry.uuid]) return; seenUuids[entry.uuid] = true; }
     var msg = entry.message;
     if (!msg) return;
-    if (entry.uuid) { if (seenUuids[entry.uuid]) return; seenUuids[entry.uuid] = true; }
     if (entry.role === 'assistant') {
       renderAssistant(msg, hist);
       if (msg.usage) emitMsgStats(msg, hist);

@@ -332,7 +332,6 @@ function topHelp() {
 Usage:
   ccbb ls [options]        list sessions in the terminal (see: ccbb ls --help)
   ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
-  ccbb webex               start the Webex bot front-end
   ccbb confluence          start the Confluence page front-end
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
 
