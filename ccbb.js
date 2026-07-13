@@ -4,8 +4,8 @@
 //
 //   ccbb ls [options]         column-adaptive session listing for the terminal
 //   ccbb web [-p port]        clean web UI (drive live sessions in tmux)
-//   ccbb webex                Webex bot front-end (drive a live session from Webex)
-//   ccbb confluence           Confluence page front-end (drive a live session there)
+//     --webex                 also run the Webex front-end (shares the server)
+//     --confluence            also run the Confluence page front-end
 //
 // All discovery / stats / pricing / transcript reading live in ccbb-common.js so the
 // front-ends can't drift. ccbb never rewrites a transcript — the only write it makes is
@@ -332,7 +332,8 @@ function topHelp() {
 Usage:
   ccbb ls [options]        list sessions in the terminal (see: ccbb ls --help)
   ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
-  ccbb confluence          start the Confluence page front-end
+     [--webex]             ...also run the Webex front-end (one process)
+     [--confluence]        ...also run the Confluence page front-end
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
 
 With no command, 'ls' is assumed.`);
@@ -347,18 +348,6 @@ function main() {
   if (cmd === 'ls') return runLs(rest);
   if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);
   if (cmd === 'web') return require('./ccbb-web').runWeb(rest);
-  if (cmd === 'webex') {
-    let startWebex;
-    try { ({ startWebex } = require('./ccbb-webex')); }
-    catch (e) { console.error('ccbb: failed to load ccbb-webex:', e.message); process.exit(1); }
-    return startWebex();
-  }
-  if (cmd === 'confluence') {
-    let startConfluence;
-    try { ({ startConfluence } = require('./ccbb-confluence')); }
-    catch (e) { console.error('ccbb: failed to load ccbb-confluence:', e.message); process.exit(1); }
-    return startConfluence();
-  }
   console.error(`ccbb: unknown command '${cmd}'. Try: ccbb help`);
   process.exit(1);
 }

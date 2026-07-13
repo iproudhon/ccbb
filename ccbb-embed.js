@@ -80,44 +80,89 @@ function liveJs(pollMs) { return `
   // "#ccb-<verb>[-<arg>]" (single b — the bridge's markup kept the old ccb prefix):
   //   #ccb-attach-<id> → /attach <id>     #ccb-detach-<id> → /detach <id>
   //   #ccb-max-<id|list> → /max <id>      #ccb-normal → /normal    #ccb-refresh → /refresh
+  // Escape text into a storage-format <p> body (the poller decodes entities back to text).
+  function escXml(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  // Post a comment carrying text (a slash-command or a typed message). expedite makes the next
+  // version bump swap immediately so the page reacts in ~1s instead of waiting out SETTLE.
+  function postComment(text,label){
+    var s=document.getElementById('ccbbStat');if(s)s.textContent=(label||text)+' …';
+    return fetch('/rest/api/content',{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json','Accept':'application/json','X-Atlassian-Token':'no-check'},
+      body:JSON.stringify({type:'comment',container:{id:id,type:'page'},body:{storage:{value:'<p>'+escXml(text)+'</p>',representation:'storage'}}})})
+    .then(function(r){
+      if(!r.ok){if(s)s.textContent=(label||text)+' failed '+r.status;return false;}
+      expedite=true;clearTimeout(expTimer);expTimer=setTimeout(function(){expedite=false;},6000);
+      [150,400,800,1400,2200,3200].forEach(function(d){setTimeout(poll,d);});
+      return true;
+    })
+    .catch(function(e){if(s)s.textContent=(label||text)+' err '+e.message;return false;});
+  }
   document.addEventListener('click',function(ev){
+    // Composer send button → post the textarea's text as a message.
+    var sb=ev.target&&ev.target.closest?ev.target.closest('.cbx-send'):null;
+    if(sb){ev.preventDefault();var row=sb.closest('.cbx-row');var box=row&&row.querySelector('.cbx-box');if(box&&box.value.trim()){postComment(box.value.trim(),'message');box.value='';box.style.height='auto';}return;}
     var a=ev.target&&ev.target.closest?ev.target.closest('a[href^="#ccb-"]'):null;
     if(!a)return;
     ev.preventDefault();
     var raw=a.getAttribute('href').slice('#ccb-'.length);
+    // Local-only control (no server round-trip): minimize/restore the fixed overlay so the
+    // Confluence comment box underneath is reachable. Persisted so a body swap re-applies it.
+    if(raw==='fs-min'){minimized=!minimized;applyMin();return;}
+    // #ccb-ans-<n>-<sessionId> → answer a permission/question card for that session.
+    var am=raw.match(/^ans-(\d+)-(.+)$/);
+    if(am){postComment('/answer '+am[1]+' '+am[2],'answer '+am[1]);return;}
     var m=raw.match(/^(attach|detach|max)-(.*)$/);
     var cmd=m?('/'+m[1]+(m[2]?' '+m[2]:'')):('/'+raw);
-    var s=document.getElementById('ccbbStat');if(s)s.textContent=cmd+' …';
-    fetch('/rest/api/content',{method:'POST',credentials:'same-origin',
-      headers:{'Content-Type':'application/json','Accept':'application/json','X-Atlassian-Token':'no-check'},
-      body:JSON.stringify({type:'comment',container:{id:id,type:'page'},body:{storage:{value:'<p>'+cmd+'</p>',representation:'storage'}}})})
-    .then(function(r){if(!r.ok&&s)s.textContent=cmd+' failed '+r.status;})
-    .catch(function(e){if(s)s.textContent=cmd+' err '+e.message;});
+    postComment(cmd);
+  });
+  // Composer: Enter sends, Shift+Enter makes a newline; auto-grow the textarea.
+  document.addEventListener('keydown',function(ev){
+    var box=ev.target&&ev.target.classList&&ev.target.classList.contains('cbx-box')?ev.target:null;
+    if(!box)return;
+    if(ev.key==='Enter'&&!ev.shiftKey){ev.preventDefault();if(box.value.trim()){postComment(box.value.trim(),'message');box.value='';box.style.height='auto';}}
+  });
+  document.addEventListener('input',function(ev){
+    var box=ev.target&&ev.target.classList&&ev.target.classList.contains('cbx-box')?ev.target:null;
+    if(!box)return;box.style.height='auto';box.style.height=Math.min(200,box.scrollHeight)+'px';
   });
   // A single Claude turn appends many times (text, tool_use, tool_result…), bumping the
   // version repeatedly. Rather than swap on each bump, we swap once the version has held
   // STEADY for SETTLE ms — one update per burst. shownV is the version currently displayed;
   // lastV is the previous poll's value (to detect ongoing change).
   var SETTLE=Math.max(1500,POLL*2),shownV=null,lastV=null,stableAt=0,busy=false;
+  // expedite: set right after a user command POST so the next version bump swaps immediately
+  // (no SETTLE wait). Layout clicks want instant feedback; streaming bursts want debouncing.
+  var expedite=false,expTimer=null;
   function now(){return (performance&&performance.now)?performance.now():+new Date();}
-  // Scroll handling is container-agnostic: we don't assume the window is the scroller
-  // (Confluence may put the scrollbar on an inner wrapper). Instead we act on the LAST
-  // transcript element — with stacked views the bottom-most expanded session is the one
-  // that grows. Only session views have a .transcript; the list view doesn't auto-scroll.
-  function transcript(){var ts=document.querySelectorAll('.ccb-app .transcript');return ts.length?ts[ts.length-1]:null;}
-  function isSession(){return !!transcript();}
-  function lastTurn(){var t=transcript();return t&&t.lastElementChild;}
-  // "Near the bottom" = the last turn's bottom edge is at or just past the viewport
-  // bottom (within 200px). True regardless of which element actually scrolls.
-  function nearBottom(){
-    var el=lastTurn();
-    if(!el)return true;
-    var b=el.getBoundingClientRect().bottom;
-    return b<=(window.innerHeight||document.documentElement.clientHeight)+200;
+  // Full-viewport overlay: the app is a fixed flex shell and each view scrolls in its OWN
+  // .view-body (the web look). minimized drops it back to normal document flow so the
+  // Confluence comment box is reachable; the state survives body swaps (re-applied after each).
+  var minimized=false;
+  function app(){return document.querySelector('.ccb-app');}
+  function applyMin(){var a=app();if(a)a.classList.toggle('min',minimized);}
+  // The scrolling container we track is the LAST expanded session's own .view-body — with
+  // stacked views the bottom-most transcript is the one that grows. Each session view-body
+  // holds a .transcript; the list view-body (.lv-body) does not, so we skip it.
+  function scroller(){
+    var bodies=document.querySelectorAll('.ccb-app .ccb-view .view-body');
+    for(var i=bodies.length-1;i>=0;i--){if(bodies[i].querySelector('.transcript'))return bodies[i];}
+    return null;
   }
-  // Bring the last turn fully into view — scrolls every scrollable ancestor as needed, so
-  // it works whether the window or an inner wrapper is the scroll container.
-  function toBottom(){var el=lastTurn();if(el)el.scrollIntoView({block:'end',inline:'nearest'});}
+  function isSession(){return !!scroller();}
+  // "Near the bottom" of the tracked scroller (within 200px). If minimized (view-body flows
+  // in the document), fall back to the last turn's viewport position.
+  function nearBottom(){
+    var sc=scroller();if(!sc)return true;
+    if(minimized){var t=sc.querySelector('.transcript'),el=t&&t.lastElementChild;if(!el)return true;
+      return el.getBoundingClientRect().bottom<=(window.innerHeight||document.documentElement.clientHeight)+200;}
+    return sc.scrollHeight-sc.scrollTop-sc.clientHeight<=200;
+  }
+  // Pin the tracked scroller to its bottom (or scroll the last turn into view when minimized).
+  function toBottom(){
+    var sc=scroller();if(!sc)return;
+    if(minimized){var t=sc.querySelector('.transcript'),el=t&&t.lastElementChild;if(el)el.scrollIntoView({block:'end',inline:'nearest'});}
+    else sc.scrollTop=sc.scrollHeight;
+  }
   function swap(v){
     busy=true;
     // Was the user near the bottom BEFORE the swap? If they've scrolled up to review, leave
@@ -129,6 +174,7 @@ function liveJs(pollMs) { return `
       var el=bodyEl(),html=j.body&&j.body.view&&j.body.view.value;
       if(el&&html!=null){
         el.innerHTML=html;
+        applyMin();   // the swapped-in shell defaults to overlay; re-apply the local minimize state
         // Re-pin to bottom across a couple frames so it lands after layout settles.
         if(follow&&isSession()){requestAnimationFrame(function(){toBottom();requestAnimationFrame(toBottom);});}
       }
@@ -144,6 +190,8 @@ function liveJs(pollMs) { return `
     .then(function(j){
       var v=j.version&&j.version.number,s=document.getElementById('ccbbStat');
       if(shownV===null){shownV=lastV=v;if(s)s.textContent='v'+v+' · watching';return;}
+      // Expedited (just after a command click): swap on the first newer version, no SETTLE.
+      if(expedite&&v>shownV&&!busy){expedite=false;clearTimeout(expTimer);swap(v);return;}
       if(v!==lastV){lastV=v;stableAt=now();if(s)s.textContent='v'+v+' · updating…';return;}
       // v has held steady since stableAt. Swap once it's been stable long enough AND it's
       // newer than what's on screen. Don't yank the body mid text-selection.

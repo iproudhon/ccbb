@@ -41,7 +41,7 @@ const common = require('./ccbb-common');
 const {
   CONFIG_FILE, readConfig, findSessionJsonl, getSessionStats,
   listSessions, getSessionHistory, getSessionCwd,
-  paneForSession, injectToPane, tmux, capturePane, parsePrompt, promptFingerprint,
+  paneForSession, injectToPane, tmux, capturePane, parsePrompt, promptFingerprint, PROMPT_RE,
   askQuestions, formatAskText, openAskEntry,
   startTail, stopTail, loadCommands, expandRun, truncTitle, langForFile,
   awsIdText, awsLoginStream, priceForModel,

@@ -4,3 +4,8 @@ node_modules/
 # npm packaging
 *.tgz
 
+# aws test files
+aws-*
+
+# artifacts files
+artifacts/

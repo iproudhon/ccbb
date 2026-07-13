@@ -27,8 +27,20 @@ const {
 
 const DEFAULT_PORT = 8590;
 
-// Broadcast hook, wired up by runWeb once the WS server exists. No-op otherwise.
-let wsBroadcast = () => {};
+// ── Event bus ────────────────────────────────────────────────────────────────
+// Every server-side event (permission, permission_clear, ask_block, transcript,
+// command output) is emitted through emit(sessionId, obj). Browsers receive it over
+// WebSocket (wsSend, wired by runWeb once the WS server exists); in-process front-ends
+// (webex, confluence, launched via `ccbb web --webex/--confluence`) receive the SAME
+// events by registering via onServerEvent(). This is what lets every front-end share
+// the one hook+scrape permission path instead of each running its own scraper.
+let wsSend = () => {};                    // set to the WS fan-out in runWeb
+const busListeners = new Set();           // fn(sessionId, obj)
+function onServerEvent(fn) { busListeners.add(fn); return () => busListeners.delete(fn); }
+function wsBroadcast(sessionId, obj) {
+  wsSend(sessionId, obj);
+  for (const fn of busListeners) { try { fn(sessionId, obj); } catch (e) { console.error('[bus]', e.message); } }
+}
 
 // ── Custom "//" commands (web variant: returns structured { kind, title, content }) ──
 const awsLogins = new Map();   // sessionId → running `aws sso login` child (one at a time)
@@ -176,7 +188,8 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 #views.horizontal .bar-main{display:none!important}
 #views.horizontal .bar-tab{display:flex;align-items:center;gap:6px;flex:1 1 auto;min-width:0;font-weight:600;font-size:13px;color:var(--ink)}
 #views.horizontal .bar-tab .status-dot{flex-shrink:0}
-#views.horizontal .bar-tab .bar-tab-text{flex:1 1 auto;min-width:0}
+#views.horizontal .bar-tab .bar-tab-text{flex:1 1 auto;min-width:0;cursor:pointer;border-radius:5px;padding:1px 4px;margin:-1px -4px}
+#views.horizontal .view:not(.collapsed) .bar-tab .bar-tab-text:hover{background:var(--line-soft)}
 /* ── list view ── */
 .lv{font-family:ui-monospace,'Cascadia Code',Menlo,monospace;font-size:13px;background:#fff}
 .lv .view-body{display:block;overflow-y:auto}
@@ -828,14 +841,27 @@ function createSessionView(INFO){
     e.stopPropagation();
     editSessionTitle();
   });
+  // In horizontal mode .bar-main (with titleEl) is hidden and the tab shows the name — let
+  // clicking the tab rename too. Guard against the collapsed-bar handler and the button row.
+  v.barTabEl.addEventListener('click', function(e){
+    if (orientation !== 'horizontal') return;
+    if (el.classList.contains('collapsed')) return;   // bar handler expands instead
+    if (e.target.closest('.vb-btn')) return;
+    e.stopPropagation();
+    editSessionTitle();
+  });
   function editSessionTitle() {
+    var horiz = orientation === 'horizontal';
+    // Insert the input where the name is actually visible: the tab (horizontal) or the
+    // hidden-in-horizontal .bar-main title (vertical).
+    var anchor = horiz ? (v.barTabEl.querySelector('.bar-tab-text') || v.barTabEl) : titleEl;
     var inp = document.createElement('input');
     inp.className = 'hdr-title-input';
     inp.value = INFO.title || '';
     inp.placeholder = 'Session name';
     inp.addEventListener('click', function(e){ e.stopPropagation(); });
-    titleEl.style.display = 'none';
-    titleEl.parentNode.insertBefore(inp, titleEl.nextSibling);
+    anchor.style.display = 'none';
+    anchor.parentNode.insertBefore(inp, anchor.nextSibling);
     inp.focus(); inp.select();
     var done = false;
     function finish(save) {
@@ -849,7 +875,7 @@ function createSessionView(INFO){
         }).catch(function(){});
       }
       inp.remove();
-      titleEl.style.display = '';
+      anchor.style.display = '';
       renderTitle();
     }
     inp.addEventListener('blur', function(){ finish(true); });
@@ -1702,10 +1728,15 @@ function readBody(req, done) {
 
 function runWeb(args) {
   let port = DEFAULT_PORT;
+  let withWebex = false, withConfluence = false;
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) port = parseInt(args[++i], 10);
+    else if (args[i] === '--webex') withWebex = true;
+    else if (args[i] === '--confluence') withConfluence = true;
     else if (args[i] === '-h' || args[i] === '--help') {
-      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port]   (default ${DEFAULT_PORT})`);
+      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port] [--webex] [--confluence]\n\n` +
+        `  --webex        also run the Webex front-end (shares this server's prompt path)\n` +
+        `  --confluence   also run the Confluence page front-end`);
       return;
     }
   }
@@ -1812,6 +1843,20 @@ function runWeb(args) {
     console.log(`ccbb http://127.0.0.1:${port}`);
   });
 
+  // Optional in-process front-ends. They subscribe to the event bus (onServerEvent) and
+  // drive sessions via the exported answer/inject/command helpers, so the permission path
+  // (hooks + scrape) is shared — no separate scraper. Loaded lazily so a missing optional
+  // dep (e.g. webex-node-bot-framework) only affects the flag that needs it.
+  const hostApi = module.exports;
+  if (withConfluence) {
+    try { require('./ccbb-confluence').attachConfluence(hostApi); }
+    catch (e) { console.error('ccbb: --confluence failed:', e.message); }
+  }
+  if (withWebex) {
+    try { require('./ccbb-webex').attachWebex(hostApi); }
+    catch (e) { console.error('ccbb: --webex failed:', e.message); }
+  }
+
   let WS;
   try { WS = require('ws'); } catch {}
   if (WS) {
@@ -1823,7 +1868,7 @@ function runWeb(args) {
       const json = JSON.stringify(obj);
       for (const c of set) if (c.readyState === 1) c.send(json);
     };
-    wsBroadcast = sendTo;
+    wsSend = sendTo;
     server.on('upgrade', (req, socket, head) => {
       const m = req.url && req.url.match(/^\/ws\/([^/?]+)/);
       if (!m) return socket.destroy();
@@ -1855,6 +1900,13 @@ function runWeb(args) {
   return server;
 }
 
-module.exports = { runWeb, DEFAULT_PORT };
+module.exports = {
+  runWeb, DEFAULT_PORT,
+  // Server-side seam shared with the in-process front-ends (webex/confluence). They
+  // subscribe to the event bus and drive sessions through the SAME hook+scrape path.
+  onServerEvent, activePrompts,
+  answerPrompt, answerAsk, runCommand,
+  startWatching, stopWatching, startPaneWatch, stopPaneWatch,
+};
 
 if (require.main === module) runWeb(process.argv.slice(2));
