@@ -536,7 +536,8 @@ function sessionLiveness(sessionId) {
     try { d = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8')); } catch { continue; }
     if (d.sessionId !== sessionId) continue;
     if (!pidAlive(d.pid)) continue;
-    return { live: true, pid: d.pid, status: d.status || 'unknown', cwd: d.cwd || '' };
+    return { live: true, pid: d.pid, status: d.status || 'unknown',
+      statusUpdatedAt: d.statusUpdatedAt || null, cwd: d.cwd || '' };
   }
   return { live: false };
 }
@@ -697,6 +698,7 @@ function getSessionInfo(sessionId) {
     startedAt: stats.startedAt || null,
     live: live.live,
     liveStatus: live.status || null,
+    liveStatusAt: live.statusUpdatedAt || null,
     stats,
   };
 }

@@ -235,6 +235,10 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .subturns{font-size:0.8em;color:var(--ink-faint)}
 .status-dot{width:9px;height:9px;border-radius:50%;background:var(--ink-faint);flex-shrink:0}
 .status-dot.live{background:#2da44e;animation:pulse 1.6s ease-in-out infinite}
+.status-dot.idle{background:#d4a72c}
+.hdr-status{display:none;font-size:11px;color:#8a6d1a;margin-top:3px;font-variant-numeric:tabular-nums}
+.hdr-status.show{display:block}
+.hdr-status b{font-weight:600}
 .query-ind{position:absolute;bottom:14px;right:16px;width:16px;height:16px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;display:none;animation:spin .7s linear infinite;pointer-events:none;z-index:5}
 .query-ind.show{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -504,7 +508,8 @@ function openSession(sid){
   }
   fetch('/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
     var info = { sessionId: sid, title: (d&&d.title)||'', projectPath: (d&&d.projectPath)||'',
-                 live: !!(d&&d.live), stats: (d&&d.stats)||null };
+                 live: !!(d&&d.live), liveStatus: (d&&d.liveStatus)||null, liveStatusAt: (d&&d.liveStatusAt)||null,
+                 stats: (d&&d.stats)||null };
     var v = createSessionView(info);
     views.push(v);
     viewsEl.appendChild(v.el);
@@ -744,7 +749,7 @@ function createSessionView(INFO){
   var body = document.createElement('div');
   body.className = 'view-body';
   body.innerHTML =
-    '<div class="sv-stats"><span class="hdr-proj"></span><span class="hdr-stats"></span></div>'+
+    '<div class="sv-stats"><span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status"></div></div>'+
     '<div class="tr-wrap">'+
       '<div class="transcript"></div>'+
       '<button class="jump-marker">&#8595; New updates</button>'+
@@ -768,6 +773,7 @@ function createSessionView(INFO){
   v.bodyEl = body;
   var projEl = body.querySelector('.hdr-proj');
   var statsEl = body.querySelector('.hdr-stats');
+  var statusRow = body.querySelector('.hdr-status');
   var transcript = body.querySelector('.transcript');
   var jumpMarker = body.querySelector('.jump-marker');
   var queryEl = body.querySelector('.query-ind');
@@ -847,9 +853,31 @@ function createSessionView(INFO){
       '  &middot;  <b>'+fmtCost(st.cost)+'</b>'+modelStr+
       '  &middot;  <b>'+fmtTokShort(st.totalTokens)+'</b>  '+tokStr+ctxStr;
   }
-  function setLive(live) {
-    dotEl.className = 'status-dot' + (live ? ' live' : '');
-    dotEl.title = live ? 'Active' : 'Idle';
+  // Session state from the live sidecar: busy = Claude is working, idle = it finished the
+  // turn and is waiting for your input ("session end" in the turn sense), no sidecar = the
+  // process has exited. We surface idle prominently: when did it stop, how long it's waited.
+  function relSince(iso){
+    if (iso == null) return '';
+    var t = typeof iso === 'number' ? iso : Date.parse(iso); if (isNaN(t)) return '';
+    var s = Math.max(0, Math.round((Date.now()-t)/1000));
+    if (s < 60) return s+'s';
+    var m = Math.floor(s/60); if (m < 60) return m+'m';
+    var h = Math.floor(m/60), rm = m%60; return h+'h'+(rm?' '+rm+'m':'');
+  }
+  function setStatus(d) {
+    var live = !!(d && d.live), status = d && d.status;
+    var idle = live && status === 'idle';
+    dotEl.className = 'status-dot' + (live ? (idle ? ' idle' : ' live') : '');
+    dotEl.title = !live ? 'Not running' : (idle ? 'Waiting for input' : 'Working');
+    if (idle) {
+      var at = d.statusUpdatedAt, since = relSince(at);
+      statusRow.innerHTML = '⏸ finished responding' + (at ? ' at <b>'+esc(fd(at))+'</b>' : '') +
+        ' · waiting for input' + (since ? ' <b>'+since+'</b>' : '');
+      statusRow.classList.add('show');
+    } else {
+      statusRow.classList.remove('show');
+      statusRow.innerHTML = '';
+    }
   }
   var queryCount = 0;
   function queryStart(){ queryCount++; queryEl.classList.add('show'); }
@@ -857,7 +885,7 @@ function createSessionView(INFO){
   function qfetch(url, opts){ queryStart(); return fetch(url, opts).finally(queryEnd); }
   function pollLive() {
     qfetch('/api/session/'+INFO.sessionId+'/live').then(function(r){return r.json();})
-      .then(function(d){ setLive(d&&d.live); }).catch(function(){});
+      .then(function(d){ setStatus(d); }).catch(function(){});
     qfetch('/api/session/'+INFO.sessionId+'/stats').then(function(r){return r.json();})
       .then(function(d){ if(d) renderStats(d); }).catch(function(){});
   }
@@ -1324,7 +1352,7 @@ function createSessionView(INFO){
 
   renderTitle();
   renderStats(INFO.stats);
-  setLive(INFO.live);
+  setStatus({ live: INFO.live, status: INFO.liveStatus, statusUpdatedAt: INFO.liveStatusAt });
   autoGrow(inputBox);
   refreshDrivable();
   connect();
