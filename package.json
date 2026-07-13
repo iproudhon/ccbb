@@ -32,10 +32,7 @@
     "start": "node ccbb.js"
   },
   "dependencies": {
-    "https-proxy-agent": "^5.0.1",
+    "https-proxy-agent": "^9.1.0",
     "ws": "^8.18.0"
-  },
-  "optionalDependencies": {
-    "webex-node-bot-framework": "^2.5.1"
   }
 }
