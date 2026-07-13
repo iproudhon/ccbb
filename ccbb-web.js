@@ -824,7 +824,7 @@ function createSessionView(INFO){
 
   var ws, reconnectTimer, destroyed = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
-  var historyLoaded = false, pendingTranscript = [];
+  var historyLoaded = false, pendingTranscript = [], pendingAsk = null;
   var permEls = {};    // fp -> element
   var askCards = {};   // tool_use id -> card element
   var statEls = {}, statTurnNo = {}, statTurns = 0, statSeenFirst = false;
@@ -1301,7 +1301,10 @@ function createSessionView(INFO){
     } else if (msg.type==='command') {
       showCmd(msg); noteUpdate();
     } else if (msg.type==='ask_block') {
-      renderAskCard(msg.block, false); noteUpdate();   // hook-pushed question (dedups by id)
+      // Defer until history is in so the card lands at the bottom (after prior turns), not
+      // above them. renderAskCard dedups by tool_use id, so a history copy won't double it.
+      if (!historyLoaded) pendingAsk = msg.block;
+      else { renderAskCard(msg.block, false); noteUpdate(); }
     }
   }
 
@@ -1353,6 +1356,9 @@ function createSessionView(INFO){
   function flushPending() {
     for (var i=0;i<pendingTranscript.length;i++) { processEntry(pendingTranscript[i], false); }
     pendingTranscript = [];
+    // An open ask that arrived before history loaded: render it now (after the transcript is
+    // in place). If history already rendered the same card, renderAskCard dedups by id.
+    if (pendingAsk) { renderAskCard(pendingAsk, false); pendingAsk = null; noteUpdate(); }
   }
 
   // — composer —
@@ -1449,7 +1455,7 @@ function createSessionView(INFO){
     transcript.innerHTML = '';
     msgEls = {}; toolEls = {}; seenUuids = {}; askCards = {};
     statEls = {}; statTurnNo = {}; statTurns = 0; statSeenFirst = false;
-    historyLoaded = false; pendingTranscript = [];
+    historyLoaded = false; pendingTranscript = []; pendingAsk = null;
     following = true; anchorEl = null;
     loadHistory();
     pollLive();
@@ -1886,6 +1892,14 @@ function runWeb(args) {
         // (or reloaded) while a bash approval is pending would silently miss it.
         const ap = activePrompts.get(sessionId);
         if (ap) { try { ws.send(JSON.stringify({ type: 'permission', fp: ap.fp, title: ap.title, options: ap.options })); } catch {} }
+        // Same story for an open AskUserQuestion: the PreToolUse hook broadcasts it once, so a
+        // view opened/reconnected after the dialog appeared would miss it and only recover on a
+        // full history reload. The open ask lives in the JSONL — replay it straight to THIS
+        // socket. renderAskCard dedups by tool_use id, so the transcript copy won't double it.
+        try {
+          const ask = openAskEntry(getSessionHistory(sessionId));
+          if (ask) ws.send(JSON.stringify({ type: 'ask_block', block: { id: ask.id, name: 'AskUserQuestion', input: ask.input } }));
+        } catch {}
         ws.on('close', () => {
           const set = clients.get(sessionId);
           if (set) { set.delete(ws); if (!set.size) { clients.delete(sessionId); stopPaneWatch(sessionId); } }
