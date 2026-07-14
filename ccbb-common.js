@@ -645,9 +645,9 @@ function injectToPane(pane, text, buffer) {
 
 // ── Transcript / history ──────────────────────────────────────────
 // Reduce a raw JSONL entry to a display entry, or null if it isn't a shown turn.
-function transcriptEntry(d) {
+function transcriptEntry(d, opts) {
   if ((d.type !== 'user' && d.type !== 'assistant') || !d.message) return null;
-  if (d.isSidechain === true) return null;
+  if (d.isSidechain === true && !(opts && opts.keepSidechain)) return null;
   let content = d.message.content;
   if (typeof content === 'string') content = [{ type: 'text', text: content }];
   if (!Array.isArray(content)) return null;
@@ -661,6 +661,15 @@ function transcriptEntry(d) {
   };
   const e = { role: d.message.role, message, uuid: d.uuid, timestamp: d.timestamp || null };
   if (d.isCompactSummary === true) e.compact = true;
+  // A completed Agent/Task tool call records its subagent id in toolUseResult. Tag the
+  // matching tool_result so the client can lazily nest that subagent's transcript under the
+  // tool card. One tool_result per JSONL line (verified), so the block is unambiguous.
+  const tur = d.toolUseResult;
+  if (tur && tur.agentId) {
+    const tr = content.find(b => b && b.type === 'tool_result');
+    if (tr && tr.tool_use_id)
+      e.subagent = { agentId: String(tur.agentId), agentType: tur.agentType || '', toolUseId: tr.tool_use_id };
+  }
   return e;
 }
 
@@ -690,6 +699,29 @@ function getSessionHistory(sessionId) {
     let d;
     try { d = JSON.parse(line); } catch { continue; }
     const e = transcriptEntry(d);
+    if (e) entries.push(e);
+  }
+  return entries;
+}
+
+// Full transcript for one subagent (Agent/Task) run, to nest under its parent tool card.
+// The file lives at <sessionDir>/<sessionId>/subagents/agent-<agentId>.jsonl. agentId is
+// stripped to alphanumerics so it can't escape that directory. Sidechain entries are the
+// whole point here, so they're kept.
+function getSubagentHistory(sessionId, agentId) {
+  const safe = String(agentId || '').replace(/[^a-zA-Z0-9]/g, '');
+  if (!safe) return [];
+  const mainPath = findSessionJsonl(sessionId);
+  if (!mainPath) return [];
+  const filePath = path.join(path.dirname(mainPath), sessionId, 'subagents', 'agent-' + safe + '.jsonl');
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return []; }
+  const entries = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let d;
+    try { d = JSON.parse(line); } catch { continue; }
+    const e = transcriptEntry(d, { keepSidechain: true });
     if (e) entries.push(e);
   }
   return entries;
@@ -1155,7 +1187,7 @@ module.exports = {
   pidAlive, sessionLiveness, liveSessionIds, livePidsForSession, renameSession,
   // tmux + transcript
   tmux, paneForSession, injectToPane,
-  transcriptEntry, getSessionCwd, getSessionHistory, getSessionInfo,
+  transcriptEntry, getSessionCwd, getSessionHistory, getSubagentHistory, getSessionInfo,
   startTail, stopTail,
   // permission parsing
   PROMPT_RE, OPTION_RE, capturePane, parsePrompt, promptFingerprint,

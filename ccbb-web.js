@@ -16,7 +16,7 @@ const { spawnSync } = require('child_process');
 
 const common = require('./ccbb-common');
 const {
-  CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSessionStats,
+  CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSubagentHistory, getSessionStats,
   sessionLiveness, renameSession, paneForSession, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
   loadCommands, expandRun, truncTitle, looksLikeDiff, langForFile,
@@ -318,6 +318,13 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .think-body{padding:12px 14px;border-top:1px dashed var(--line);font-size:13px;line-height:1.6;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word;font-style:italic}
 .hist-sep{font-size:11px;color:var(--ink-faint);text-align:center;padding:4px 0;width:100%;max-width:740px;border-bottom:1px dashed var(--line);margin-bottom:4px}
 .msg.hist .msg-body,.tool-card.hist,.think-card.hist{opacity:.65}
+.subagent-block{border-top:1px solid var(--line);margin-top:2px}
+.subagent-hdr{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--bg-alt);cursor:pointer;user-select:none;font-size:12px;font-weight:600;color:var(--ink-soft)}
+.subagent-hdr:hover{background:var(--line-soft)}
+.subagent-toggle{font-size:10px;color:var(--ink-soft)}
+.subagent-body{padding:10px 12px;border-left:2px solid var(--accent);margin:8px 0 8px 12px;display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+.subagent-body>*{max-width:100%}
+.subagent-loading{font-size:12px;color:var(--ink-faint);font-style:italic}
 .perm-card{border:1px solid var(--accent);border-radius:12px;overflow:hidden;width:100%;max-width:740px}
 .perm-hdr{padding:11px 16px;background:var(--accent-soft);border-bottom:1px solid var(--accent);font-size:13px;font-weight:600;color:var(--accent);display:flex;align-items:center;gap:6px}
 .perm-body{padding:12px 16px;background:var(--surface);font-size:14px;color:var(--ink)}
@@ -1012,7 +1019,7 @@ function createSessionView(INFO){
       if (!isNaN(ts)) lastUserTs = ts;
       if (entry.compact) { renderCompactMarker(msg, hist); return; }
       var hasToolResult = (msg.content||[]).some(function(b){ return b.type==='tool_result'; });
-      if (hasToolResult) renderToolResults(msg, ts);
+      if (hasToolResult) renderToolResults(msg, ts, entry.subagent);
       renderUserMessage(msg, hist, youGap);
     }
     repinPermissions();
@@ -1071,7 +1078,7 @@ function createSessionView(INFO){
     transcript.appendChild(card);
     scrollBottom();
   }
-  function renderToolResults(msg, resultTs) {
+  function renderToolResults(msg, resultTs, subagent) {
     for (var i=0;i<(msg.content||[]).length;i++) {
       var block = msg.content[i];
       if (block.type!=='tool_result') continue;
@@ -1086,9 +1093,102 @@ function createSessionView(INFO){
       if (typeof block.content==='string') content = block.content;
       else if (Array.isArray(block.content)) content = block.content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
       outputEl.innerHTML = '<pre>'+esc(content)+'</pre>';
+      // A finished Agent/Task call: nest the subagent's own transcript, collapsed, under its
+      // output. Lazy-fetched on first expand (see toggleSubagent) so history stays light.
+      if (subagent && subagent.toolUseId===id && !document.getElementById('sa-'+id)) {
+        var sa = document.createElement('div');
+        sa.className = 'subagent-block'; sa.id = 'sa-'+id;
+        var label = 'Subagent transcript'+(subagent.agentType?' &middot; '+esc(subagent.agentType):'');
+        sa.innerHTML =
+          '<div class="subagent-hdr"><span class="subagent-toggle">&#9654;</span> '+label+'</div>'+
+          '<div class="subagent-body" id="sab-'+id+'" hidden></div>';
+        (function(tid, aid){
+          sa.querySelector('.subagent-hdr').addEventListener('click', function(){ toggleSubagent(tid, aid); });
+        })(id, subagent.agentId);
+        outputEl.parentNode.appendChild(sa);
+      }
       if (askCards[id]) settleAsk(id);
     }
     scrollBottom();   // results grow an existing card in place — keep following
+  }
+  // Expand/collapse a subagent transcript nested under an Agent/Task card. The nested tree is
+  // fetched and built once (on first expand); later toggles just flip visibility.
+  function toggleSubagent(toolId, agentId) {
+    var body = document.getElementById('sab-'+toolId), block = document.getElementById('sa-'+toolId);
+    if (!body || !block) return;
+    var toggle = block.querySelector('.subagent-toggle');
+    var open = body.hasAttribute('hidden');
+    if (open) body.removeAttribute('hidden'); else body.setAttribute('hidden','');
+    if (toggle) toggle.innerHTML = open?'&#9660;':'&#9654;';
+    if (open && body.dataset.loaded!=='1') {
+      body.dataset.loaded = '1';
+      body.innerHTML = '<div class="subagent-loading">Loading…</div>';
+      qfetch('/api/session/'+INFO.sessionId+'/subagent/'+encodeURIComponent(agentId))
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          body.innerHTML = '';
+          var entries = (d&&d.history)||[];
+          if (!entries.length) { body.innerHTML = '<div class="subagent-loading">No subagent messages.</div>'; return; }
+          renderSubagentInto(body, entries);
+        })
+        .catch(function(){ body.dataset.loaded=''; body.innerHTML = '<div class="subagent-loading">Failed to load.</div>'; });
+    }
+  }
+  // Static, one-shot render of a subagent's transcript into the container. Self-contained (no
+  // live streaming, no shared element maps): the run is already complete. The leading user
+  // entry is the agent prompt — already shown in the parent card's input — so it's dropped.
+  function renderSubagentInto(container, entries) {
+    var results = {};   // tool_use_id → its tool_result block, pre-indexed for inline output
+    entries.forEach(function(e){
+      (e.message.content||[]).forEach(function(b){ if (b.type==='tool_result') results[b.tool_use_id]=b; });
+    });
+    var droppedPrompt = false;
+    entries.forEach(function(e){
+      var content = e.message.content||[];
+      if (e.role==='assistant') {
+        var think = content.filter(function(b){return b.type==='thinking';}).map(function(b){return b.thinking||'';}).join('').trim();
+        if (think) {
+          var tc = document.createElement('div'); tc.className='think-card';
+          tc.innerHTML = '<div class="think-hdr" onclick="toggleTool(this)"><span class="think-label">&#10024; Thinking</span><span class="tool-toggle">&#9654;</span></div><div class="tool-body"><div class="think-body"></div></div>';
+          tc.querySelector('.think-body').textContent = think; container.appendChild(tc);
+        }
+        var text = content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('').trim();
+        if (text) {
+          var m = document.createElement('div'); m.className='msg';
+          m.innerHTML = '<div class="msg-label">Subagent</div><div class="msg-body">'+marked.parse(text)+'</div>';
+          container.appendChild(m);
+        }
+        content.filter(function(b){return b.type==='tool_use';}).forEach(function(b){ container.appendChild(subToolCard(b, results[b.id])); });
+      } else if (e.role==='user') {
+        if (content.some(function(b){return b.type==='tool_result';})) return;   // inlined into tool cards above
+        var ut = content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('').trim();
+        if (!droppedPrompt) { droppedPrompt = true; return; }                    // the agent prompt
+        if (ut && !isSystemNoise(ut)) {
+          var um = document.createElement('div'); um.className='msg you';
+          um.innerHTML = '<div class="msg-label">User</div><div class="msg-body">'+esc(ut)+'</div>';
+          container.appendChild(um);
+        }
+      }
+    });
+  }
+  // A collapsed tool card for a subagent's tool call, with its result inlined. Nested Agent
+  // calls render as a plain card (no recursion into deeper subagents).
+  function subToolCard(block, resultBlock) {
+    var card = document.createElement('div'); card.className='tool-card';
+    var inputStr = formatToolInput(block.name, block.input);
+    var out = '';
+    if (resultBlock) {
+      if (typeof resultBlock.content==='string') out = resultBlock.content;
+      else if (Array.isArray(resultBlock.content)) out = resultBlock.content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
+    }
+    var isErr = resultBlock && resultBlock.is_error;
+    card.innerHTML =
+      '<div class="tool-hdr" onclick="toggleTool(this)"><span class="tool-name">'+esc(block.name)+'</span>'+
+        '<span class="tool-meta"><span class="tool-status '+(isErr?'error':'done')+'">'+(isErr?'Error':'Done')+'</span></span>'+
+        '<span class="tool-toggle">&#9654;</span></div>'+
+      '<div class="tool-body"><div class="tool-input"><pre>'+esc(inputStr)+'</pre></div>'+
+        '<div class="tool-output"><pre>'+esc(out)+'</pre></div></div>';
+    return card;
   }
   // A question dialog: each question gets radio-select options plus a "Type something" custom
   // field; a single question answers on one click, a series collects one pick per question and
@@ -1201,7 +1301,7 @@ function createSessionView(INFO){
     if (toolName==='Grep' && input.pattern) return input.pattern+(input.path?'  '+input.path:'');
     if (toolName==='WebFetch' && input.url) return input.url+(input.prompt?'\\n\\n'+s(input.prompt):'');
     if (toolName==='WebSearch' && input.query) return input.query;
-    if (toolName==='Task' && (input.description||input.prompt)) return s(input.description)+'\\n\\n'+s(input.prompt);
+    if ((toolName==='Task'||toolName==='Agent') && (input.description||input.prompt)) return s(input.description)+'\\n\\n'+s(input.prompt);
     try { return JSON.stringify(input, null, 2); } catch(e) { return String(input); }
   }
   var NOISE_TAG = /^<(command-name|command-message|command-args|local-command|system-reminder|task-notification|bash-input|bash-stdout|bash-stderr)/;
@@ -1788,6 +1888,8 @@ function runWeb(args) {
       return send(res, 200, getSessionInfo(m[1]));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/history$/)))
       return send(res, 200, { history: getSessionHistory(m[1]) });
+    if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/subagent\/([^/]+)$/)))
+      return send(res, 200, { history: getSubagentHistory(m[1], m[2]) });
     // Claude Code prompt-capture hooks POST here (permission dialogs, AskUserQuestion).
     if (method === 'POST' && pathname === '/api/hook') {
       readBody(req, body => {
