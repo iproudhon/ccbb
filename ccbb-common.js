@@ -311,6 +311,10 @@ function computeSessionStats(sessionId, opts) {
   let lastCtxTs = null, lastCtx = null, maxCtx = null;
   let lastCompactTs = null, lastCompactTokens = 0;
   let aiTitle, customTitle, firstTs = null;
+  // Average server response time: for each billable assistant message on the MAIN transcript,
+  // its write time minus the last user entry (prompt or tool_result) before it. Anchored to the
+  // last user entry, not the adjacent line, since one response spans several assistant entries.
+  let lastUserTs = null, respSum = 0, respCount = 0;
   const seenMsgIds = new Set();
   const seenTurnIds = new Set();
   const PERIODS = ['day', 'week', 'month'];
@@ -346,11 +350,16 @@ function computeSessionStats(sessionId, opts) {
         const sumStr = typeof c === 'string' ? c : (c ? JSON.stringify(c) : '');
         lastCompactTokens = Math.ceil(sumStr.length / 4);
       }
+      if (isMain && d.type === 'user' && d.timestamp) { const t = Date.parse(d.timestamp); if (!isNaN(t)) lastUserTs = t; }
       if (d.type === 'assistant' && d.message && d.message.usage) s.hasUsage = true;
       const dkey = (d.message && d.message.id) ? d.message.id + '|' + (d.requestId || '') : null;
       if (d.type === 'assistant' && d.message && d.message.usage &&
           inPeriod(d.timestamp) && !(dkey && seenMsgIds.has(dkey))) {
         if (dkey) seenMsgIds.add(dkey);
+        if (isMain && d.timestamp && lastUserTs != null) {
+          const r = Date.parse(d.timestamp) - lastUserTs;
+          if (r >= 0) { respSum += r; respCount++; }
+        }
         const u = d.message.usage;
         const inp = u.input_tokens || 0, out = u.output_tokens || 0;
         const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
@@ -435,6 +444,7 @@ function computeSessionStats(sessionId, opts) {
   }
   s.context = periodFilter ? null : lastCtx;
   s.contextMax = periodFilter ? null : maxCtx;
+  s.avgResponseMs = respCount ? respSum / respCount : null;
   s.models = Object.values(modelMap).sort((a, b) => b.cost - a.cost);
   s.providers = Object.values(providerMap).sort((a, b) => b.cost - a.cost);
   s.title = customTitle !== undefined ? customTitle : (aiTitle || '');
@@ -457,9 +467,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 3 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 4 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 3, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 4, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 function saveStatsCache() {

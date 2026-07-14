@@ -280,11 +280,15 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .msg.you{align-items:flex-end}
 .msg.you .msg-label{align-self:flex-end}
 .msg-label{font-size:11px;font-weight:600;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.05em}
+.msg-time{text-transform:none;letter-spacing:0;font-weight:400;color:var(--ink-faint);font-variant-numeric:tabular-nums}
 .msg.you .msg-body{background:var(--bg-alt);border:1px solid var(--line);border-radius:16px 16px 4px 16px;padding:12px 16px;max-width:85%;white-space:pre-wrap}
 .tool-card{border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:13px;width:100%;max-width:740px;background:var(--surface)}
 .tool-hdr{display:flex;align-items:center;gap:8px;padding:9px 14px;background:var(--bg-alt);cursor:pointer;user-select:none}
 .tool-hdr:hover{background:var(--line-soft)}
 .tool-name{font-weight:600;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink)}
+.tool-meta{margin-left:auto;display:flex;gap:8px;align-items:center}
+.tool-meta .tool-status{margin-left:0}
+.tool-time{font-size:11px;color:var(--ink-faint);font-variant-numeric:tabular-nums}
 .tool-status{font-size:11px;margin-left:auto;padding:2px 8px;border-radius:10px;font-weight:500}
 .tool-status.running{background:var(--accent-soft);color:var(--accent)}
 .tool-status.done{background:var(--bg-alt);color:var(--ink-soft)}
@@ -394,6 +398,7 @@ function fmtMonth(mk){ var p=mk.split('-'), names=['Jan','Feb','Mar','Apr','May'
 function fmtTokK(t){ t=t||0; if(t>=1e9)return (t/1e9).toFixed(1)+'B'; if(t>=1e6)return (t/1e6).toFixed(1)+'M'; if(t>=1e3)return (t/1e3).toFixed(1)+'K'; return String(t); }
 function fmtTokShort(n){ n=n||0; if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+'M'; if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1)+'K'; return String(n); }
 function fmtCost(c){ return '$'+(c||0).toFixed(2); }
+function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s'; var m=Math.floor(s/60); if(m<60)return m+'m '+Math.round(s%60)+'s'; var h=Math.floor(m/60); if(h<24)return h+'h '+(m%60)+'m'; return Math.floor(h/24)+'d '+(h%24)+'h'; }
 function fmtPct(part,whole){ return (whole>0?(100*part/whole):0).toFixed(1)+'%'; }
 function fmtStatDate(iso){ return fd(iso); }
 function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown'; var x=m.replace(/^claude-/,'').replace(/-\\d{6,}$/,''); var parts=x.split('-'); var name=(parts.shift()||''); name=name.charAt(0).toUpperCase()+name.slice(1); var ver=parts.join('.'); return ver?name+' '+ver:name; }
@@ -824,6 +829,11 @@ function createSessionView(INFO){
 
   var ws, reconnectTimer, destroyed = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
+  // Timing: response time = assistant entry ts − last USER entry ts (prompt/tool_result), anchored
+  // to the last user entry since one response spans several assistant entries (thinking/text/tool).
+  // Reaction time = typed-prompt ts − last ASSISTANT entry ts. toolStart maps a tool_use id → its
+  // assistant entry's time, paired on the result card to show how long the tool took.
+  var lastUserTs = null, lastAsstTs = null, toolStart = {};
   var historyLoaded = false, pendingTranscript = [], pendingAsk = null;
   var permEls = {};    // fp -> element
   var askCards = {};   // tool_use id -> card element
@@ -894,7 +904,8 @@ function createSessionView(INFO){
       : (models.length===1?' <span class="sub">('+esc(prettyModel(models[0].model))+')</span>':'');
     var c = st.categories||{}, totCost = st.cost||0;
     function cat(label,key){ var x=c[key]||{tokens:0,cost:0}; return '<span class="rl-lbl">'+label+'</span> '+fmtTokShort(x.tokens)+' <span class="rl-pct">'+fmtPct(x.cost,totCost)+'</span>'; }
-    var tokStr = cat('cr','cacheRead')+'  '+cat('cw','cacheWrite')+'  '+cat('cm','cacheMiss')+'  '+cat('out','output')+'  '+cat('in','input');
+    var tokStr = cat('cr','cacheRead')+'  '+cat('cw','cacheWrite')+'  '+cat('cm','cacheMiss')+'  '+cat('out','output')+'  '+cat('in','input')+
+      (fmtDur(st.avgResponseMs)?'  <span class="rl-lbl">t</span> '+fmtDur(st.avgResponseMs):'');
     var ctx = st.context;
     var ctxStr = ctx ? '  &middot;  ctx:'+(ctx.postCompact?'~':'')+'<b>'+fmtTokShort(ctx.tokens)+'</b>/'+fmtCost(ctx.cost)+
       (ctx.postCompact?' <span class="subturns">post-compact</span>':'') : '';
@@ -946,7 +957,7 @@ function createSessionView(INFO){
   }
 
   // — per-response usage line —
-  function emitMsgStats(msg, hist) {
+  function emitMsgStats(msg, hist, respMs) {
     var u = msg.usage||{};
     var input=u.input_tokens||0, output=u.output_tokens||0;
     var cacheRead=u.cache_read_input_tokens||0, cacheWrite=u.cache_creation_input_tokens||0;
@@ -970,7 +981,8 @@ function createSessionView(INFO){
       '<b>'+fmtCost(cost)+'</b> '+fmtTokShort(totalTok)+
       '  '+seg('cr',cacheRead,cCr)+'  '+seg('cw',cacheWrite,cCw)+'  '+seg('cm',missTok,missCost)+
       '  '+seg('out',output,cOut)+'  '+seg('in',input,cIn)+
-      '  <span class="rl-lbl">ctx</span> '+fmtTokShort(ctxTok)+' <span class="rl-pct">'+fmtCost(ctxCost)+'</span>';
+      '  <span class="rl-lbl">ctx</span> '+fmtTokShort(ctxTok)+' <span class="rl-pct">'+fmtCost(ctxCost)+'</span>'+
+      (fmtDur(respMs)?'  <span class="rl-lbl">t</span> '+fmtDur(respMs):'');
     var lineEl = statEls[msg.id];
     if (!lineEl) {
       lineEl = document.createElement('div');
@@ -987,14 +999,21 @@ function createSessionView(INFO){
     if (entry.uuid) { if (seenUuids[entry.uuid]) return; seenUuids[entry.uuid] = true; }
     var msg = entry.message;
     if (!msg) return;
+    var ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
     if (entry.role === 'assistant') {
+      var respGap = (!isNaN(ts) && lastUserTs != null) ? ts - lastUserTs : null;
+      if (!isNaN(ts)) lastAsstTs = ts;
+      // record each tool_use's start so its result card can show how long the tool took
+      if (!isNaN(ts)) for (var i=0;i<(msg.content||[]).length;i++) { var b=msg.content[i]; if (b.type==='tool_use' && b.id) toolStart[b.id]=ts; }
       renderAssistant(msg, hist);
-      if (msg.usage) emitMsgStats(msg, hist);
+      if (msg.usage) emitMsgStats(msg, hist, respGap);
     } else if (entry.role === 'user') {
+      var youGap = (!isNaN(ts) && lastAsstTs != null) ? ts - lastAsstTs : null;
+      if (!isNaN(ts)) lastUserTs = ts;
       if (entry.compact) { renderCompactMarker(msg, hist); return; }
       var hasToolResult = (msg.content||[]).some(function(b){ return b.type==='tool_result'; });
-      if (hasToolResult) renderToolResults(msg);
-      renderUserMessage(msg, hist);
+      if (hasToolResult) renderToolResults(msg, ts);
+      renderUserMessage(msg, hist, youGap);
     }
     repinPermissions();
   }
@@ -1043,7 +1062,8 @@ function createSessionView(INFO){
     var inputStr = formatToolInput(block.name, block.input);
     card.innerHTML =
       '<div class="tool-hdr" onclick="toggleTool(this)"><span class="tool-name">'+esc(block.name)+'</span>'+
-        '<span class="tool-status '+(hist?'done':'running')+'" id="ts-'+id+'">'+(hist?'Done':'Running')+'</span>'+
+        '<span class="tool-meta"><span class="tool-time" id="tm-'+id+'"></span>'+
+          '<span class="tool-status '+(hist?'done':'running')+'" id="ts-'+id+'">'+(hist?'Done':'Running')+'</span></span>'+
         '<span class="tool-toggle" id="tt-'+id+'">&#9660;</span></div>'+
       '<div class="tool-body open" id="tb-'+id+'"><div class="tool-input"><pre>'+esc(inputStr)+'</pre></div>'+
         '<div class="tool-output" id="to-'+id+'"></div></div>';
@@ -1051,7 +1071,7 @@ function createSessionView(INFO){
     transcript.appendChild(card);
     scrollBottom();
   }
-  function renderToolResults(msg) {
+  function renderToolResults(msg, resultTs) {
     for (var i=0;i<(msg.content||[]).length;i++) {
       var block = msg.content[i];
       if (block.type!=='tool_result') continue;
@@ -1060,6 +1080,8 @@ function createSessionView(INFO){
       if (!outputEl) continue;
       var isError = block.is_error;
       if (statusEl) { statusEl.className = 'tool-status '+(isError?'error':'done'); statusEl.textContent = isError?'Error':'Done'; }
+      var timeEl = document.getElementById('tm-'+id);
+      if (timeEl && toolStart[id]!=null && !isNaN(resultTs)) timeEl.textContent = fmtDur(resultTs - toolStart[id]);
       var content = '';
       if (typeof block.content==='string') content = block.content;
       else if (Array.isArray(block.content)) content = block.content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
@@ -1203,12 +1225,13 @@ function createSessionView(INFO){
     transcript.appendChild(mk);
     scrollBottom();
   }
-  function renderUserMessage(msg, hist) {
+  function renderUserMessage(msg, hist, gap) {
     var text = (msg.content||[]).filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('').trim();
     if (!text || isSystemNoise(text)) return false;
     var mEl = document.createElement('div');
     mEl.className = 'msg you'+(hist?' hist':'');
-    mEl.innerHTML = '<div class="msg-label">You</div><div class="msg-body">'+esc(text)+'</div>';
+    var yt = fmtDur(gap);
+    mEl.innerHTML = '<div class="msg-label">You'+(yt?' <span class="msg-time">'+yt+'</span>':'')+'</div><div class="msg-body">'+esc(text)+'</div>';
     transcript.appendChild(mEl);
     scrollBottom();
     return true;
@@ -1453,7 +1476,7 @@ function createSessionView(INFO){
   // — refresh / destroy —
   v.refresh = function(){
     transcript.innerHTML = '';
-    msgEls = {}; toolEls = {}; seenUuids = {}; askCards = {};
+    msgEls = {}; toolEls = {}; seenUuids = {}; askCards = {}; lastUserTs = null; lastAsstTs = null; toolStart = {};
     statEls = {}; statTurnNo = {}; statTurns = 0; statSeenFirst = false;
     historyLoaded = false; pendingTranscript = []; pendingAsk = null;
     following = true; anchorEl = null;
