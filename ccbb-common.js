@@ -314,7 +314,7 @@ function computeSessionStats(sessionId, opts) {
   // Average server response time: for each billable assistant message on the MAIN transcript,
   // its write time minus the last user entry (prompt or tool_result) before it. Anchored to the
   // last user entry, not the adjacent line, since one response spans several assistant entries.
-  let lastUserTs = null, respSum = 0, respCount = 0;
+  let lastUserTs = null, respSum = 0, respCount = 0, respOut = 0;
   const seenMsgIds = new Set();
   const seenTurnIds = new Set();
   const PERIODS = ['day', 'week', 'month'];
@@ -358,7 +358,9 @@ function computeSessionStats(sessionId, opts) {
         if (dkey) seenMsgIds.add(dkey);
         if (isMain && d.timestamp && lastUserTs != null) {
           const r = Date.parse(d.timestamp) - lastUserTs;
-          if (r >= 0) { respSum += r; respCount++; }
+          // respOut tracks the output tokens of exactly the messages that contribute to
+          // respSum, so avgOutTps below is the rate over the same measured window as `t`.
+          if (r >= 0) { respSum += r; respCount++; respOut += d.message.usage.output_tokens || 0; }
         }
         const u = d.message.usage;
         const inp = u.input_tokens || 0, out = u.output_tokens || 0;
@@ -445,6 +447,9 @@ function computeSessionStats(sessionId, opts) {
   s.context = periodFilter ? null : lastCtx;
   s.contextMax = periodFilter ? null : maxCtx;
   s.avgResponseMs = respCount ? respSum / respCount : null;
+  // Output tokens per second of response time — equivalently avg output tokens ÷ avg
+  // response time, since both share respCount. Null when no response time was measured.
+  s.avgOutTps = respSum > 0 ? respOut / (respSum / 1000) : null;
   s.models = Object.values(modelMap).sort((a, b) => b.cost - a.cost);
   s.providers = Object.values(providerMap).sort((a, b) => b.cost - a.cost);
   s.title = customTitle !== undefined ? customTitle : (aiTitle || '');
@@ -467,9 +472,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 4 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 6 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 4, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 6, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 function saveStatsCache() {
@@ -1070,6 +1075,10 @@ function listSessions() {
 function newBucket() {
   return {
     cost: 0, tokens: 0, turns: 0, subTurns: 0,
+    // Response time and the output tokens produced in it, over main-transcript messages
+    // only (see sessionContribution). Summed, not averaged, so buckets stay mergeable:
+    // the avg and the tok/s rate are derived at render time.
+    respMs: 0, respCount: 0, respOut: 0,
     categories: {
       input:      { tokens: 0, cost: 0 },
       cacheRead:  { tokens: 0, cost: 0 },
@@ -1082,6 +1091,7 @@ function newBucket() {
 function addToBucket(b, m) {
   b.cost += m.cost; b.tokens += m.tokens;
   b.turns += 1; if (m.sub) b.subTurns += 1;
+  if (m.respMs != null) { b.respMs += m.respMs; b.respCount += 1; b.respOut += m.out; }
   b.categories.input.tokens      += m.inp;     b.categories.input.cost      += m.cInp;
   b.categories.cacheRead.tokens  += m.cr;      b.categories.cacheRead.cost  += m.cCr;
   b.categories.cacheWrite.tokens += m.cw;      b.categories.cacheWrite.cost += m.cCw;
@@ -1090,6 +1100,7 @@ function addToBucket(b, m) {
 }
 function addBucketInto(d, s) {
   d.cost += s.cost; d.tokens += s.tokens; d.turns += s.turns; d.subTurns += s.subTurns;
+  d.respMs += s.respMs || 0; d.respCount += s.respCount || 0; d.respOut += s.respOut || 0;
   for (const k of Object.keys(s.categories)) {
     d.categories[k].tokens += s.categories[k].tokens;
     d.categories[k].cost   += s.categories[k].cost;
@@ -1111,6 +1122,7 @@ function sessionContribution(usagePaths) {
   const addScope = (sc, m, prov, model) => { addToBucket(sc.all, m); addToBucket(slug(sc.byProvider, prov), m); addToBucket(slug(sc.byModel, model), m); };
   const mainPath = usagePaths[0];
   const firstSeen = {};
+  let lastUserTs = null;
   for (const fp of usagePaths) {
     const isSub = fp !== mainPath;
     let text;
@@ -1119,6 +1131,13 @@ function sessionContribution(usagePaths) {
       if (!line.trim()) continue;
       let d;
       try { d = JSON.parse(line); } catch { continue; }
+      // Anchor for response time: the last user entry (prompt or tool_result) before an
+      // assistant message. Main transcript only — subagent turns are billed but their
+      // timings aren't part of the session's measured response. Mirrors computeSessionStats.
+      if (!isSub && d.type === 'user' && d.timestamp) {
+        const t = Date.parse(d.timestamp);
+        if (!isNaN(t)) lastUserTs = t;
+      }
       if (d.type !== 'assistant' || !d.message || !d.message.usage) continue;
       const dkey = d.message.id ? d.message.id + '|' + (d.requestId || '') : null;
       if (dkey && seen.has(dkey)) continue;
@@ -1136,10 +1155,17 @@ function sessionContribution(usagePaths) {
       const isFirst = !firstSeen[fp];
       firstSeen[fp] = true;
       const miss = (cr === 0 && !isFirst);
+      // null (not 0) when unmeasurable, so addToBucket can tell "no sample" from "0ms".
+      let respMs = null;
+      if (!isSub && d.timestamp && lastUserTs != null) {
+        const r = Date.parse(d.timestamp) - lastUserTs;
+        if (r >= 0) respMs = r;
+      }
       const m = {
         inp, out, cr, cw, cInp, cOut, cCr, cCw, sub: isSub ? 1 : 0,
         missTok: miss ? cw : 0, missCost: miss ? cCw : 0,
         tokens: inp + out + cr + cw, cost: cInp + cOut + cCr + cCw,
+        respMs,
       };
       const prov = String(d.message.id || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic';
       const model = d.message.model || 'unknown';

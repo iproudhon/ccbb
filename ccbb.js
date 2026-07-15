@@ -39,6 +39,14 @@ function fmtTokK(t) {
   if (t >= 1e3) return (t / 1e3).toFixed(1) + 'K';
   return String(t);
 }
+// Avg response time + output tokens/sec for a cost-summary bucket, e.g. "17s 49.0/s".
+// Both derive from summed respMs/respOut, so they stay correct across merged buckets.
+function fmtRespRate(b) {
+  if (!b || !b.respCount || !(b.respMs > 0)) return '—';
+  const avgS = b.respMs / b.respCount / 1000;
+  const dur = avgS < 10 ? avgS.toFixed(1) + 's' : Math.round(avgS) + 's';
+  return dur + ' ' + (b.respOut / (b.respMs / 1000)).toFixed(1) + '/s';
+}
 function fmtDate(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -155,8 +163,10 @@ function sortSessions(sessions, opt) {
 }
 
 // Resolve flexible widths, then print a header + colored rows for the given column defs.
-function printTable(cols, rows, width) {
-  const gap = 2;
+// opts.gap overrides the inter-column spacing (default 2) — the cost summary is all
+// fixed-width columns, so a tighter gap is the only lossless way to keep it inside 80.
+function printTable(cols, rows, width, opts) {
+  const gap = (opts && opts.gap) || 2;
   const fixedTotal = cols.filter(col => !col.flex).reduce((a, col) => a + col.w, 0);
   const gaps = (cols.length - 1) * gap;
   const flexCols = cols.filter(col => col.flex);
@@ -226,6 +236,7 @@ function printCostSummary(scope, label, extended) {
     cm: catVal(b.categories.cacheMiss, b.cost),
     out: catVal(b.categories.output, b.cost),
     in: catVal(b.categories.input, b.cost),
+    time: fmtRespRate(b),
   });
   const rows = keys.map(k => rowFor(PROV_LABEL_CLI[k] || k, map[k]));
   if (keys.length > 1) rows.push(rowFor('Total', scope.all));
@@ -234,16 +245,20 @@ function printCostSummary(scope, label, extended) {
   const cols = [
     { head: '', align: 'l', w: nameW, get: r => r.name, color: c.bold },
     { head: 'USD', align: 'r', w: 8, get: r => r.cost, color: c.green },
-    { head: 'TOKENS', align: 'r', w: 7, get: r => r.tokens, color: c.gray },
-    { head: 'TURNS', align: 'r', w: extended ? 9 : 8, get: r => r.turns, color: c.gray },
+    // TOKENS: fmtTokK never exceeds 6 ("999.9M"/"1.0B"), so the 7th column was dead space —
+    // spend it on TURNS, which otherwise clips the all-time "10855+882" to "10855+8…".
+    { head: 'TOKENS', align: 'r', w: 6, get: r => r.tokens, color: c.gray },
+    { head: 'TURNS', align: 'r', w: 9, get: r => r.turns, color: c.gray },
     { head: extended ? 'CACHE READ' : 'CR',  align: 'r', w: cw, get: r => r.cr,  color: extended ? null : c.gray },
     { head: extended ? 'CACHE WRITE' : 'CW', align: 'r', w: cw, get: r => r.cw,  color: extended ? null : c.gray },
     { head: extended ? 'CACHE MISS' : 'CM',  align: 'r', w: cw, get: r => r.cm,  color: extended ? null : c.gray },
     { head: 'OUT', align: 'r', w: extended ? 12 : 6, get: r => r.out, color: extended ? null : c.gray },
     { head: 'IN',  align: 'r', w: extended ? 12 : 6, get: r => r.in,  color: extended ? null : c.gray },
+    { head: 'TIME', align: 'r', w: 11, get: r => r.time, color: c.gray },
   ];
   console.log(c.bold(`Cost summary${label ? ' — ' + label : ''}`));
-  printTable(cols, rows, process.stdout.columns || 80);
+  // gap 1: with TIME added, gap 2 ran to 89 cols worst-case ("Bedrock"/"Total" rows).
+  printTable(cols, rows, process.stdout.columns || 80, { gap: 1 });
   console.log('');
 }
 

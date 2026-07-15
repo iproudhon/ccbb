@@ -677,6 +677,13 @@ function createListView(){
     var pct = totCost > 0 ? (cat.cost/totCost*100).toFixed(1) : '0.0';
     return '<td class="c-tok">'+fmtTokK(cat.tokens)+' '+gsub(pct+'%')+'</td>';
   }
+  // Avg response time + output tokens/sec for a bucket, e.g. "17s 49.0/s". Derived from the
+  // bucket's summed respMs/respOut, so it stays correct for merged rows (Total).
+  function respRateHtml(b){
+    if (!b || !b.respCount || !(b.respMs > 0)) return '<td class="c-tok">—</td>';
+    return '<td class="c-tok">'+fmtDur(b.respMs/b.respCount)+
+      ' <span class="c-sub">'+(b.respOut/(b.respMs/1000)).toFixed(1)+'/s</span></td>';
+  }
   function provRowHtml(label, b){
     var c = b.categories;
     var rowCost = b.cost;
@@ -690,6 +697,7 @@ function createListView(){
       + catCell(c.cacheMiss, rowCost)
       + catCell(c.output, rowCost)
       + catCell(c.input, rowCost)
+      + respRateHtml(b)
       + '</tr>';
   }
   function providerTableHtml(scope){
@@ -700,7 +708,7 @@ function createListView(){
     var tbody = keys.map(function(k){ return provRowHtml(PROV_LABEL[k]||k, map[k]); }).join('');
     var tfoot = keys.length > 1 ? '<tfoot>'+provRowHtml('Total', scope.all)+'</tfoot>' : '';
     var thead = '<thead><tr><th>&nbsp;</th><th>USD</th><th>Tokens</th><th>Turns</th>'
-      + '<th>Cache Read</th><th>Cache Write</th><th>Cache Miss</th><th>Out</th><th>In</th></tr></thead>';
+      + '<th>Cache Read</th><th>Cache Write</th><th>Cache Miss</th><th>Out</th><th>In</th><th>Time</th></tr></thead>';
     return '<table class="sum-table prov">'+thead+'<tbody>'+tbody+'</tbody>'+tfoot+'</table>';
   }
   function renderSummary() {
@@ -912,7 +920,8 @@ function createSessionView(INFO){
     var c = st.categories||{}, totCost = st.cost||0;
     function cat(label,key){ var x=c[key]||{tokens:0,cost:0}; return '<span class="rl-lbl">'+label+'</span> '+fmtTokShort(x.tokens)+' <span class="rl-pct">'+fmtPct(x.cost,totCost)+'</span>'; }
     var tokStr = cat('cr','cacheRead')+'  '+cat('cw','cacheWrite')+'  '+cat('cm','cacheMiss')+'  '+cat('out','output')+'  '+cat('in','input')+
-      (fmtDur(st.avgResponseMs)?'  <span class="rl-lbl">t</span> '+fmtDur(st.avgResponseMs):'');
+      (fmtDur(st.avgResponseMs)?'  <span class="rl-lbl">t</span> '+fmtDur(st.avgResponseMs)+
+        (st.avgOutTps?' '+st.avgOutTps.toFixed(1)+'/s':''):'');
     var ctx = st.context;
     var ctxStr = ctx ? '  &middot;  ctx:'+(ctx.postCompact?'~':'')+'<b>'+fmtTokShort(ctx.tokens)+'</b>/'+fmtCost(ctx.cost)+
       (ctx.postCompact?' <span class="subturns">post-compact</span>':'') : '';
