@@ -922,8 +922,10 @@ function createSessionView(INFO){
     var tokStr = cat('cr','cacheRead')+'  '+cat('cw','cacheWrite')+'  '+cat('cm','cacheMiss')+'  '+cat('out','output')+'  '+cat('in','input')+
       (fmtDur(st.avgResponseMs)?'  <span class="rl-lbl">t</span> '+fmtDur(st.avgResponseMs)+
         (st.avgOutTps?' '+st.avgOutTps.toFixed(1)+'/s':''):'');
-    var ctx = st.context;
-    var ctxStr = ctx ? '  &middot;  ctx:'+(ctx.postCompact?'~':'')+'<b>'+fmtTokShort(ctx.tokens)+'</b>/'+fmtCost(ctx.cost)+
+    var ctx = st.context, cmax = st.contextMax;
+    var peakStr = ctx && cmax && fmtTokShort(cmax.tokens)!==fmtTokShort(ctx.tokens)
+      ? ' <span class="subturns">peak '+fmtTokShort(cmax.tokens)+'</span>' : '';
+    var ctxStr = ctx ? '  &middot;  ctx:'+(ctx.postCompact?'~':'')+'<b>'+fmtTokShort(ctx.tokens)+'</b>/'+fmtCost(ctx.cost)+peakStr+
       (ctx.postCompact?' <span class="subturns">post-compact</span>':'') : '';
     var turns = st.turns||0, subTurns = st.subTurns||0;
     var subStr = subTurns>0?' <span class="subturns">+'+subTurns+'</span>':'';

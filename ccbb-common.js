@@ -309,6 +309,7 @@ function computeSessionStats(sessionId, opts) {
   const s = { startedAt: null, lastActivity: null, totalTokens: 0, cost: 0, turns: 0,
     categories, models: [], providers: [], context: null, contextMax: null, subTurns: 0, hasUsage: false, title: '' };
   let lastCtxTs = null, lastCtx = null, maxCtx = null;
+  const ctxSamples = []; const seenCtxIds = new Set();
   let lastCompactTs = null, lastCompactTokens = 0;
   let aiTitle, customTitle, firstTs = null;
   // Average server response time: for each billable assistant message on the MAIN transcript,
@@ -427,13 +428,32 @@ function computeSessionStats(sessionId, opts) {
           lastCtxTs = d.timestamp || lastCtxTs;
           lastCtx = { tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6, model: d.message.model || null, max: contextMaxFor(d.message.model) };
         }
-        // Peak context the session ever reached — differs from the current context after a
-        // /compact (which resets it) or when the final turn is smaller than an earlier one.
-        if (!maxCtx || ctxTok > maxCtx.tokens) {
-          maxCtx = { tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6, model: d.message.model || null, max: contextMaxFor(d.message.model) };
+        // Collect per-turn context samples (deduped by message id, in chronological order)
+        // so the peak can be computed after the loop with spike artifacts discounted.
+        if (!(d.message.id && seenCtxIds.has(d.message.id))) {
+          if (d.message.id) seenCtxIds.add(d.message.id);
+          ctxSamples.push({ tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6,
+            model: d.message.model || null, ts: d.timestamp ? Date.parse(d.timestamp) : null });
         }
       }
     }
+  }
+  // Peak context the session ever reached — differs from the current context after a
+  // /compact (which resets it) or when the final turn is smaller than an earlier one.
+  // Discount cache-accounting spikes: on a prompt-cache refresh the usage can double-count
+  // the cached prefix, so a lone turn reads ~2x the surrounding turns and reverts on the
+  // next one. Signature: context >= 1.8x both neighbors, and the neighbors match each other
+  // (the pre/post-revert level) — the symmetry check also rejects subagent-interleave cases
+  // where the neighbors are a small subagent turn and a full main turn. Skip such turns.
+  const SPIKE_RATIO = 1.8, NEIGHBOR_SYM = 0.7;
+  for (let i = 0; i < ctxSamples.length; i++) {
+    const c = ctxSamples[i], prev = ctxSamples[i - 1], next = ctxSamples[i + 1];
+    if (prev && next) {
+      const lo = Math.min(prev.tokens, next.tokens), hi = Math.max(prev.tokens, next.tokens);
+      if (hi > 0 && c.tokens >= SPIKE_RATIO * hi && lo >= NEIGHBOR_SYM * hi) continue;
+    }
+    if (!maxCtx || c.tokens > maxCtx.tokens)
+      maxCtx = { tokens: c.tokens, cost: c.cost, model: c.model, max: contextMaxFor(c.model) };
   }
   if (lastCompactTs && (!lastCtxTs || lastCompactTs > lastCtxTs)) {
     const model = lastCtx ? lastCtx.model : null;
@@ -472,9 +492,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 6 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 8 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 6, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 8, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 function saveStatsCache() {
