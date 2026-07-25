@@ -482,6 +482,111 @@ function computeSessionStats(sessionId, opts) {
   return s;
 }
 
+// ── Skeleton extraction (privacy-safe, for stats collection / replay) ─────────
+// Reduces a session to structure + numbers only: NO message text, tool args/results,
+// prompts, cwd, file paths, git branches or titles survive. What's kept is a session
+// fingerprint (SHA over the main transcript's event sequence — used to dedup identical
+// sessions across a collection) plus one numeric row per billable assistant message
+// (token usage, provider, model, response time, local hour). Provider is anthropic vs
+// bedrock (msg_bdrk_ id prefix); a custom Anthropic-compatible endpoint can't be told
+// apart from subscription and reads as 'anthropic'.
+function buildSkeleton(sessionId, opts = {}) {
+  const usagePaths = sessionUsagePaths(sessionId, opts.mainPath);
+  if (!usagePaths.length) return null;
+  const mainPath = usagePaths[0];
+  const responses = [];
+  const models = new Set(), providers = new Set();
+  const fpParts = [];
+  const seenMsgIds = new Set();
+  let version = null, startedAt = null, lastActivity = null;
+  for (const filePath of usagePaths) {
+    const isMain = filePath === mainPath;
+    let text;
+    try { text = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
+    let lastUserTs = null;
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let d;
+      try { d = JSON.parse(line); } catch { continue; }
+      if (d.sessionId && d.sessionId !== sessionId) continue;
+      if (d.version && !version) version = d.version;
+      if (d.timestamp) {
+        if (!startedAt || d.timestamp < startedAt) startedAt = d.timestamp;
+        if (!lastActivity || d.timestamp > lastActivity) lastActivity = d.timestamp;
+      }
+      // Structural fingerprint — main transcript only, in file order. Records the shape
+      // of the conversation (turn kinds + tool names), never any content.
+      if (isMain && d.message) {
+        const c = d.message.content;
+        if (d.type === 'user') {
+          const isTR = Array.isArray(c) && c.some(b => b && b.type === 'tool_result');
+          fpParts.push(isTR ? 'r' : 'u');
+        } else if (d.type === 'assistant' && Array.isArray(c)) {
+          for (const b of c) {
+            if (!b) continue;
+            if (b.type === 'tool_use') fpParts.push('t:' + (b.name || ''));
+            else if (b.type === 'text') fpParts.push('x');
+            else if (b.type === 'thinking') fpParts.push('k');
+            else fpParts.push(b.type || '?');
+          }
+        }
+      }
+      if (isMain && d.type === 'user' && d.timestamp) {
+        const t = Date.parse(d.timestamp); if (!isNaN(t)) lastUserTs = t;
+      }
+      const dkey = (d.message && d.message.id) ? d.message.id + '|' + (d.requestId || '') : null;
+      if (d.type === 'assistant' && d.message && d.message.usage && !(dkey && seenMsgIds.has(dkey))) {
+        if (dkey) seenMsgIds.add(dkey);
+        const u = d.message.usage;
+        const input = u.input_tokens || 0, output = u.output_tokens || 0;
+        const cacheRead = u.cache_read_input_tokens || 0, cacheWrite = u.cache_creation_input_tokens || 0;
+        const provider = String(d.message.id || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic';
+        const model = d.message.model || 'unknown';
+        models.add(model); providers.add(provider);
+        let respMs = null;
+        if (isMain && d.timestamp && lastUserTs != null) {
+          const r = Date.parse(d.timestamp) - lastUserTs;
+          if (r >= 0) respMs = r;
+        }
+        const ts = d.timestamp || null;
+        responses.push({
+          ts,
+          hour: ts ? new Date(ts).getHours() : null,   // local hour at extraction time
+          model, provider, main: isMain,
+          input, cacheRead, cacheWrite, output,
+          promptTokens: input + cacheRead + cacheWrite,  // context fed in
+          respMs,
+        });
+      }
+    }
+  }
+  if (!responses.length) return null;
+  const fingerprint = crypto.createHash('sha256').update(fpParts.join('|')).digest('hex').slice(0, 16);
+  return {
+    sessionId, fingerprint, version, startedAt, lastActivity,
+    models: [...models], providers: [...providers],
+    responses,
+  };
+}
+
+// Build skeletons for every discoverable session. Returns the collection object that
+// `ccbb skel` serializes to one JSON file.
+function buildAllSkeletons() {
+  const idx = sessionPathIndex(true);
+  const sessions = [];
+  for (const [sessionId, mainPath] of idx) {
+    let sk = null;
+    try { sk = buildSkeleton(sessionId, { mainPath }); } catch {}
+    if (sk) sessions.push(sk);
+  }
+  return {
+    tool: 'ccbb', kind: 'skeleton', schema: 1,
+    generatedAt: new Date().toISOString(),
+    count: sessions.length,
+    sessions,
+  };
+}
+
 // ── Stats cache (size+mtime keyed, persisted to CLAUDE_DIR/ccbb-cache.json) ────
 // Session JSONLs are append-only, so a session's computed stats stay valid until one of
 // its files changes size or mtime. Only unfiltered (all-time) stats are cached. Cached
@@ -1226,6 +1331,7 @@ module.exports = {
   // discovery + stats
   periodKey, sessionJsonlPaths, sessionPathIndex, findSessionJsonl,
   collectJsonl, sessionUsagePaths, computeSessionStats, getSessionStats, getSessionSummary,
+  buildSkeleton, buildAllSkeletons,
   loadStatsCache, saveStatsCache, sessionSig, pruneStatsCache,
   // listing + cost summary
   getSessions, listSessions, sessionContribution, getCostSummary,

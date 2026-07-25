@@ -350,6 +350,8 @@ Usage:
      [--webex]             ...also run the Webex front-end (one process)
      [--confluence]        ...also run the Confluence page front-end
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
+  ccbb skel [-o file]      extract privacy-safe session skeletons to one JSON (see: ccbb skel -h)
+  ccbb stats <file...>     render an HTML stats report from skeletons (see: ccbb stats -h)
 
 With no command, 'ls' is assumed.`);
 }
@@ -363,6 +365,8 @@ function main() {
   if (cmd === 'ls') return runLs(rest);
   if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);
   if (cmd === 'web') return require('./ccbb-web').runWeb(rest);
+  if (cmd === 'skel') return require('./ccbb-stats').runSkel(rest);
+  if (cmd === 'stats') return require('./ccbb-stats').runStats(rest);
   console.error(`ccbb: unknown command '${cmd}'. Try: ccbb help`);
   process.exit(1);
 }

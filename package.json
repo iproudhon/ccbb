@@ -19,6 +19,7 @@
   "files": [
     "ccbb.js",
     "ccbb-common.js",
+    "ccbb-stats.js",
     "ccbb-web.js",
     "ccbb-webex.js",
     "ccbb-confluence.js",
