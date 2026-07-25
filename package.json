@@ -1,6 +1,6 @@
 {
   "name": "ccbb",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Read-only browser and live remote for your Claude Code sessions — terminal, web, Webex, and Confluence front-ends.",
   "keywords": [
     "claude",
