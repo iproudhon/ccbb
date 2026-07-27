@@ -221,11 +221,22 @@ function buildView(src, cap) {
   const sum = Array(24).fill(0), cnt = Array(24).fill(0);
   for (const r of withTiming) { if (r.hour != null) { sum[r.hour] += r.respMs; cnt[r.hour]++; } }
   const s = samplePoints(src, cap);
+  // True per-response means over the raw rows — independent of the histogram binning, so the
+  // reference lines don't move when the log toggle changes the bins.
+  const R = Math.round;
+  let cr = 0, cw = 0, dec = 0, rs = 0;
+  for (const r of src) { cr += r.cacheRead; cw += r.cacheWrite; dec += r.output; }
+  for (const r of withTiming) rs += r.respMs;
+  const n = src.length || 1;
+  const means = {
+    cr: R(cr / n), cw: R(cw / n), dec: R(dec / n), total: R((cr + cw + dec) / n),
+    resp: withTiming.length ? R(rs / withTiming.length) : 0,
+  };
   return {
     lin: { all: makeAgg(src, false), resp: makeAgg(withTiming, false) },
     log: { all: makeAgg(src, true), resp: makeAgg(withTiming, true) },
     hour: { sum: sum.map(Math.round), cnt },
-    pts: s.pts, ptsTotal: s.total,
+    pts: s.pts, ptsTotal: s.total, means,
   };
 }
 function buildViews(rows, cap) {
@@ -269,7 +280,7 @@ svg{display:block;max-width:100%;height:auto}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 8px;color:__secondary__;font-size:12px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
-.sw1{background:__s1__}.sw2{background:__s2__}.sw3{background:__s3__}
+.sw0{background:__primary__}.sw1{background:__s1__}.sw2{background:__s2__}.sw3{background:__s3__}
 .foot{color:__muted__;font-size:12px;margin-top:8px}
 .tip{position:fixed;left:0;top:0;pointer-events:none;background:__surface__;color:__primary__;
   border:1px solid __border__;border-radius:8px;padding:6px 9px;font-size:12px;line-height:1.5;
@@ -289,13 +300,13 @@ const MARKUP = `
     <label><input type="checkbox" id="logToggle"> log scaling (histogram bins &amp; response-time axis)</label>
     <label><input type="checkbox" id="outToggle"> remove outliers (0-size &amp; 0-response, or response &gt; 10&nbsp;min)</label>
   </div>
-  <div class="card"><h2>Prompt Size Distribution</h2><p class="desc">responses binned by total prompt (cache-read + cache-write + decode); each bar stacked by token-type share of that bin</p>
-    <div class="legend"><span><i class="sw1"></i>cache read</span><span><i class="sw2"></i>cache write</span><span><i class="sw3"></i>decode</span></div><div id="stack-count"></div></div>
+  <div class="card"><h2>Prompt Size Distribution</h2><p class="desc">responses binned by total prompt (cache-read + cache-write + decode); dashed lines show the average prompt composition, stacked (own token scale) — averages in the legend</p>
+    <div class="legend" id="stack-count-legend"></div><div id="stack-count"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Response Time</h2><p class="desc">avg response time binned by total prompt; each bar stacked by token-type share of that bin</p>
     <div class="legend"><span><i class="sw1"></i>cache read</span><span><i class="sw2"></i>cache write</span><span><i class="sw3"></i>decode</span></div><div id="stack-resp"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Decode</h2><p class="desc">avg decode (output) tokens per response, binned by total prompt</p><div id="avg-decode"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Cache Write</h2><p class="desc">avg cache-write tokens per response, binned by total prompt</p><div id="avg-cw"></div></div>
-  <div class="card"><h2>Prompt&nbsp;+&nbsp;output size&nbsp;→&nbsp;response time</h2><p class="desc">each dot is one response (main-transcript responses with timing)<span id="pts-note"></span></p><div id="scatter"></div></div>
+  <div class="card"><h2>Prompt&nbsp;+&nbsp;output size&nbsp;→&nbsp;response time</h2><p class="desc">each dot is one response (main-transcript responses with timing); orange line = mean response time per x-slot (12 slots)<span id="pts-note"></span></p><div id="scatter"></div></div>
   <div class="card"><h2>Time of day&nbsp;→&nbsp;avg response time</h2><p class="desc">mean response time by local hour</p><div id="hour"></div></div>
   <p class="foot" id="foot"></p>
 `;
@@ -386,6 +397,16 @@ function axisLabel(x, y, txt, rot){
   var a = {x:x, y:y, 'text-anchor':'middle', fill:PAL.secondary, 'font-size':12};
   if(rot) a.transform = rot;
   var t = el('text', a); t.textContent = txt; return t; }
+// Dashed horizontal reference line at data value val on a 0-to-maxH y-scale, labelled at right.
+function meanLine(svg, val, maxH, label){
+  if(!(val > 0) || !(maxH > 0)) return;
+  var y = M.t + IH - IH * Math.min(val, maxH) / maxH;
+  svg.appendChild(el('line',{x1:M.l, y1:y, x2:M.l+IW, y2:y, stroke:PAL.secondary,
+    'stroke-width':1.5, 'stroke-dasharray':'5 4'}));
+  var t = el('text',{x:M.l+IW-2, y:y-4, 'text-anchor':'end', fill:PAL.secondary,
+    'font-size':11, 'font-variant-numeric':'tabular-nums'});
+  t.textContent = label; svg.appendChild(t);
+}
 
 function drawScatter(log){
   var hostEl = $('scatter'); hostEl.innerHTML = '';
@@ -408,6 +429,25 @@ function drawScatter(log){
     var c = el('circle',{cx:sx(p[0]), cy:sy(p[1]), r:3.5, fill:PAL.series, 'fill-opacity':0.55});
     c.addEventListener('mousemove', function(e){
       showTip('<b>'+fmt(p[0])+'</b> tok in+out<br><b>'+fmtMs(p[1])+'</b> response', e); });
+    c.addEventListener('mouseleave', hideTip); svg.appendChild(c);
+  });
+  // Binned trend: split x into 12 slots, connect each slot's mean response time.
+  var SLOTS = 12, sw = xMax / SLOTS;
+  var ss = [], sc = [];
+  for(var s=0; s<SLOTS; s++){ ss.push(0); sc.push(0); }
+  pts.forEach(function(p){ var i = Math.min(SLOTS-1, Math.floor(p[0]/sw)); ss[i]+=p[1]; sc[i]++; });
+  var d = '', started = false, dots = [];
+  for(var s2=0; s2<SLOTS; s2++){
+    if(!sc[s2]){ started = false; continue; }
+    var av = ss[s2]/sc[s2], cx = sx((s2+0.5)*sw), cy = sy(av);
+    d += (started?' L':'M') + cx.toFixed(1) + ' ' + cy.toFixed(1); started = true;
+    dots.push([cx, cy, av, sc[s2]]);
+  }
+  if(d) svg.appendChild(el('path',{d:d, fill:'none', stroke:PAL.s2, 'stroke-width':2}));
+  dots.forEach(function(pt){
+    var c = el('circle',{cx:pt[0], cy:pt[1], r:4, fill:PAL.s2});
+    c.addEventListener('mousemove', function(e){
+      showTip('slot avg<br><b>'+fmtMs(pt[2])+'</b> · '+pt[3]+' resp', e); });
     c.addEventListener('mouseleave', hideTip); svg.appendChild(c);
   });
   svg.appendChild(axisLabel(M.l+IW/2, H-4, 'prompt + output tokens'));
@@ -482,6 +522,27 @@ function drawStacked(id, metric, log){
     }
     if(i % Math.ceil(agg.length/8) === 0) svg.appendChild(tickText(x, M.t+IH+16, 'middle', fmt(a.lo)));
   });
+  if(metric === 'count'){
+    // Overlay the AVERAGE prompt composition as stacked reference bands on their own token
+    // scale (avg total → 90% of plot height): cache read from 0, cache write and decode
+    // stacked above it. Values are shown in the legend, not on the chart.
+    var mn = VIEW.means, tp = mn.total || 1, frac = 0.9;
+    var ty = function(v){ return M.t + IH - IH * frac * v / tp; };
+    var bounds = [[mn.cr, PAL.s1], [mn.cr+mn.cw, PAL.s2], [mn.cr+mn.cw+mn.dec, PAL.s3]];
+    bounds.forEach(function(b){
+      var y = ty(b[0]);
+      svg.appendChild(el('line',{x1:M.l, y1:y, x2:M.l+IW, y2:y, stroke:b[1],
+        'stroke-width':1.5, 'stroke-dasharray':'5 4'}));
+    });
+    var lg = $('stack-count-legend');
+    if(lg) lg.innerHTML =
+      '<span><i class="sw0"></i>Prompt Size: <b>'+fmt(mn.total)+'</b></span>'+
+      '<span><i class="sw1"></i>Cache Read: <b>'+fmt(mn.cr)+'</b></span>'+
+      '<span><i class="sw2"></i>Cache Write: <b>'+fmt(mn.cw)+'</b></span>'+
+      '<span><i class="sw3"></i>Decode: <b>'+fmt(mn.dec)+'</b></span>';
+  } else {
+    meanLine(svg, VIEW.means.resp, maxH, 'avg ' + fmtMs(VIEW.means.resp));
+  }
   svg.appendChild(axisLabel(M.l+IW/2, H-4, 'total prompt tokens' + (got.isLog ? ' (log bins)' : '')));
   hostEl.appendChild(svg);
 }
@@ -510,6 +571,7 @@ function drawAvgBar(id, field, colorKey, log){
     }
     if(i % Math.ceil(agg.length/8) === 0) svg.appendChild(tickText(x, M.t+IH+16, 'middle', fmt(a.lo)));
   });
+  var m = VIEW.means[field] || 0; meanLine(svg, m, maxH, 'avg ' + fmt(m));
   svg.appendChild(axisLabel(M.l+IW/2, H-4, 'total prompt tokens' + (got.isLog ? ' (log bins)' : '')));
   hostEl.appendChild(svg);
 }
