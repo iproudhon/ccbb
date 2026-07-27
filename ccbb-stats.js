@@ -300,7 +300,7 @@ const MARKUP = `
     <label><input type="checkbox" id="logToggle"> log scaling (histogram bins &amp; response-time axis)</label>
     <label><input type="checkbox" id="outToggle"> remove outliers (0-size &amp; 0-response, or response &gt; 10&nbsp;min)</label>
   </div>
-  <div class="card"><h2>Prompt Size Distribution</h2><p class="desc">responses binned by total prompt (cache-read + cache-write + decode); dashed lines show the average prompt composition, stacked (own token scale) — averages in the legend</p>
+  <div class="card"><h2>Prompt Size Distribution</h2><p class="desc">responses binned by total prompt (cache-read + cache-write + decode); vertical dashed lines mark the average prompt composition, cumulative on the token axis (cache read, +cache write, +decode = avg total) — values in the legend</p>
     <div class="legend" id="stack-count-legend"></div><div id="stack-count"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Response Time</h2><p class="desc">avg response time binned by total prompt; each bar stacked by token-type share of that bin</p>
     <div class="legend"><span><i class="sw1"></i>cache read</span><span><i class="sw2"></i>cache write</span><span><i class="sw3"></i>decode</span></div><div id="stack-resp"></div></div>
@@ -397,6 +397,24 @@ function axisLabel(x, y, txt, rot){
   var a = {x:x, y:y, 'text-anchor':'middle', fill:PAL.secondary, 'font-size':12};
   if(rot) a.transform = rot;
   var t = el('text', a); t.textContent = txt; return t; }
+// x pixel for a token value on the binned (linear or log) prompt-size axis: find the bin that
+// contains it and interpolate inside that bin's slot, the same way the bars are laid out.
+function binX(agg, isLog, v, bw){
+  if(!(v > 0)) return M.l;
+  if(v <= agg[0].lo) return M.l;
+  var last = agg[agg.length-1];
+  if(v >= last.hi) return M.l + IW;
+  for(var i=0; i<agg.length; i++){
+    var a = agg[i];
+    if(v < a.lo || v >= a.hi) continue;
+    var f = (isLog && a.lo > 0)
+      ? (Math.log(v) - Math.log(a.lo)) / (Math.log(a.hi) - Math.log(a.lo))
+      : (v - a.lo) / (a.hi - a.lo);
+    if(!isFinite(f)) f = 0;
+    return M.l + (i + f) * bw;
+  }
+  return M.l + IW;
+}
 // Dashed horizontal reference line at data value val on a 0-to-maxH y-scale, labelled at right.
 function meanLine(svg, val, maxH, label){
   if(!(val > 0) || !(maxH > 0)) return;
@@ -523,15 +541,15 @@ function drawStacked(id, metric, log){
     if(i % Math.ceil(agg.length/8) === 0) svg.appendChild(tickText(x, M.t+IH+16, 'middle', fmt(a.lo)));
   });
   if(metric === 'count'){
-    // Overlay the AVERAGE prompt composition as stacked reference bands on their own token
-    // scale (avg total → 90% of plot height): cache read from 0, cache write and decode
-    // stacked above it. Values are shown in the legend, not on the chart.
-    var mn = VIEW.means, tp = mn.total || 1, frac = 0.9;
-    var ty = function(v){ return M.t + IH - IH * frac * v / tp; };
+    // Mark the AVERAGE prompt composition on the token (x) axis: cumulative cache read,
+    // +cache write, +decode — the last one is the average total prompt size. Vertical because
+    // these are token values, which is what x measures. Values are shown in the legend.
+    var mn = VIEW.means;
     var bounds = [[mn.cr, PAL.s1], [mn.cr+mn.cw, PAL.s2], [mn.cr+mn.cw+mn.dec, PAL.s3]];
     bounds.forEach(function(b){
-      var y = ty(b[0]);
-      svg.appendChild(el('line',{x1:M.l, y1:y, x2:M.l+IW, y2:y, stroke:b[1],
+      if(!(b[0] > 0)) return;
+      var x = binX(agg, got.isLog, b[0], bw);
+      svg.appendChild(el('line',{x1:x, y1:M.t, x2:x, y2:M.t+IH, stroke:b[1],
         'stroke-width':1.5, 'stroke-dasharray':'5 4'}));
     });
     var lg = $('stack-count-legend');
