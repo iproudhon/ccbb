@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 
 const common = require('./ccbb-common');
 const {
@@ -293,6 +293,9 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .jump-marker{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;border:none;border-radius:16px;padding:5px 14px;font-size:12px;font-family:inherit;cursor:pointer;display:none;z-index:6;box-shadow:0 2px 6px rgba(0,0,0,.15)}
 .jump-marker.show{display:block}
 .jump-marker:hover{background:var(--accent-hover,#a84f34)}
+/* Transcript prose reads as black, not the app's soft ink. Scoped to the session body so
+   the list view, the bars and the deliberately muted metadata keep their palette. */
+.sv .view-body{color:#000}
 .tr-wrap{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
 .transcript{flex:1;overflow-y:auto;overflow-anchor:none;padding:20px 20px;display:flex;flex-direction:column;align-items:center;gap:24px;position:relative}
 .transcript>*{flex-shrink:0}
@@ -415,11 +418,90 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .input-inner{width:100%;max-width:740px}
 .input-row{display:flex;gap:8px;align-items:flex-end;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:6px 6px 6px 14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .input-row:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.input-box{flex:1;border:none;background:none;padding:4px 0;font-size:14px;font-family:inherit;resize:none;min-height:28px;max-height:200px;line-height:1.5;overflow-y:auto;color:var(--ink)}
+/* Fixed-width, like the terminal: a prompt is usually code, paths and flags, and a
+   proportional font makes those hard to line up and hard to proofread. */
+.input-box{flex:1;border:none;background:none;padding:4px 0;font-size:13px;
+  font-family:ui-monospace,Menlo,Consolas,'Cascadia Code',monospace;resize:none;
+  min-height:28px;max-height:200px;line-height:1.5;overflow-y:auto;color:var(--ink)}
 .input-box:focus{outline:none}
+/* Maximized composer: the whole content area of the session, for writing something long
+   enough that a five-line box is in the way. Everything above it is hidden rather than
+   scrolled off, so the textarea gets the full height instead of a share of it. */
+.view-body.input-max>.sv-stats,.view-body.input-max>.tr-wrap,.view-body.input-max>.cmd-box{display:none}
+.view-body.input-max>.input-area{flex:1 1 auto;min-height:0;border-top:none}
+.view-body.input-max .input-inner{max-width:none;height:100%;display:flex;flex-direction:column}
+.view-body.input-max .input-row{flex:1 1 auto;min-height:0;align-items:stretch}
+.view-body.input-max .input-box{max-height:none;height:100%}
+.view-body.input-max .input-btns{align-self:flex-end}
+/* Laid out in a ROW, not a column: stacked buttons make this box taller than a one-line
+   textarea, and with align-items:flex-end that surplus becomes dead space above the
+   textarea that swallows clicks instead of focusing it. */
+.input-btns{display:flex;align-items:center;gap:4px;flex-shrink:0}
+.exp-btn,.hist-btn{background:none;border:1px solid var(--line);color:var(--ink-soft);
+  width:28px;height:30px;border-radius:9px;font-size:12px;cursor:pointer;font-family:inherit;
+  flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
+.exp-btn:hover:not(:disabled),.hist-btn:hover:not(:disabled){border-color:var(--accent);color:var(--ink);background:var(--accent-soft)}
+.exp-btn:disabled,.hist-btn:disabled{opacity:.35;cursor:default}
+.hist-btn{font-size:10px}
+.hist-sep{width:1px;height:20px;background:var(--line);flex-shrink:0;margin:0 2px}
 .send-btn{background:var(--accent);border:none;color:#fff;width:30px;height:30px;border-radius:9px;font-size:15px;cursor:pointer;font-family:inherit;flex-shrink:0;display:flex;align-items:center;justify-content:center}
 .send-btn:hover:not(:disabled){background:var(--accent-hover,#a84f34)}
 .send-btn:disabled{opacity:.4;cursor:default}
+/* ── ssh terminal ──
+   A terminal is deliberately NOT a view: you want it over whatever you are reading, at
+   whatever size, and still there when you switch sessions. So it floats above #views with
+   its own drag/resize/min/max — and its own font size and theme, because a terminal is
+   read at a different size and contrast than prose. ── */
+.term-win{position:fixed;z-index:80;display:flex;flex-direction:column;background:var(--bg);
+  border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.28);
+  overflow:hidden;min-width:340px;min-height:150px}
+.term-win.max{left:0!important;top:0!important;width:100%!important;height:100%!important;border-radius:0}
+.term-win.min{height:auto!important;min-height:0}
+.term-win.min .term-body,.term-win.min .term-grip{display:none}
+.term-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:6px 8px 6px 14px;
+  background:var(--bg-alt);border-bottom:1px solid var(--line);min-height:34px;font-size:12px;
+  color:var(--ink-soft);cursor:move;user-select:none}
+/* Dot doubles as the connection lamp: grey connecting, green live, red exited. */
+.term-head::before{content:'';flex-shrink:0;width:8px;height:8px;border-radius:50%;background:var(--ink-faint)}
+.term-win.live .term-head::before{background:#2da44e}
+.term-win.dead .term-head::before{background:#cf222e}
+.term-title{font-family:ui-monospace,Menlo,monospace;font-weight:600;color:var(--ink);
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.term-btns{margin-left:auto;display:flex;align-items:stretch;gap:2px;flex-shrink:0}
+.term-btn{background:none;border:none;color:var(--ink-soft);font-size:13px;cursor:pointer;
+  line-height:1;padding:4px 7px;border-radius:6px;font-family:inherit}
+.term-btn:hover{background:var(--line);color:var(--ink)}
+.term-sep{width:1px;margin:3px 3px;background:var(--line);flex-shrink:0}
+.term-body{flex:1 1 auto;min-height:0;padding:6px 4px 6px 8px;background:#fff;overflow:hidden}
+.term-win.dark .term-body{background:#000}
+.term-grip{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;z-index:2}
+.term-grip::after{content:'';position:absolute;right:4px;bottom:4px;width:7px;height:7px;
+  border-right:2px solid var(--ink-faint);border-bottom:2px solid var(--ink-faint);opacity:.7}
+.term-win.max .term-grip,.term-win.min .term-grip{display:none}
+.term-pick{padding:14px 16px;overflow:auto;height:100%;background:var(--bg)}
+.term-note{color:var(--ink-soft);font-size:12.5px;line-height:1.6}
+.term-note code{font-family:ui-monospace,Menlo,monospace;background:var(--code-bg);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+/* Config panel: text size, theme and an explicit grid. Tucked behind the gear rather
+   than spread across the title bar, which a terminal narrowed to 40 columns has no room
+   for. Anchored inside the window, so it travels with it. */
+.term-cfg{position:absolute;top:36px;right:8px;z-index:4;display:none;background:var(--surface);
+  border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.22);
+  padding:10px 12px;font-size:12px;color:var(--ink);min-width:212px}
+.term-win.cfg .term-cfg{display:block}
+.term-cfg .crow{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+.term-cfg .crow:last-child{margin-bottom:0}
+.term-cfg .clbl{color:var(--ink-soft);width:48px;flex-shrink:0}
+.term-cfg button{background:var(--bg-alt);border:1px solid var(--line);border-radius:6px;color:var(--ink);
+  font-family:inherit;font-size:12px;padding:3px 9px;cursor:pointer;line-height:1.4}
+.term-cfg button:hover{border-color:var(--accent);background:var(--accent-soft)}
+.term-cfg .cval{font-family:ui-monospace,Menlo,monospace;min-width:30px;text-align:center;color:var(--ink-soft)}
+.term-cfg input{width:54px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--ink);
+  font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:3px 6px;text-align:right}
+.term-cfg input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.term-cfg .cx{color:var(--ink-faint)}
+.lv .chip-term{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:11px;color:#8c959f;
+  border-radius:5px;padding:0 4px;margin:-2px -6px -2px 0;line-height:1.6}
+.lv .chip-term:hover{background:#d0d7de;color:#1f2328}
 /* toast (replaces alert(): alerts block browser automation and yank focus) */
 #toast{position:fixed;bottom:18px;right:18px;background:#3d3d3a;color:#fff;border-radius:10px;padding:10px 16px;font-size:13px;z-index:99;display:none;max-width:420px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 </style>
@@ -496,10 +578,22 @@ function toggleTool(hdr) {
 //   { kind:'list'|'session', sessionId?, el, barEl, maxed, unseen, refresh(), destroy?() }
 var views = [];
 var viewsEl = document.getElementById('views');
-var orientation = 'vertical';   // 'vertical' (stacked) or 'horizontal' (columns)
+// 'vertical' (stacked) or 'horizontal' (columns). Remembered per server, in a cookie:
+// which way you want the views stacked is a property of the machine you are working on,
+// and two ccbb servers open side by side keep their own answers. (cookieGet and friends
+// live with the terminal below; function declarations hoist.)
+function uiCookieName(){ return 'ccbb_ui_' + String(SELF.name || 'self').replace(/[^A-Za-z0-9]/g, '_'); }
+var uiPrefs = {};
+try { uiPrefs = JSON.parse(cookieGet(uiCookieName()) || '{}') || {}; } catch(e) { uiPrefs = {}; }
+var orientation = uiPrefs.orientation === 'horizontal' ? 'horizontal' : 'vertical';
+function saveUiPrefs(){
+  uiPrefs.orientation = orientation;
+  cookieSet(uiCookieName(), JSON.stringify(uiPrefs));
+}
 function toggleOrientation(){
   orientation = orientation === 'vertical' ? 'horizontal' : 'vertical';
   viewsEl.classList.toggle('horizontal', orientation === 'horizontal');
+  saveUiPrefs();
   relayout();
 }
 function relayout(){
@@ -590,6 +684,7 @@ function makeViewBar(v, barMain, buttons){
   btns.className = 'bar-btns';
   btns.innerHTML = '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
     '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
+    (buttons && buttons.term ? '<button class="vb-btn term-open" data-act="term" title="Terminal on the server this session runs on">&gt;_</button>' : '')+
     (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
     (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
   bar.appendChild(btns);
@@ -598,6 +693,7 @@ function makeViewBar(v, barMain, buttons){
     if (b) {
       e.stopPropagation();
       if (b.dataset.act === 'refresh') v.refresh();
+      else if (b.dataset.act === 'term') { if (v.onTerm) v.onTerm(); }
       else if (b.dataset.act === 'max') toggleMax(v);
       else if (b.dataset.act === 'orient') toggleOrientation();
       else if (b.dataset.act === 'close') closeView(v);
@@ -706,8 +802,8 @@ function createListView(){
   }
   function renderServers(){
     var bar = body.querySelector('#srvbar');
-    // With no peers configured there is nothing to filter — stay out of the way.
-    if (servers.length < 2) { bar.style.display = 'none'; return; }
+    // Shown even for a lone server: the chip is where a machine's terminal is opened
+    // from, so hiding the bar would leave a single-machine install with no launcher.
     bar.style.display = '';
     bar.innerHTML = servers.map(function(s){
       var on = isSelected(s.name);
@@ -715,10 +811,13 @@ function createListView(){
         + (s.inbound ? ' — linked in (reached over its own connection)' : '')
         + (s.status === 'down' ? ' — offline: ' + (s.error||'unreachable') : '')
         + (s.rttMs != null && s.status === 'up' ? ' — ' + s.rttMs + 'ms' : '');
-      return '<button class="chip'+(on?' on':'')+'" data-srv="'+esc(s.name)+'" title="'+esc(tip)+'">'
+      // Not a <button>: it carries the terminal launcher, and a button inside a button
+      // is invalid and swallows the inner click in some browsers.
+      return '<span class="chip'+(on?' on':'')+'" data-srv="'+esc(s.name)+'" title="'+esc(tip)+'">'
         + '<span class="sdot '+esc(s.status||'unknown')+'"></span>'
         + '<span class="cname">'+esc(s.name)+'</span>'
-        + '</button>';
+        + '<span class="chip-term" data-term="'+esc(s.name)+'" title="Open a terminal on '+esc(s.name)+'">&gt;_</span>'
+        + '</span>';
     }).join('');
   }
   async function loadServers(){
@@ -955,6 +1054,8 @@ function createListView(){
       ? 'Total: '+(tc?fc(totals.totalCost):'')+(tc&&tt?' | ':'')+(tt?ft(totals.totalTokens)+' tokens':'') : '';
   }
   body.addEventListener('click', function(e) {
+    var tbtn = e.target.closest('.chip-term[data-term]');
+    if (tbtn) { openTerminalWindow(tbtn.dataset.term); return; }
     var chip = e.target.closest('.chip[data-srv]');
     if (chip) { toggleServer(chip.dataset.srv); return; }
     // Session links open a stacked view instead of navigating (middle-click still works).
@@ -995,6 +1096,9 @@ function createListView(){
 // instead, so the transcript gets the space back.
 var SEND_TIP = 'Send  ·  Ctrl+Enter  ·  Enter inserts a newline  ·  //help for commands';
 var SEND_TIP_OFF = 'Session not running in a tmux pane here — input disabled. // commands still work.';
+var EXPAND_TIP = 'Expand the composer to the whole session';
+var HIST_PREV_TIP = 'Earlier input  ·  this session\\'s prompts and this page\\'s // commands';
+var HIST_NEXT_TIP = 'Later input  ·  past the newest returns what you were typing';
 
 function createSessionView(INFO){
   var v = { kind:'session', sessionId: INFO.sessionId, server: INFO.server || null, maxed:false, unseen:false };
@@ -1013,7 +1117,10 @@ function createSessionView(INFO){
   barMain.innerHTML = '<div class="status-dot"></div>'
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
     + '<div class="hdr-title">Loading…</div>';
-  el.appendChild(makeViewBar(v, barMain, { close:true }));
+  el.appendChild(makeViewBar(v, barMain, { close:true, term:true }));
+  // The session's own server, and its pane if it has one: the terminal lands inside the
+  // running Claude Code rather than in a fresh shell next to it.
+  v.onTerm = function(){ openTerminalWindow(INFO.server, { sessionId: INFO.sessionId }); };
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
 
@@ -1038,7 +1145,13 @@ function createSessionView(INFO){
     '</div>'+
     '<div class="input-area"><div class="input-inner"><div class="input-row">'+
       '<textarea class="input-box" placeholder="Message the session…  (// for commands)" rows="1"></textarea>'+
-      '<button class="send-btn" title="'+SEND_TIP+'">&#8593;</button>'+
+      '<div class="input-btns">'+
+        '<button class="hist-btn" data-h="prev" title="'+HIST_PREV_TIP+'">&#9650;</button>'+
+        '<button class="hist-btn" data-h="next" title="'+HIST_NEXT_TIP+'">&#9660;</button>'+
+        '<span class="hist-sep"></span>'+
+        '<button class="exp-btn" title="'+EXPAND_TIP+'">&#9633;</button>'+
+        '<button class="send-btn" title="'+SEND_TIP+'">&#8593;</button>'+
+      '</div>'+
     '</div></div></div>';
   el.appendChild(body);
   v.bodyEl = body;
@@ -1053,6 +1166,10 @@ function createSessionView(INFO){
   var cmdContent = body.querySelector('.cmd-content');
   var inputBox = body.querySelector('.input-box');
   var sendBtn = body.querySelector('.send-btn');
+  var expBtn = body.querySelector('.exp-btn');
+  var inputBtns = body.querySelector('.input-btns');
+  var histPrevBtn = body.querySelector('.hist-btn[data-h="prev"]');
+  var histNextBtn = body.querySelector('.hist-btn[data-h="next"]');
 
   var ws, reconnectTimer, destroyed = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
@@ -1541,6 +1658,7 @@ function createSessionView(INFO){
     mEl.className = 'msg you'+(hist?' hist':'');
     var yt = fmtDur(gap);
     mEl.innerHTML = '<div class="msg-label">You'+(yt?' <span class="msg-time">'+yt+'</span>':'')+'</div><div class="msg-body">'+esc(text)+'</div>';
+    histAdd(text);   // the transcript IS the prompt history; ↑ reaches back past this page
     transcript.appendChild(mEl);
     scrollBottom();
     return true;
@@ -1712,13 +1830,21 @@ function createSessionView(INFO){
   function sendMessage() {
     var text = inputBox.value;
     if (!text.trim()) return;
-    if (text.trim().charAt(0) === '/' && text.trim().charAt(1) === '/') { runCmd(text.trim()); inputBox.value=''; autoGrow(inputBox); return; }
+    if (text.trim().charAt(0) === '/' && text.trim().charAt(1) === '/') {
+      // Back to one line once it is gone: the expanded composer is for writing, and it
+      // covers the very output this command is about to produce.
+      histAdd(text); runCmd(text.trim()); inputBox.value=''; setInputMax(false); return;
+    }
     if (!canDrive) { if (text.trim().charAt(0) === '/') toast('Session not running in a tmux pane here — cannot send /commands.'); return; }
     sendBtn.disabled = true;
     qfetch('/api/session/'+INFO.sessionId+'/input', {
       method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: text })
     }).then(function(r){ return r.json(); }).then(function(d){
-      if (d && d.ok) { inputBox.value=''; autoGrow(inputBox); } else { toast((d&&d.error)||'Send failed'); }
+      // Added on success only: a prompt the pane refused was never sent, and the
+      // transcript will add it a moment later anyway (histAdd drops the repeat).
+      // Only on success: a prompt the pane refused is still in the box, and shrinking
+      // would hide most of what you would have to retype.
+      if (d && d.ok) { histAdd(text); inputBox.value=''; setInputMax(false); } else { toast((d&&d.error)||'Send failed'); }
     }).catch(function(e){ toast(String(e)); }).then(function(){ sendBtn.disabled=false; inputBox.focus(); });
   }
   function runCmd(raw) {
@@ -1783,7 +1909,77 @@ function createSessionView(INFO){
     syncCmdBtns();
   });
   sendBtn.addEventListener('click', sendMessage);
-  inputBox.addEventListener('input', function(){ autoGrow(inputBox); });
+  inputBox.addEventListener('input', function(){ if (!inputMaxed()) autoGrow(inputBox); });
+
+  // — expand —
+  function inputMaxed(){ return body.classList.contains('input-max'); }
+  function setInputMax(on){
+    body.classList.toggle('input-max', !!on);
+    expBtn.innerHTML = on ? '&#10064;' : '&#9633;';
+    expBtn.title = on ? 'Shrink the composer back' : EXPAND_TIP;
+    if (on) inputBox.style.height = '';   // the class drives the height from here
+    else autoGrow(inputBox);
+    inputBox.focus();
+  }
+  expBtn.addEventListener('click', function(){ setInputMax(!inputMaxed()); });
+
+  // — input history —
+  // Seeded from the prompts already in the transcript, so ↑ reaches what you sent before
+  // this page was opened. // commands are appended as they are run and are never written
+  // anywhere: they live only in this page, and a reload starts them over.
+  // histDraft holds what you had typed when you started walking back, so ↓ past the end
+  // returns it rather than dropping it.
+  var inputHist = [], histPos = -1, histDraft = '';
+  function histAdd(text){
+    text = String(text || '');
+    if (!text.trim()) return;
+    if (inputHist.length && inputHist[inputHist.length - 1] === text) return;   // no runs of duplicates
+    inputHist.push(text);
+    if (inputHist.length > 200) inputHist.shift();
+    histPos = -1;
+    histSync();
+  }
+  // Buttons, not the arrow keys: the composer is a multi-line editor — maximized it is
+  // the whole page — and ↑/↓ belong to the caret there.
+  function histSync(){
+    histPrevBtn.disabled = !inputHist.length || histPos === 0;
+    histNextBtn.disabled = !inputHist.length || histPos === -1;
+  }
+  function histShow(text, toEnd){
+    inputBox.value = text;
+    if (!inputMaxed()) autoGrow(inputBox);
+    var at = toEnd ? text.length : 0;
+    try { inputBox.setSelectionRange(at, at); } catch(e) {}
+    histSync();
+  }
+  function histWalk(delta){
+    if (!inputHist.length) return false;
+    if (histPos === -1) {
+      if (delta > 0) return false;             // already at the live draft
+      histDraft = inputBox.value;
+      histPos = inputHist.length;
+    }
+    var next = histPos + delta;
+    if (next >= inputHist.length) { histPos = -1; histShow(histDraft, true); return true; }
+    if (next < 0) next = 0;
+    histPos = next;
+    histShow(inputHist[histPos], true);
+    return true;
+  }
+  // mousedown is where focus is lost, so that is where it is refused: the caret stays in
+  // the textarea and the click never takes it away.
+  inputBtns.addEventListener('mousedown', function(e){ if (e.target.closest('.hist-btn,.exp-btn')) e.preventDefault(); });
+  histPrevBtn.addEventListener('click', function(){ histWalk(-1); inputBox.focus(); });
+  histNextBtn.addEventListener('click', function(){ histWalk(1); inputBox.focus(); });
+  // Clicking anywhere in the composer's frame — the padding, the gap beside the buttons —
+  // means "I want to type here". Without this those pixels just drop the focus.
+  body.querySelector('.input-row').addEventListener('mousedown', function(e){
+    if (e.target === inputBox || e.target.closest('button')) return;
+    e.preventDefault();
+    inputBox.focus();
+  });
+  histSync();
+
   // Plain Enter is a newline: a prompt is usually several lines, and a stray Enter firing
   // one off half-written into a live session is not a recoverable mistake. Ctrl/Cmd+Enter
   // is the deliberate two-key send, same as the button.
@@ -1791,6 +1987,12 @@ function createSessionView(INFO){
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       sendMessage();
+      return;
+    }
+    // ↑/↓ are deliberately NOT bound: they move the caret. History is on the buttons.
+    if (e.key === 'Escape' && inputMaxed() && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      e.preventDefault();
+      setInputMax(false);
     }
   });
 
@@ -1801,6 +2003,10 @@ function createSessionView(INFO){
     statEls = {}; statTurnNo = {}; statTurns = 0; statSeenFirst = false;
     historyLoaded = false; pendingTranscript = []; pendingAsk = null;
     following = true; anchorEl = null;
+    // The transcript is about to be replayed, and every user message re-seeds the input
+    // history — so clear it first, or a refresh would double every prompt. // commands
+    // are lost with it, which is what "only for this page" means.
+    inputHist = []; histPos = -1; histSync();
     loadHistory();
     pollLive();
   };
@@ -1824,6 +2030,458 @@ function createSessionView(INFO){
   return v;
 }
 
+// ── host terminal ─────────────────────────────────────────────────────────────
+// A login shell on the machine a server chip names, in a floating window. No ssh: a
+// peer's terminal rides the connection ccbb already holds to it, since /peer/<name>/…
+// is spliced by the same proxy that carries the session WebSockets.
+//
+// One WebSocket, both directions, so bytes cannot arrive out of order either way. The
+// sequence number on output is an assertion and a resume cursor, not the input to a
+// reordering buffer: a number that isn't lastSeq+1 means bytes were LOST, and the only
+// honest repair is to drop the socket and let the reconnect replay the backlog.
+var XTERM_BASE = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/';
+var XTERM_FIT = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js';
+var xtermLoad = null;
+function loadScriptTag(src){
+  return new Promise(function(ok, fail){
+    var s = document.createElement('script');
+    s.src = src;
+    s.onload = function(){ ok(); };
+    s.onerror = function(){ fail(new Error('could not load ' + src)); };
+    document.head.appendChild(s);
+  });
+}
+// Fetched on the first terminal open, never at page load: the rest of the app must not
+// pay a CDN round trip for a feature it isn't using.
+function loadXterm(){
+  if (!xtermLoad) {
+    var css = document.createElement('link');
+    css.rel = 'stylesheet'; css.href = XTERM_BASE + 'css/xterm.css';
+    document.head.appendChild(css);
+    xtermLoad = loadScriptTag(XTERM_BASE + 'lib/xterm.js').then(function(){ return loadScriptTag(XTERM_FIT); });
+    xtermLoad.catch(function(){ xtermLoad = null; });   // a later open may retry
+  }
+  return xtermLoad;
+}
+
+var TERM_THEMES = {
+  light: { background:'#ffffff', foreground:'#000000', cursor:'#000000', cursorAccent:'#ffffff',
+    selectionBackground:'#cfe3ff', selectionForeground:'#000000',
+    black:'#000000', red:'#c1272d', green:'#1a7f37', yellow:'#8a6d1a', blue:'#0969da',
+    magenta:'#8250df', cyan:'#116a72', white:'#57606a', brightBlack:'#8c959f', brightRed:'#cf222e',
+    brightGreen:'#2da44e', brightYellow:'#bf8700', brightBlue:'#218bff', brightMagenta:'#a475f9',
+    brightCyan:'#1b7c83', brightWhite:'#24292f' },
+  dark: { background:'#000000', foreground:'#e6e6e6', cursor:'#e6e6e6', cursorAccent:'#000000',
+    selectionBackground:'#3a4a63', selectionForeground:'#ffffff',
+    black:'#2e3436', red:'#cc0000', green:'#4e9a06', yellow:'#c4a000', blue:'#3465a4',
+    magenta:'#75507b', cyan:'#06989a', white:'#d3d7cf', brightBlack:'#555753', brightRed:'#ef2929',
+    brightGreen:'#8ae234', brightYellow:'#fce94f', brightBlue:'#729fcf', brightMagenta:'#ad7fa8',
+    brightCyan:'#34e2e2', brightWhite:'#eeeeec' }
+};
+
+// — per-server persistence, in a cookie —
+// Keyed by the server the shell runs on, so each machine's terminal comes back where you
+// left it, at the size and contrast you left it at.
+function termCookieName(server){ return 'ccbb_term_' + String(server || 'self').replace(/[^A-Za-z0-9]/g, '_'); }
+function cookieGet(name){
+  var parts = document.cookie ? document.cookie.split(';') : [];
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i].replace(/^\\s+/, '');
+    var eq = p.indexOf('=');
+    if (eq > 0 && p.slice(0, eq) === name) { try { return decodeURIComponent(p.slice(eq + 1)); } catch(e) { return ''; } }
+  }
+  return '';
+}
+function cookieSet(name, val){
+  document.cookie = name + '=' + encodeURIComponent(val) + '; Path=/; SameSite=Strict; Max-Age=31536000';
+}
+// Missing must fall back to the default, not to zero: Number(null) is 0 and Number('')
+// is 0, so neither can be left to Number() and isFinite() alone.
+function tnum(v, d){
+  if (v === null || v === undefined || v === '') return d;
+  v = Number(v);
+  return isFinite(v) ? v : d;
+}
+// A rect saved on a bigger screen — or on a monitor that is no longer there — would put
+// the window somewhere it can never be grabbed back from. Clamp until all of it is on
+// screen: size first (it bounds the position), then position.
+function sanitizeTermGeom(g){
+  var vw = Math.max(360, window.innerWidth), vh = Math.max(200, window.innerHeight);
+  var out = {};
+  out.w = Math.round(Math.min(Math.max(340, tnum(g && g.w, 880)), vw));
+  out.h = Math.round(Math.min(Math.max(150, tnum(g && g.h, 480)), vh));
+  out.x = Math.round(Math.min(Math.max(0, tnum(g && g.x, 56)), vw - out.w));
+  out.y = Math.round(Math.min(Math.max(0, tnum(g && g.y, 56)), vh - out.h));
+  return out;
+}
+
+var termWins = [];
+var termZTop = 80;
+function b64FromBytes(u8){
+  var s = '';
+  for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+function bytesFromB64(s){
+  var bin = atob(s), u = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+
+function openTerminalWindow(server, opts){
+  opts = opts || {};
+  var srv = isLocal(server) ? null : server;
+  var name = srv || SELF.name;
+  var API = apiBase(srv);          // '' locally, '/peer/<name>' for a peer — same routes
+  // One terminal per server. A second window would be a second writer of that server's
+  // cookie, so the two would fight over the remembered layout. Replacing means the old
+  // shell ends and the new one takes its place — including its position and size, which
+  // destroy() has just written to the cookie the new window is about to read.
+  for (var q = termWins.length - 1; q >= 0; q--) if (termWins[q].server === name) termWins[q].destroy();
+  var saved = null;
+  var raw = cookieGet(termCookieName(name));
+  if (raw) { try { saved = JSON.parse(raw); } catch(e) { saved = null; } }
+
+  var w = { id:null, term:null, fit:null, ws:null, lastSeq:null, dead:false, destroyed:false,
+            cols:0, rows:0, server:name,
+            fontSize: Math.max(8, Math.min(28, Math.round(tnum(saved && saved.fontSize, 13)))),
+            theme: (saved && saved.theme === 'dark') ? 'dark' : 'light' };
+  // Cascade only a window we have never placed; a remembered one goes back where it was.
+  var n = termWins.length % 8;
+  var geom = sanitizeTermGeom(saved || { x: 56 + n * 28, y: 56 + n * 28, w: 880, h: 480 });
+
+  var el = document.createElement('div');
+  el.className = 'term-win' + (w.theme === 'dark' ? ' dark' : '');
+  el.style.cssText = 'left:'+geom.x+'px;top:'+geom.y+'px;width:'+geom.w+'px;height:'+geom.h+'px;z-index:'+(++termZTop);
+  el.innerHTML =
+    '<div class="term-head"><span class="term-title"></span>'+
+      '<div class="term-btns">'+
+        '<button class="term-btn" data-t="cfg" title="Settings">&#9881;</button>'+
+        '<span class="term-sep"></span>'+
+        '<button class="term-btn" data-t="min" title="Minimize">&#8211;</button>'+
+        '<button class="term-btn" data-t="max" title="Maximize">&#9633;</button>'+
+        '<button class="term-btn" data-t="close" title="Close">&#10005;</button>'+
+      '</div></div>'+
+    '<div class="term-cfg">'+
+      '<div class="crow"><span class="clbl">Text</span>'+
+        '<button data-c="fdown" title="Smaller">A&#8722;</button>'+
+        '<span class="cval" data-v="font"></span>'+
+        '<button data-c="fup" title="Larger">A+</button></div>'+
+      '<div class="crow"><span class="clbl">Theme</span>'+
+        '<button data-c="theme" data-v="theme"></button></div>'+
+      '<div class="crow"><span class="clbl">Size</span>'+
+        '<input data-c="cols" type="number" min="20" max="500" title="Columns">'+
+        '<span class="cx">&times;</span>'+
+        '<input data-c="rows" type="number" min="5" max="200" title="Rows">'+
+        '<button data-c="grid" title="Resize the window to this grid">Set</button></div>'+
+    '</div>'+
+    '<div class="term-body"></div>'+
+    '<div class="term-grip" title="Resize"></div>';
+  document.body.appendChild(el);
+  w.el = el;
+  termWins.push(w);
+
+  var head = el.querySelector('.term-head');
+  var titleEl = el.querySelector('.term-title');
+  var bodyEl = el.querySelector('.term-body');
+  var cfgEl = el.querySelector('.term-cfg');
+  var grip = el.querySelector('.term-grip');
+  titleEl.textContent = name;
+  el.addEventListener('mousedown', function(){ el.style.zIndex = ++termZTop; });
+
+  // — remembered state —
+  // Maximized and minimized are transient: persisting either would restore a window
+  // that fills the screen, or one with no body, and hide where it really lives.
+  var lastRect = { x: geom.x, y: geom.y, w: geom.w, h: geom.h };
+  var lastGrid = { cols: Math.round(tnum(saved && saved.cols, 0)), rows: Math.round(tnum(saved && saved.rows, 0)) };
+  var saveTimer = null;
+  function transient(){ return el.classList.contains('max') || el.classList.contains('min'); }
+  function noteRect(){
+    if (transient()) return;
+    var r = el.getBoundingClientRect();
+    lastRect = { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+    if (w.term) lastGrid = { cols: w.term.cols, rows: w.term.rows };
+  }
+  function writeState(){
+    cookieSet(termCookieName(name), JSON.stringify({
+      x: lastRect.x, y: lastRect.y, w: lastRect.w, h: lastRect.h,
+      fontSize: w.fontSize, theme: w.theme, cols: lastGrid.cols, rows: lastGrid.rows,
+    }));
+  }
+  function saveSoon(){ clearTimeout(saveTimer); saveTimer = setTimeout(writeState, 250); }
+  // Called on unload, where a debounce would never fire.
+  w.saveNow = function(){ clearTimeout(saveTimer); noteRect(); writeState(); };
+
+  // — drag by the header, resize by the corner grip —
+  function dragWith(e, onMove){
+    var sx = e.clientX, sy = e.clientY, r = el.getBoundingClientRect();
+    function mv(ev){ onMove(r, ev.clientX - sx, ev.clientY - sy); }
+    function up(){
+      document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up);
+      noteRect(); saveSoon();
+    }
+    document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+    e.preventDefault();
+  }
+  head.addEventListener('mousedown', function(e){
+    if (e.target.closest('.term-btn') || el.classList.contains('max')) return;
+    dragWith(e, function(r, dx, dy){
+      // Keep the whole window on screen, for the same reason the saved rect is clamped.
+      el.style.left = Math.max(0, Math.min(window.innerWidth - r.width, r.left + dx)) + 'px';
+      el.style.top = Math.max(0, Math.min(window.innerHeight - r.height, r.top + dy)) + 'px';
+    });
+  });
+  grip.addEventListener('mousedown', function(e){
+    dragWith(e, function(r, dx, dy){
+      el.style.width = Math.max(340, Math.min(window.innerWidth - r.left, r.width + dx)) + 'px';
+      el.style.height = Math.max(150, Math.min(window.innerHeight - r.top, r.height + dy)) + 'px';
+    });
+  });
+
+  // — header + config controls —
+  function syncBtns(){
+    var mx = el.querySelector('.term-btn[data-t="max"]');
+    var on = el.classList.contains('max');
+    mx.innerHTML = on ? '&#10064;' : '&#9633;';
+    mx.title = on ? 'Restore' : 'Maximize';
+  }
+  function syncCfg(){
+    cfgEl.querySelector('[data-v="font"]').textContent = w.fontSize;
+    cfgEl.querySelector('[data-v="theme"]').textContent = w.theme === 'dark' ? 'white on black' : 'black on white';
+    var ci = cfgEl.querySelector('input[data-c="cols"]'), ri = cfgEl.querySelector('input[data-c="rows"]');
+    if (document.activeElement !== ci) ci.value = w.term ? w.term.cols : (lastGrid.cols || '');
+    if (document.activeElement !== ri) ri.value = w.term ? w.term.rows : (lastGrid.rows || '');
+  }
+  function applyTheme(){
+    el.classList.toggle('dark', w.theme === 'dark');
+    if (w.term) w.term.options.theme = TERM_THEMES[w.theme];
+  }
+  function applyFont(){
+    if (w.term) w.term.options.fontSize = w.fontSize;
+    refit();
+  }
+  el.querySelector('.term-btns').addEventListener('click', function(e){
+    var b = e.target.closest('.term-btn');
+    if (!b) return;
+    var t = b.dataset.t;
+    if (t === 'close') return destroy();
+    if (t === 'cfg') { el.classList.toggle('cfg'); syncCfg(); return; }
+    if (t === 'min') { el.classList.toggle('min'); el.classList.remove('max'); }
+    else if (t === 'max') { el.classList.toggle('max'); el.classList.remove('min'); }
+    syncBtns();
+    if (!transient()) { noteRect(); saveSoon(); }
+    if (w.term && !el.classList.contains('min')) w.term.focus();
+  });
+  cfgEl.addEventListener('click', function(e){
+    var b = e.target.closest('button');
+    if (!b) return;
+    var c = b.dataset.c;
+    if (c === 'fup') { w.fontSize = Math.min(28, w.fontSize + 1); applyFont(); }
+    else if (c === 'fdown') { w.fontSize = Math.max(8, w.fontSize - 1); applyFont(); }
+    else if (c === 'theme') { w.theme = w.theme === 'dark' ? 'light' : 'dark'; applyTheme(); }
+    else if (c === 'grid') applyGridFromInputs();
+    syncCfg(); saveSoon();
+  });
+  cfgEl.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); applyGridFromInputs(); }
+  });
+  cfgEl.addEventListener('change', function(e){ if (e.target.tagName === 'INPUT') applyGridFromInputs(); });
+  function applyGridFromInputs(){
+    var c = parseInt(cfgEl.querySelector('input[data-c="cols"]').value, 10);
+    var r = parseInt(cfgEl.querySelector('input[data-c="rows"]').value, 10);
+    if (isFinite(c) && isFinite(r)) applyGrid(c, r, 0);
+  }
+  syncBtns(); syncCfg();
+
+  // — geometry —
+  // The grid is what you ask for and the window wraps it, so the two can never disagree:
+  // typing a size resizes the window, dragging the window updates the size.
+  function applyGrid(cols, rows, tries){
+    if (!w.term) return;
+    cols = Math.max(20, Math.min(500, Math.round(cols)));
+    rows = Math.max(5, Math.min(200, Math.round(rows)));
+    var scr = el.querySelector('.xterm-screen');
+    if (!scr) return;
+    var sr = scr.getBoundingClientRect();
+    var cw = sr.width / w.term.cols, ch = sr.height / w.term.rows;
+    if (!(cw > 0 && ch > 0)) return;
+    el.classList.remove('max', 'min');
+    var er = el.getBoundingClientRect();
+    var g = sanitizeTermGeom({ x: er.left, y: er.top,
+      w: Math.round(er.width + (cols - w.term.cols) * cw),
+      h: Math.round(er.height + (rows - w.term.rows) * ch) });
+    el.style.left = g.x + 'px'; el.style.top = g.y + 'px';
+    el.style.width = g.w + 'px'; el.style.height = g.h + 'px';
+    syncBtns();
+    // Cell sizes are fractional, so the first guess lands a column or two out; one or
+    // two corrections settle it. A grid too big for the screen stops here instead, with
+    // the fields showing what it actually got.
+    setTimeout(function(){
+      fitNow();
+      if ((w.term.cols !== cols || w.term.rows !== rows) && (tries || 0) < 2) applyGrid(cols, rows, (tries || 0) + 1);
+      else { noteRect(); syncCfg(); saveSoon(); }
+    }, 80);
+  }
+  function fitNow(){
+    if (!w.term || !w.fit || el.classList.contains('min')) return;
+    try { w.fit.fit(); } catch(e) { return; }
+    if (w.term.cols === w.cols && w.term.rows === w.rows) return;
+    w.cols = w.term.cols; w.rows = w.term.rows;
+    wsSendJ({ type:'size', cols:w.cols, rows:w.rows });
+    syncCfg();
+    noteRect(); saveSoon();
+  }
+  var refitTimer = null;
+  function refit(){ clearTimeout(refitTimer); refitTimer = setTimeout(fitNow, 60); }
+  var ro = null;
+  if (window.ResizeObserver) { ro = new ResizeObserver(refit); ro.observe(bodyEl); }
+  // A browser window that shrank can leave a remembered rect hanging off the edge.
+  function onViewportResize(){
+    if (!transient()) {
+      var g = sanitizeTermGeom(el.getBoundingClientRect());
+      el.style.left = g.x + 'px'; el.style.top = g.y + 'px';
+      el.style.width = g.w + 'px'; el.style.height = g.h + 'px';
+      noteRect();
+    }
+    refit();
+  }
+  window.addEventListener('resize', onViewportResize);
+
+  function note(html){ bodyEl.innerHTML = '<div class="term-pick"><div class="term-note">' + html + '</div></div>'; }
+  function wsSendJ(obj){
+    if (w.ws && w.ws.readyState === 1) { try { w.ws.send(JSON.stringify(obj)); } catch(e) {} }
+  }
+
+  // — open the shell, then attach —
+  note('Starting a shell on <code>' + esc(name) + '</code>…');
+  loadXterm().then(function(){
+    if (w.destroyed) return;
+    bodyEl.innerHTML = '';
+    w.term = new Terminal({
+      fontSize: w.fontSize,
+      fontFamily: 'ui-monospace, Menlo, Consolas, "Cascadia Code", monospace',
+      cursorBlink: true, scrollback: 5000,
+      theme: TERM_THEMES[w.theme],
+    });
+    w.fit = new FitAddon.FitAddon();
+    w.term.loadAddon(w.fit);
+    w.term.open(bodyEl);
+    try { w.fit.fit(); } catch(e) {}
+    w.cols = w.term.cols; w.rows = w.term.rows;
+    // One socket is one ordered stream, so keystrokes need no sequencing of their own.
+    w.term.onData(function(d){ wsSendJ({ type:'in', b: b64FromBytes(new TextEncoder().encode(d)) }); });
+    // onBinary hands over raw bytes as latin-1 chars — encoding them as UTF-8 would
+    // corrupt anything above 0x7f, so they go across as they are.
+    w.term.onBinary(function(d){
+      var u = new Uint8Array(d.length);
+      for (var i = 0; i < d.length; i++) u[i] = d.charCodeAt(i) & 0xff;
+      wsSendJ({ type:'in', b: b64FromBytes(u) });
+    });
+    w.term.focus();
+    syncCfg();
+    return fetch(API + '/api/term/open', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ cols:w.cols, rows:w.rows, sessionId: opts.sessionId || null }) })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (w.destroyed) return;
+        if (!d || d.error) {
+          w.term.write('\\r\\n\\x1b[31m' + ((d && d.error) || 'could not start a shell') + '\\x1b[0m\\r\\n');
+          el.classList.add('dead');
+          return;
+        }
+        w.id = d.id;
+        // Say which it is: attached to the session's pane, or a plain shell beside it.
+        // Asking for a pane and silently getting a shell would be a confusing surprise.
+        titleEl.textContent = name + (d.attached ? '  ·  session pane' : '');
+        connect();
+        // Write the state once up front. Otherwise a window that is opened and never
+        // touched — the common case — would leave nothing behind to restore, since
+        // every other save hangs off an actual change.
+        noteRect(); saveSoon();
+        // A remembered grid is applied once the shell is up, so the window ends at the
+        // size it had rather than at whatever the restored rect happened to fit.
+        if (lastGrid.cols && lastGrid.rows) setTimeout(function(){ applyGrid(lastGrid.cols, lastGrid.rows, 0); }, 60);
+      });
+  }).catch(function(e){
+    if (!w.destroyed) note('Could not load xterm.js from the CDN (' + esc(String(e.message || e)) + '). ' +
+      'The terminal needs it; the rest of ccbb does not.');
+  });
+
+  // — the socket —
+  var reconnectTimer = null;
+  var resyncQuiet = null;
+  // A replayed backlog arrives in bulk, and xterm only sticks to the bottom while the
+  // viewport is already there — so after a reset the screen would be rebuilt correctly
+  // and then left scrolled to the middle of it. Follow the tail until replay goes quiet.
+  function afterResyncWrite(){
+    w.term.scrollToBottom();
+    clearTimeout(resyncQuiet);
+    resyncQuiet = setTimeout(function(){ w.resyncing = false; }, 400);
+  }
+  function connect(){
+    if (w.destroyed || w.dead || !w.id) return;
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(proto + '//' + location.host + API + '/ws-term/' + w.id +
+      (w.lastSeq != null ? '?from=' + w.lastSeq : ''));
+    w.ws = ws;
+    ws.onopen = function(){
+      el.classList.add('live'); el.classList.remove('dead');
+      wsSendJ({ type:'size', cols:w.cols, rows:w.rows });
+    };
+    ws.onmessage = function(ev){
+      var f; try { f = JSON.parse(ev.data); } catch(e) { return; }
+      if (f.type === 'o') {
+        // Ordered by construction. A hole means loss, not reordering — so drop the
+        // socket and let the reconnect replay, rather than piecing the screen together.
+        if (w.lastSeq != null && f.seq !== w.lastSeq + 1) { w.lastSeq = null; try { ws.close(); } catch(e) {} return; }
+        w.lastSeq = f.seq;
+        w.term.write(bytesFromB64(f.b), w.resyncing ? afterResyncWrite : undefined);
+      } else if (f.type === 'reset') {
+        w.term.reset(); w.lastSeq = null; w.resyncing = true;
+      } else if (f.type === 'exit') {
+        w.dead = true;
+        el.classList.remove('live'); el.classList.add('dead');
+        w.term.write('\\r\\n\\x1b[90m[shell exited' + (f.code != null ? ' (' + f.code + ')' : '') + ']\\x1b[0m\\r\\n');
+        try { ws.close(); } catch(e) {}
+      }
+    };
+    ws.onclose = function(){
+      if (w.destroyed || w.dead) return;
+      el.classList.remove('live');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 1000);
+    };
+  }
+
+  function destroy(){
+    w.destroyed = true;
+    clearTimeout(reconnectTimer); clearTimeout(refitTimer);
+    w.saveNow();   // the debounce would be cancelled by the teardown below
+    if (w.id && !w.dead) {
+      if (w.ws && w.ws.readyState === 1) wsSendJ({ type:'close' });
+      else fetch(API + '/api/term/' + w.id + '/close', { method:'POST' }).catch(function(){});
+    }
+    if (w.ws) { try { w.ws.close(); } catch(e) {} }
+    if (w.term) { try { w.term.dispose(); } catch(e) {} }
+    if (ro) { try { ro.disconnect(); } catch(e) {} }
+    window.removeEventListener('resize', onViewportResize);
+    el.remove();
+    var i = termWins.indexOf(w);
+    if (i >= 0) termWins.splice(i, 1);
+  }
+  w.destroy = destroy;
+  return w;
+}
+// Closing the tab ends the shells it opened. sendBeacon is the only thing that survives
+// unload, which is why one HTTP close route exists alongside the socket.
+window.addEventListener('pagehide', function(){
+  termWins.forEach(function(w){
+    if (w.saveNow) w.saveNow();
+    if (w.id && !w.dead && navigator.sendBeacon)
+      navigator.sendBeacon(apiBase(w.server === SELF.name ? null : w.server) + '/api/term/' + w.id + '/close');
+  });
+});
+
 // ── boot ──────────────────────────────────────────────────────────────────────
 document.addEventListener('visibilitychange', function(){
   if (!document.hidden) views.forEach(function(v){ if (v.onExpanded && !v.el.classList.contains('collapsed')) v.onExpanded(); });
@@ -1831,6 +2489,9 @@ document.addEventListener('visibilitychange', function(){
 var listView = createListView();
 views.push(listView);
 viewsEl.appendChild(listView.el);
+// The remembered orientation has to reach the DOM before the first layout, or a page
+// restored as columns would flash stacked and reflow.
+viewsEl.classList.toggle('horizontal', orientation === 'horizontal');
 relayout();
 if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
 `;
@@ -2059,6 +2720,195 @@ function answerAsk(sessionId, answers) {
     }
   } catch (e) { return { error: e.message }; }
   return { ok: true };
+}
+
+// ── host terminals ─────────────────────────────────────────────────────────────
+// A login shell on the machine this server runs on, under a real pty. No ssh: a peer's
+// terminal rides the connection ccbb already holds to that peer — /peer/<name>/ws-term/…
+// is spliced by proxyUpgrade for a configured peer, and by proxyUpgradeOverLink for one
+// that only linked in to us. That is also why the transport is a WebSocket rather than
+// SSE: proxyHttpOverLink buffers a whole response before returning it, so a stream would
+// never reach a browser through an inbound link, while WebSockets splice both ways.
+//
+// One socket is one ordered stream, so bytes cannot arrive out of order in either
+// direction. The sequence number on output is an assertion and a resume cursor, not the
+// input to a reordering buffer: a number that isn't last+1 means bytes were LOST, and
+// the only honest repair is to clear the screen and replay the backlog.
+//
+// Node cannot open a pty without a native module, so script(1) opens it. That costs us
+// the master fd — but the pty's SLAVE is the shell's stdin, and setting the window size
+// THERE is what makes the kernel raise SIGWINCH, so resize still reaches full-screen
+// programs.
+const TERM_BACKLOG_BYTES = 256 * 1024;   // replayed after a dropped socket
+const TERM_GRACE_MS = 60 * 1000;         // reconnect window after the last socket goes
+const terms = new Map();                 // id → terminal
+let termIds = 0;
+function clampInt(v, lo, hi, dflt) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt;
+}
+
+function shQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+// The tmux session holding a live Claude Code session's pane, if it has one. Attaching
+// there shows the actual TUI rather than a fresh shell beside it.
+function tmuxAttachFor(sessionId) {
+  const loc = paneForSession(sessionId);
+  if (!loc) return null;
+  let sess;
+  try { sess = tmux(['display-message', '-p', '-t', loc.pane, '#{session_name}']).split('\n')[0].trim(); }
+  catch { return null; }
+  if (!sess) return null;
+  // Select the window AND the pane first, so the client lands on the session's pane
+  // rather than wherever the tmux session was last left.
+  return 'tmux select-window -t ' + shQuote(loc.pane) + ' 2>/dev/null; ' +
+         'tmux select-pane -t ' + shQuote(loc.pane) + ' 2>/dev/null; ' +
+         'exec tmux attach -t ' + shQuote(sess);
+}
+
+function openTerm(cols, rows, sessionId) {
+  cols = clampInt(cols, 20, 500, 80);
+  rows = clampInt(rows, 5, 200, 24);
+  const id = String(++termIds);
+  const shell = process.env.SHELL || '/bin/bash';
+  const attach = sessionId ? tmuxAttachFor(String(sessionId)) : null;
+  // stty runs inside the pty before the shell starts, so the first prompt is drawn at
+  // the right geometry instead of at 80x24 and then redrawn.
+  const cmd = `stty rows ${rows} cols ${cols} 2>/dev/null; ` + (attach || `exec ${shell} -l`);
+  let child;
+  try {
+    child = spawn('script', ['-q', '-f', '-c', cmd, '/dev/null'], {
+      cwd: os.homedir(),
+      env: Object.assign({}, process.env, { TERM: 'xterm-256color' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (e) { return { error: 'could not start script(1): ' + e.message }; }
+  const t = { id, child, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
+              pts: null, alive: true, exitCode: null, graceTimer: null, idleSince: Date.now() };
+  terms.set(id, t);
+  child.stdout.on('data', c => termPush(t, c));
+  child.stderr.on('data', c => termPush(t, c));
+  child.stdin.on('error', () => {});
+  child.on('error', e => termPush(t, Buffer.from(`\r\nccbb: ${e.message}\r\n`)));
+  child.on('exit', code => {
+    t.alive = false; t.exitCode = code;
+    termBroadcast(t, { type: 'exit', code });
+    t.idleSince = Date.now();
+  });
+  return { id, cols, rows, shell, attached: !!attach };
+}
+
+function termBroadcast(t, obj) {
+  const frame = JSON.stringify(obj);
+  for (const ws of t.subs) { try { if (ws.readyState === 1) ws.send(frame); } catch {} }
+}
+function termPush(t, chunk) {
+  const rec = { seq: ++t.seq, b: chunk.toString('base64'), n: chunk.length };
+  t.buf.push(rec);
+  t.bytes += rec.n;
+  while (t.buf.length > 1 && t.bytes > TERM_BACKLOG_BYTES) t.bytes -= t.buf.shift().n;
+  termBroadcast(t, { type: 'o', seq: rec.seq, b: rec.b });
+}
+
+// One browser window attaching to one terminal. `from` is the last sequence number it
+// already has; absent means it wants a fresh screen.
+function attachTerm(t, ws, from) {
+  const sendJ = o => { try { if (ws.readyState === 1) ws.send(JSON.stringify(o)); } catch {} };
+  const oldest = t.buf.length ? t.buf[0].seq : t.seq + 1;
+  // No cursor at all must stay distinguishable from a cursor of 0 — Number(null) is 0,
+  // not NaN, so this cannot be left to Number() alone.
+  let start = (from === undefined || from === null || from === '') ? null : Number(from);
+  if (start !== null && (!Number.isFinite(start) || start < 0)) start = null;
+  // A cursor ahead of anything we ever sent belongs to a previous life of this id.
+  if (start !== null && start > t.seq) start = null;
+  // Either a fresh window, or a resume from further back than the backlog reaches.
+  // Appending could not make the screen correct, so say so and replay what we do hold.
+  if (start === null || start + 1 < oldest) { sendJ({ type: 'reset' }); start = oldest - 1; }
+  for (const rec of t.buf) if (rec.seq > start) sendJ({ type: 'o', seq: rec.seq, b: rec.b });
+  if (!t.alive) { sendJ({ type: 'exit', code: t.exitCode }); try { ws.close(); } catch {} return; }
+
+  t.subs.add(ws);
+  if (t.graceTimer) { clearTimeout(t.graceTimer); t.graceTimer = null; }
+  ws.on('message', raw => {
+    let f; try { f = JSON.parse(raw); } catch { return; }
+    if (f.type === 'in' && typeof f.b === 'string') {
+      try { t.child.stdin.write(Buffer.from(f.b, 'base64')); } catch {}
+    } else if (f.type === 'size') {
+      termResize(t, f.cols, f.rows);
+    } else if (f.type === 'close') {
+      closeTerm(t);
+    }
+  });
+  const bye = () => {
+    t.subs.delete(ws);
+    t.idleSince = Date.now();
+    if (t.subs.size || !t.alive || t.graceTimer) return;
+    // The window owns the shell. The grace period is only wide enough for a reconnect
+    // (a reload, a blipped tunnel) — not for walking away and coming back.
+    t.graceTimer = setTimeout(() => { t.graceTimer = null; if (!t.subs.size) closeTerm(t); }, TERM_GRACE_MS);
+    if (t.graceTimer.unref) t.graceTimer.unref();
+  };
+  ws.on('close', bye);
+  ws.on('error', bye);
+}
+
+// script(1) holds the pty master; the shell it forked holds the slave as its stdin.
+// Setting the size on the slave is what raises SIGWINCH on the foreground group — the
+// only way to resize this pty without a native module.
+function termPts(t) {
+  if (t.pts) return t.pts;
+  try {
+    const kids = fs.readFileSync(`/proc/${t.child.pid}/task/${t.child.pid}/children`, 'utf8').trim().split(/\s+/);
+    for (const k of kids) {
+      if (!k) continue;
+      const link = fs.readlinkSync(`/proc/${k}/fd/0`);
+      if (link.startsWith('/dev/pts/')) { t.pts = link; return link; }
+    }
+  } catch {}
+  return null;
+}
+function termResize(t, cols, rows) {
+  const c = clampInt(cols, 20, 500, t.cols), r = clampInt(rows, 5, 200, t.rows);
+  if (c === t.cols && r === t.rows) return { ok: true, resized: false, cols: c, rows: r };
+  t.cols = c; t.rows = r;
+  const pts = termPts(t);
+  if (!pts) return { ok: true, resized: false, cols: c, rows: r };
+  const out = spawnSync('stty', ['-F', pts, 'rows', String(r), 'cols', String(c)],
+    { timeout: 3000, stdio: 'ignore' });
+  return { ok: true, resized: !out.error && out.status === 0, cols: c, rows: r };
+}
+
+function closeTerm(t) {
+  terms.delete(t.id);
+  if (t.graceTimer) { clearTimeout(t.graceTimer); t.graceTimer = null; }
+  t.alive = false;
+  termBroadcast(t, { type: 'exit', code: t.exitCode });
+  for (const ws of t.subs) { try { ws.close(); } catch {} }
+  t.subs.clear();
+  try { t.child.kill('SIGHUP'); } catch {}
+  setTimeout(() => { try { t.child.kill('SIGKILL'); } catch {} }, 2000).unref();
+}
+// A pty is a child process, not a resource the OS reclaims with us: nothing kills these
+// shells when ccbb goes away, so every restart would otherwise strand one per terminal
+// that was open. SIGKILL cannot be caught, so `kill -9` on the server still leaks — a
+// plain stop or Ctrl-C, which is how it is actually restarted, does not.
+function closeAllTerms() {
+  for (const t of Array.from(terms.values())) { try { t.child.kill('SIGHUP'); } catch {} }
+  terms.clear();
+}
+process.on('exit', closeAllTerms);
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => { closeAllTerms(); process.exit(0); });
+}
+
+// Backstop. The grace timer normally does this, but a terminal that never had a socket
+// at all (opened, then the browser died before connecting) has no timer to fire.
+function termReap() {
+  const now = Date.now();
+  for (const [id, t] of terms) {
+    if (t.subs.size) { t.idleSince = now; continue; }
+    if (!t.alive) { if (now - t.idleSince > 60000) terms.delete(id); continue; }
+    if (!t.graceTimer && now - t.idleSince > 5 * 60 * 1000) closeTerm(t);
+  }
 }
 
 // ── HTTP + WebSocket server ────────────────────────────────────────────────────
@@ -2483,6 +3333,23 @@ function runWeb(args) {
     if (method === 'GET' && pathname === '/api/cost-summary') return send(res, 200, getCostSummary());
     if (method === 'GET' && (m = pathname.match(/^\/session\/([^/]+)$/)))
       return sendHtml(res, appPageHtml(m[1]));   // deep link: app with this session opened
+    // ── host terminals ──
+    if (method === 'POST' && pathname === '/api/term/open') {
+      readBody(req, body => {
+        let b; try { b = JSON.parse(body || '{}'); } catch { b = {}; }
+        const r = openTerm(b.cols, b.rows, b.sessionId);
+        send(res, r.error ? 500 : 200, r);
+      });
+      return;
+    }
+    // Everything else about a terminal rides its WebSocket. This one route stays HTTP so
+    // a closing tab can end the shell with sendBeacon, which cannot open a socket.
+    if (method === 'POST' && (m = pathname.match(/^\/api\/term\/([^/]+)\/close$/))) {
+      const t = terms.get(m[1]);
+      if (!t) return send(res, 404, { error: 'no such terminal' });
+      closeTerm(t);
+      return send(res, 200, { ok: true });
+    }
     if (method === 'GET' && (m = pathname.match(/^\/api\/session-info\/([^/]+)$/)))
       return send(res, 200, getSessionInfo(m[1]));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/history$/)))
@@ -2580,6 +3447,7 @@ function runWeb(args) {
   pollPeers();
   pollLinks();
   setInterval(() => { pollPeers(); pollLinks(); }, 15000).unref();
+  setInterval(termReap, 60000).unref();
 
   // Optional in-process front-ends. They subscribe to the event bus (onServerEvent) and
   // drive sessions via the exported answer/inject/command helpers, so the permission path
@@ -2632,6 +3500,15 @@ function runWeb(args) {
         const link = inboundLinks.get(name);
         if (!link) return socket.destroy();
         return proxyUpgradeOverLink(link, pm[2], req, socket, head);
+      }
+      // A host terminal. Reached on a peer as /peer/<name>/ws-term/<id>, which the block
+      // above splices — over the peer's URL, or back down the link it opened to us.
+      const tm = url.match(/^\/ws-term\/([^/?]+)/);
+      if (tm) {
+        const t = terms.get(tm[1]);
+        if (!t) return socket.destroy();
+        const from = new URLSearchParams(url.split('?')[1] || '').get('from');
+        return wss.handleUpgrade(req, socket, head, ws => attachTerm(t, ws, from));
       }
       const m = url.match(/^\/ws\/([^/?]+)/);
       if (!m) return socket.destroy();
