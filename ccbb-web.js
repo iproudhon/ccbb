@@ -472,7 +472,14 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
   line-height:1;padding:4px 7px;border-radius:6px;font-family:inherit}
 .term-btn:hover{background:var(--line);color:var(--ink)}
 .term-sep{width:1px;margin:3px 3px;background:var(--line);flex-shrink:0}
-.term-body{flex:1 1 auto;min-height:0;padding:6px 4px 6px 8px;background:#fff;overflow:hidden}
+/* No padding HERE, deliberately. The fit addon sizes the grid from the parent's computed
+   height minus the terminal element's own padding — and with box-sizing:border-box that
+   computed height still includes this box's padding, which it therefore never subtracts.
+   Padding here means a grid a row too tall for the space, and the last line clipped by
+   the overflow:hidden below. On .xterm it lands on the side of the measurement that is
+   actually accounted for, so the inset is real and the arithmetic stays exact. */
+.term-body{flex:1 1 auto;min-height:0;padding:0;background:#fff;overflow:hidden}
+.term-body .xterm{padding:6px 6px 6px 8px}
 .term-win.dark .term-body{background:#000}
 .term-grip{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;z-index:2}
 .term-grip::after{content:'';position:absolute;right:4px;bottom:4px;width:7px;height:7px;
@@ -2390,9 +2397,12 @@ function openTerminalWindow(server, opts){
           return;
         }
         w.id = d.id;
-        // Say which it is: attached to the session's pane, or a plain shell beside it.
-        // Asking for a pane and silently getting a shell would be a confusing surprise.
-        titleEl.textContent = name + (d.attached ? '  ·  session pane' : '');
+        // The title is the server, nothing else — it is the one thing you need to read at
+        // a glance. Whether this is the session's pane or a shell beside it still matters
+        // (asking for a pane and silently getting a shell would be a surprise), so it goes
+        // in the tooltip rather than into the name.
+        titleEl.textContent = name;
+        titleEl.title = name + (d.attached ? ' — attached to the session pane' : ' — login shell');
         connect();
         // Write the state once up front. Otherwise a window that is opened and never
         // touched — the common case — would leave nothing behind to restore, since
@@ -2765,6 +2775,69 @@ function tmuxAttachFor(sessionId) {
          'exec tmux attach -t ' + shQuote(sess);
 }
 
+// script(1) is two different programs wearing one name. util-linux takes the command
+// with -c and flushes with -f; the BSD one on macOS takes the command as trailing
+// arguments and flushes with -F (and older ones want -F to carry a value, so plain is a
+// third possibility). Rather than key off process.platform and hope, ask the binary that
+// is actually here: run each shape once, keep the one that works. Both are told to write
+// their typescript to /dev/null — we read the pty through the pipe, not the file.
+let scriptStyle = null;
+const SCRIPT_STYLES = {
+  linux: cmd => ['-q', '-f', '-c', cmd, '/dev/null'],
+  bsdF:  cmd => ['-q', '-F', '/dev/null', '/bin/sh', '-c', cmd],
+  bsd:   cmd => ['-q', '/dev/null', '/bin/sh', '-c', cmd],
+};
+
+// What script(1) is handed for stdin is not a detail. BSD script calls tcgetattr() on
+// its own stdin before anything else and only forgives the failure for the errnos that
+// mean "not a terminal" — ENOTTY and friends. On macOS a socket (and a FIFO) answers
+// EOPNOTSUPP instead, and Node's stdio:'pipe' is a socketpair, so every terminal died at
+// birth with "tcgetattr/ioctl: Operation not supported on socket". Only an anonymous
+// pipe answers ENOTTY, and nothing in Node creates one — a shell pipeline does. Hence
+// `cat |`: cat reads our socketpair and its stdout is the pipe script wanted.
+//
+// util-linux script does not care, but the wrapper is used everywhere anyway. Two spawn
+// shapes would mean two kill paths and two process-tree shapes for termPts() to know
+// about, for no gain on the platform that already worked.
+function scriptCommandLine(cmd) {
+  if (!scriptStyle) {
+    const order = process.platform === 'darwin' ? ['bsdF', 'bsd', 'linux'] : ['linux', 'bsdF', 'bsd'];
+    // Probe through the wrapper, exactly as a real terminal runs. Probing a bare script
+    // with /dev/null on stdin is what hid this bug: it proved the arguments parsed, not
+    // that the thing could run.
+    for (const style of order) {
+      const r = spawnSync('/bin/sh', ['-c', wrapScript(SCRIPT_STYLES[style]('exit 0'))],
+        { timeout: 5000, stdio: 'ignore' });
+      if (!r.error && r.status === 0) { scriptStyle = style; break; }
+    }
+    if (!scriptStyle) {
+      scriptStyle = process.platform === 'darwin' ? 'bsdF' : 'linux';
+      console.log(`ccbb: no script(1) invocation worked; terminals will try ${scriptStyle} style anyway`);
+    }
+  }
+  return wrapScript(SCRIPT_STYLES[scriptStyle](cmd));
+}
+// Every piece of this line is load-bearing:
+//   `cat &`   — a shell waits for every member of a pipeline, and cat stays blocked on
+//               our socket long after the shell inside the pty is gone. Foreground, it
+//               would hold our child open forever and a terminal exited with `exit`
+//               would never report it. Backgrounded, the pipeline's first element is a
+//               subshell that returns at once; cat outlives it as an orphan, still in
+//               our process group, and closing the terminal kills the group.
+//   `<&3`     — POSIX gives an asynchronous command /dev/null for stdin unless it is
+//               redirected explicitly. Plain `cat &` would read EOF immediately, script
+//               would see its stdin close, and the shell would exit before its first
+//               prompt. fd 3 is the dup of ours made just before.
+//   `exec`    — the pipeline's second element becomes script itself rather than a shell
+//               sitting on top of it, which is what keeps the pty exactly two levels
+//               below our child.
+//   `3<&-`    — that dup is ours, not the user's; it does not belong in their shell.
+// Everything is quoted because an argument list is being flattened back into a shell
+// line, and cmd carries quoting of its own.
+function wrapScript(args) {
+  return 'exec 3<&0; { cat <&3 & } | exec 3<&- ' + ['script'].concat(args).map(shQuote).join(' ');
+}
+
 function openTerm(cols, rows, sessionId) {
   cols = clampInt(cols, 20, 500, 80);
   rows = clampInt(rows, 5, 200, 24);
@@ -2773,16 +2846,26 @@ function openTerm(cols, rows, sessionId) {
   const attach = sessionId ? tmuxAttachFor(String(sessionId)) : null;
   // stty runs inside the pty before the shell starts, so the first prompt is drawn at
   // the right geometry instead of at 80x24 and then redrawn.
-  const cmd = `stty rows ${rows} cols ${cols} 2>/dev/null; ` + (attach || `exec ${shell} -l`);
+  // "columns", not "cols": GNU stty takes either, BSD stty only spells it out.
+  //
+  // `tty` in the same breath names the pty slave, asked of the one process that can
+  // answer without guessing — the shell inside it, before it becomes the shell. Walking
+  // the process tree for it is the fallback, not the plan; see termPts().
+  const ptsFile = path.join(os.tmpdir(), `ccbb-pts-${process.pid}-${id}`);
+  const cmd = `stty rows ${rows} columns ${cols} 2>/dev/null; tty > ${shQuote(ptsFile)} 2>/dev/null; ` +
+              (attach || `exec ${shell} -l`);
   let child;
   try {
-    child = spawn('script', ['-q', '-f', '-c', cmd, '/dev/null'], {
+    // detached: our child leads its own process group, so closing the terminal can signal
+    // the whole pipeline at once. Killing the sh alone would strand cat and script.
+    child = spawn('/bin/sh', ['-c', scriptCommandLine(cmd)], {
       cwd: os.homedir(),
       env: Object.assign({}, process.env, { TERM: 'xterm-256color' }),
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
     });
   } catch (e) { return { error: 'could not start script(1): ' + e.message }; }
-  const t = { id, child, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
+  const t = { id, child, ptsFile, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
               pts: null, alive: true, exitCode: null, graceTimer: null, idleSince: Date.now() };
   terms.set(id, t);
   child.stdout.on('data', c => termPush(t, c));
@@ -2851,20 +2934,77 @@ function attachTerm(t, ws, from) {
   ws.on('error', bye);
 }
 
-// script(1) holds the pty master; the shell it forked holds the slave as its stdin.
-// Setting the size on the slave is what raises SIGWINCH on the foreground group — the
-// only way to resize this pty without a native module.
+// script(1) holds the pty master; the shell it forked holds the slave as its controlling
+// terminal. Setting the size on the slave is what raises SIGWINCH on the foreground
+// group — the only way to resize this pty without a native module.
+//
+// Normally the slave names itself: `tty` runs inside the pty before the shell starts and
+// writes the device path where openTerm() can read it. The ps walk below is only for the
+// case where that file never appeared. There the name ps reports is not spelled the same
+// everywhere ("pts/3", "ttys003", or bare "s003"), so candidates are tried against the
+// filesystem instead of assumed.
+function ttyDevice(name) {
+  const cands = [];
+  if (name.startsWith('/')) cands.push(name);
+  else {
+    cands.push('/dev/' + name);
+    if (!/^tty/.test(name)) cands.push('/dev/tty' + name);
+  }
+  for (const c of cands) {
+    try { if (fs.statSync(c).isCharacterDevice()) return c; } catch {}
+  }
+  return null;
+}
+function pgrepChildren(pid) {
+  try {
+    const r = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8', timeout: 3000 });
+    return String(r.stdout || '').trim().split(/\s+/).filter(Boolean);
+  } catch { return []; }
+}
+function processTty(pid) {
+  try {
+    const r = spawnSync('ps', ['-o', 'tty=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 });
+    const name = String(r.stdout || '').trim();
+    if (!name || name === '?' || name === '??' || name === '-') return null;
+    return ttyDevice(name);
+  } catch { return null; }
+}
+// The pty side is always a grandchild: our sh forks script, and script forks the shell
+// (or the tmux client). Never "the first process with a tty" — when ccbb itself was
+// started from a terminal, everything in between inherits ITS tty, and resizing that
+// would resize the window ccbb is running in.
+let ownTty;
+function ptsFromProcessTree(t) {
+  if (ownTty === undefined) ownTty = processTty(process.pid);
+  for (const kid of pgrepChildren(t.child.pid)) {
+    for (const g of pgrepChildren(kid)) {
+      const dev = processTty(g);
+      if (dev && dev !== ownTty) return dev;
+    }
+  }
+  return null;
+}
 function termPts(t) {
   if (t.pts) return t.pts;
-  try {
-    const kids = fs.readFileSync(`/proc/${t.child.pid}/task/${t.child.pid}/children`, 'utf8').trim().split(/\s+/);
-    for (const k of kids) {
-      if (!k) continue;
-      const link = fs.readlinkSync(`/proc/${k}/fd/0`);
-      if (link.startsWith('/dev/pts/')) { t.pts = link; return link; }
-    }
-  } catch {}
-  return null;
+  // Nothing partial gets cached: an empty or half-written file just means the pty is
+  // younger than this resize, and the next one should look again.
+  let named = null;
+  try { named = fs.readFileSync(t.ptsFile, 'utf8').trim(); } catch {}
+  if (named && named.startsWith('/')) {
+    try { if (fs.statSync(named).isCharacterDevice()) return (t.pts = named); } catch {}
+  }
+  return (t.pts = ptsFromProcessTree(t)) || null;
+}
+// GNU stty selects the device with -F, BSD stty with -f. Same trick as script(1): try,
+// then remember which one this machine answers to.
+let sttyFileFlag = null;
+function sttySize(dev, rows, cols) {
+  for (const flag of (sttyFileFlag ? [sttyFileFlag] : ['-F', '-f'])) {
+    const r = spawnSync('stty', [flag, dev, 'rows', String(rows), 'columns', String(cols)],
+      { timeout: 3000, stdio: 'ignore' });
+    if (!r.error && r.status === 0) { sttyFileFlag = flag; return true; }
+  }
+  return false;
 }
 function termResize(t, cols, rows) {
   const c = clampInt(cols, 20, 500, t.cols), r = clampInt(rows, 5, 200, t.rows);
@@ -2872,11 +3012,29 @@ function termResize(t, cols, rows) {
   t.cols = c; t.rows = r;
   const pts = termPts(t);
   if (!pts) return { ok: true, resized: false, cols: c, rows: r };
-  const out = spawnSync('stty', ['-F', pts, 'rows', String(r), 'cols', String(c)],
-    { timeout: 3000, stdio: 'ignore' });
-  return { ok: true, resized: !out.error && out.status === 0, cols: c, rows: r };
+  return { ok: true, resized: sttySize(pts, r, c), cols: c, rows: r };
 }
 
+// SIGKILL, and not as a last resort: script(1) absorbs both SIGHUP and SIGTERM without
+// dying and without passing them on, so anything gentler leaves the pty — and the shell
+// or tmux client behind it — running forever. Killing it is not abrupt for the shell:
+// closing the master hangs up the pty, which delivers SIGHUP to the foreground process
+// group, exactly as closing a terminal window does. The grandchild goes with it.
+//
+// The signal goes to the whole group because our child is a shell running a pipeline:
+// killing it alone would strand cat and script. spawn(detached) made it the group leader,
+// so the negative pid reaches every part at once.
+// Only while the child is still running: once it has exited and been reaped, that pid
+// belongs to whoever the OS hands it to next, and a bare kill(2) on a negative pid has
+// none of the protection child.kill() gets from holding the process handle. Nothing is
+// lost by skipping it — the sh only exits once script has, and the group empties with it.
+function killTermChild(t) {
+  if (t.child.exitCode === null && t.child.signalCode === null) {
+    try { process.kill(-t.child.pid, 'SIGKILL'); }
+    catch { try { t.child.kill('SIGKILL'); } catch {} }
+  }
+  try { fs.unlinkSync(t.ptsFile); } catch {}
+}
 function closeTerm(t) {
   terms.delete(t.id);
   if (t.graceTimer) { clearTimeout(t.graceTimer); t.graceTimer = null; }
@@ -2884,15 +3042,14 @@ function closeTerm(t) {
   termBroadcast(t, { type: 'exit', code: t.exitCode });
   for (const ws of t.subs) { try { ws.close(); } catch {} }
   t.subs.clear();
-  try { t.child.kill('SIGHUP'); } catch {}
-  setTimeout(() => { try { t.child.kill('SIGKILL'); } catch {} }, 2000).unref();
+  killTermChild(t);
 }
 // A pty is a child process, not a resource the OS reclaims with us: nothing kills these
 // shells when ccbb goes away, so every restart would otherwise strand one per terminal
 // that was open. SIGKILL cannot be caught, so `kill -9` on the server still leaks — a
 // plain stop or Ctrl-C, which is how it is actually restarted, does not.
 function closeAllTerms() {
-  for (const t of Array.from(terms.values())) { try { t.child.kill('SIGHUP'); } catch {} }
+  for (const t of Array.from(terms.values())) killTermChild(t);
   terms.clear();
 }
 process.on('exit', closeAllTerms);
@@ -2906,7 +3063,9 @@ function termReap() {
   const now = Date.now();
   for (const [id, t] of terms) {
     if (t.subs.size) { t.idleSince = now; continue; }
-    if (!t.alive) { if (now - t.idleSince > 60000) terms.delete(id); continue; }
+    // Dead already, so there is nothing to kill — but killTermChild is also what takes
+    // the pts file away, and a shell that exited on its own never went through closeTerm.
+    if (!t.alive) { if (now - t.idleSince > 60000) { killTermChild(t); terms.delete(id); } continue; }
     if (!t.graceTimer && now - t.idleSince > 5 * 60 * 1000) closeTerm(t);
   }
 }
