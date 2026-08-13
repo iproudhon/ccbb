@@ -25,11 +25,48 @@ const CACHE_FILE = path.join(CLAUDE_DIR, 'ccbb-cache.json');
 // without a restart. Shape (all keys optional except where a front-end needs them):
 //   { "token": "<webex bot token>", "allow": ["you@example.com"],
 //     "commands": { "name": { "run": "…", "kind": "console" } },
-//     "confluence": { "baseUrl": "…", "token": "…", "rootPageId": "…", "allow": […] } }
+//     "confluence": { "baseUrl": "…", "token": "…", "rootPageId": "…", "allow": […] },
+//     "server": { "name": "workbox" }, "peerToken": "…",
+//     "peers": [ { "name": "laptop", "url": "http://127.0.0.1:8591", "token": "…" } ] }
 function readConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; }
   catch { return {}; }
 }
+
+// ── Multi-server identity ─────────────────────────────────────────────────────
+// A ccbb server has a NAME (config server.name, default the hostname) and a list of
+// PEERS it can reach — normally other ccbb servers forwarded to localhost over ssh.
+// There is no master: every peer proxies to every other peer it's configured with,
+// so any of them can drive any other's sessions.
+//
+// Peers are addressed by NAME, never by a URL supplied by the client — the name is
+// looked up in this config and nothing else, so a browser can't turn a ccbb server
+// into an open proxy.
+function serverIdentity() {
+  const s = (readConfig().server) || {};
+  const hostname = os.hostname();
+  return { name: String(s.name || hostname).trim() || hostname, hostname };
+}
+// Configured peers, normalized. Entries without a url, duplicates, and any entry
+// naming ourselves are dropped — a peer pointing back at this server would make
+// /peer/<self> an infinite loop.
+function peerList() {
+  const cfg = readConfig();
+  const self = serverIdentity().name;
+  const out = [];
+  for (const p of (Array.isArray(cfg.peers) ? cfg.peers : [])) {
+    if (!p || !p.url) continue;
+    const url = String(p.url).trim().replace(/\/+$/, '');
+    const name = String(p.name || url).trim();
+    if (!name || name === self || out.some(q => q.name === name)) continue;
+    // Each peer may run its own token; peerToken is the fallback for a shared secret.
+    out.push({ name, url, token: String(p.token || cfg.peerToken || '') });
+  }
+  return out;
+}
+function peerByName(name) { return peerList().find(p => p.name === name) || null; }
+// The token THIS server requires of its callers. Empty string = no auth (the default).
+function peerToken() { return String(readConfig().peerToken || ''); }
 
 // ── Pricing ────────────────────────────────────────────────────────────────
 // Model pricing sourced from LiteLLM's community price list (the same data ccusage
@@ -1324,6 +1361,8 @@ function getCostSummary(periodFilter) {
 // ── Exports ────────────────────────────────────────────────────────────────
 module.exports = {
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
+  // multi-server
+  serverIdentity, peerList, peerByName, peerToken,
   // pricing
   PRICING, priceTable: PRICE_TABLE, priceForModel, contextMaxFor,
   loadTable, priceForModelIn, tableSig, normalizeId, convertLiteLLM,

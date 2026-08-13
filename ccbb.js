@@ -7,6 +7,9 @@
 //     --webex                 also run the Webex front-end (shares the server)
 //     --confluence            also run the Confluence page front-end
 //
+// `web` is also the multi-server front-end: with "peers" in ccbb-config.json it lists and
+// drives other machines' sessions through the same UI (see peers.md).
+//
 // All discovery / stats / pricing / transcript reading live in ccbb-common.js so the
 // front-ends can't drift. ccbb never rewrites a transcript — the only write it makes is
 // appending a custom-title entry on rename.
@@ -349,6 +352,7 @@ Usage:
   ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
      [--webex]             ...also run the Webex front-end (one process)
      [--confluence]        ...also run the Confluence page front-end
+                           multi-machine: add "peers" to ccbb-config.json (peers.md)
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
   ccbb skel [-o file]      extract privacy-safe session skeletons to one JSON (see: ccbb skel -h)
   ccbb stats <file...>     render an HTML stats report from skeletons (see: ccbb stats -h)

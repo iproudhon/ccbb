@@ -19,7 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { CLAUDE_DIR } = require('./ccbb-common');
+const { CLAUDE_DIR, peerToken } = require('./ccbb-common');
 
 const DEFAULT_PORT = 8590;
 const DEFAULT_SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
@@ -34,8 +34,11 @@ const MARKER = '#ccbb-hook';   // shell comment tag; identifies ccbb's own hook 
 function hookCommand(port) {
   // Fire-and-forget: post the stdin payload, cap at 2s, swallow all errors so a stopped or
   // slow ccbb never blocks or fails the Claude Code turn. async:true also backgrounds it.
+  // When the server requires a token (multi-server setups), the hook must present it too.
+  const tok = peerToken();
+  const auth = tok ? `-H 'x-ccbb-token: ${tok.replace(/'/g, "'\\''")}' ` : '';
   return `curl -sS -m 2 -X POST http://127.0.0.1:${port}/api/hook ` +
-    `-H 'content-type: application/json' --data-binary @- >/dev/null 2>&1 || true ${MARKER}`;
+    `-H 'content-type: application/json' ${auth}--data-binary @- >/dev/null 2>&1 || true ${MARKER}`;
 }
 function hookEntry(matcher, port) {
   return { matcher, hooks: [{ type: 'command', command: hookCommand(port), timeout: 5, async: true }] };

@@ -9,13 +9,16 @@
 // server, the web-flavored custom-command runner, and the pipe-pane permission scraper.
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const common = require('./ccbb-common');
 const {
+  serverIdentity, peerList, peerByName, peerToken,
   CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSubagentHistory, getSessionStats,
   sessionLiveness, renameSession, paneForSession, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
@@ -26,6 +29,8 @@ const {
 } = common;
 
 const DEFAULT_PORT = 8590;
+let VERSION = ''; try { VERSION = require('./package.json').version || ''; } catch {}
+let WS; try { WS = require('ws'); } catch {}
 
 // ── Event bus ────────────────────────────────────────────────────────────────
 // Every server-side event (permission, permission_clear, ask_block, transcript,
@@ -147,7 +152,7 @@ const APP_HTML = `<!DOCTYPE html>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
 <style>
 :root{
-  --bg:#faf9f5; --bg-alt:#f0eee6; --surface:#fff; --ink:#3d3d3a; --ink-soft:#6e6d66;
+  --bg:#fff; --bg-alt:#f0eee6; --surface:#fff; --ink:#3d3d3a; --ink-soft:#6e6d66;
   --ink-faint:#9b998f; --line:#e6e3da; --line-soft:#efece4; --accent:#c96442;
   --accent-soft:#f5e9e3; --code-bg:#f5f3ec;
 }
@@ -162,6 +167,13 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .view.collapsed .view-body{display:none}
 .view-bar{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:6px 14px;background:var(--bg-alt);border-bottom:1px solid var(--line);min-height:38px}
 .view.collapsed .view-bar{cursor:pointer;border-bottom:none}
+/* Stowed away: nothing but the chevron, so a folded list costs a sliver instead of a
+   column. Clicking anywhere on the strip brings it back. */
+.view.folded .view-bar{min-height:0;padding:3px 6px}
+.view.folded .bar-title,.view.folded .bar-refreshed,.view.folded .bar-btns{display:none}
+/* Pushed aside by another view's maximize — recedes, but an unseen update still shouts. */
+.view.dimmed .view-bar{opacity:.5}
+.view.dimmed.unseen .view-bar{opacity:1}
 .bar-btns{margin-left:auto;display:flex;gap:2px;flex-shrink:0}
 .vb-btn{background:none;border:none;color:var(--ink-soft);font-size:14px;cursor:pointer;line-height:1;padding:4px 8px;border-radius:6px;font-family:inherit}
 .vb-btn:hover{background:var(--line);color:var(--ink)}
@@ -169,15 +181,20 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .view.unseen .view-bar{background:#f9e3d5}
 .view.unseen .unseen-ind{display:inline-flex;align-items:center;background:var(--accent);color:#fff;border-radius:10px;padding:2px 10px;font-size:11px;font-weight:600;flex-shrink:0;animation:pulse 1.2s ease-in-out infinite}
 .view-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}
-.bar-name{font-weight:600;font-size:13px;color:var(--ink);white-space:nowrap}
-.bar-tab{display:none}
-/* ── horizontal: a traditional tab bar. All view headers sit in one top row (the tabs);
-   their bodies sit in the content row below, column-aligned. Maximizing one view makes
-   its body span the whole content row while the others' bodies hide and their tabs shrink
-   to an abbreviated label. Implemented as a 2-row grid over #views, with each .view
-   flattened via display:contents so its bar and body become direct grid items — the bar
-   auto-places into row 1, the body into row 2, same column. grid-template-columns and the
-   maxed body's column span are set per-relayout in JS. ── */
+.bar-name{font-weight:600;font-size:13px;color:var(--ink);white-space:nowrap;
+  display:flex;align-items:baseline;gap:10px;flex:1 1 auto;min-width:0;overflow:hidden}
+.bar-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fold-btn{flex-shrink:0;cursor:pointer;color:var(--ink-soft);font-size:10px;line-height:1;
+  padding:3px 5px;margin:-3px -2px -3px -5px;border-radius:5px;align-self:center}
+.fold-btn:hover{background:var(--line);color:var(--ink)}
+.bar-refreshed{font-weight:400;font-size:11px;color:var(--ink-faint);margin-left:auto;white-space:nowrap}
+/* ── horizontal: all view headers sit in one top row, their bodies in the content row
+   below, column-aligned. Each view keeps the SAME header it has in vertical mode, just
+   narrower. Maximizing one view makes its body span the whole content row while the
+   others' bodies hide and their headers clamp. Implemented as a 2-row grid over #views,
+   with each .view flattened via display:contents so its bar and body become direct grid
+   items — the bar auto-places into row 1, the body into row 2, same column.
+   grid-template-columns and the maxed body's column span are set per-relayout in JS. ── */
 #views.horizontal{display:grid;grid-template-rows:auto minmax(0,1fr)}
 #views.horizontal .view{display:contents}
 #views.horizontal .view-bar{grid-row:1;border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
@@ -185,11 +202,10 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 #views.horizontal .view-body{grid-row:2;min-width:0;border-right:1px solid var(--line)}
 #views.horizontal .view:last-child .view-body{border-right:none}
 #views.horizontal .view.collapsed .view-body{display:none}
-#views.horizontal .bar-main{display:none!important}
-#views.horizontal .bar-tab{display:flex;align-items:center;gap:6px;flex:1 1 auto;min-width:0;font-weight:600;font-size:13px;color:var(--ink)}
-#views.horizontal .bar-tab .status-dot{flex-shrink:0}
-#views.horizontal .bar-tab .bar-tab-text{flex:1 1 auto;min-width:0;cursor:pointer;border-radius:5px;padding:1px 4px;margin:-1px -4px}
-#views.horizontal .view:not(.collapsed) .bar-tab .bar-tab-text:hover{background:var(--line-soft)}
+/* A collapsed column must not hold the row open, so its header clamps: the list drops
+   its timestamp, and both kinds let the title ellipsize. */
+#views.horizontal .view.collapsed .bar-main{max-width:11ch}
+#views.horizontal .lv.collapsed .bar-refreshed{display:none}
 /* ── list view ── */
 .lv{font-family:ui-monospace,'Cascadia Code',Menlo,monospace;font-size:13px;background:#fff}
 .lv .view-body{display:block;overflow-y:auto}
@@ -219,6 +235,19 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .lv .lmsg{text-align:center;padding:48px;color:#57606a}
 .lv .err{text-align:center;padding:48px;color:#cf222e}
 .lv .foot{padding:8px 24px;color:#57606a;font-size:12px;border-top:1px solid #d0d7de}
+/* ── server chips: which machines the list draws from ── */
+.lv .srvbar{display:flex;flex-wrap:wrap;gap:6px;padding:12px 24px 0}
+.lv .chip{display:inline-flex;align-items:center;gap:6px;background:#fff;border:1px solid #d0d7de;border-radius:999px;
+  padding:3px 11px;font-family:inherit;font-size:12px;color:#8c959f;cursor:pointer}
+.lv .chip:hover{border-color:#8c959f}
+.lv .chip.on{background:#ddf4e4;border-color:#2da44e;color:#1f2328}
+.lv .chip .cname{font-weight:600}
+.lv .sdot{width:7px;height:7px;border-radius:50%;background:#2da44e;flex-shrink:0}
+.lv .sdot.down{background:#cf222e}
+.lv .sdot.unknown{background:#d0d7de}
+.lv .srv-err{margin-top:12px;padding:6px 10px;border:1px solid #f5c2c0;background:#fff5f5;border-radius:6px;color:#cf222e;font-size:12px}
+.lv .srv{color:#0969da;font-size:12px;white-space:nowrap}
+.lv .srv.local{color:#8c959f}
 .lv .summary{margin:16px 24px 0;border:1px solid #d0d7de;border-radius:10px;background:#f6f8fa;padding:14px 16px}
 .lv .summary-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}
 .lv .summary-head h2{font-size:13px;font-weight:600;color:#1f2328}
@@ -237,6 +266,9 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .lv .sum-table tfoot td{border-top:1px solid #d0d7de;border-bottom:none;font-weight:600;color:#1f2328;padding-top:6px}
 .lv .sum-table.prov{min-width:640px}
 /* ── session view ── */
+/* Which machine this session actually runs on — muted when it's this one. */
+.srv-badge{flex-shrink:0;font-size:11px;font-weight:600;border-radius:5px;padding:1px 7px;background:#ddf4e4;color:#1a7f37;border:1px solid #aceebb}
+.srv-badge.local{background:var(--line-soft);color:var(--ink-faint);border-color:var(--line)}
 .hdr-title{font-weight:600;font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;cursor:pointer;border-radius:5px;padding:1px 4px;margin:-1px -4px}
 .hdr-title:hover{background:var(--line-soft)}
 .hdr-title.empty{color:var(--ink-faint);font-style:italic;font-weight:400}
@@ -350,18 +382,30 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .ask-card .tool-output{padding:0 16px 12px;background:var(--bg-alt)}
 .ask-card .tool-output:empty{display:none}
 .ask-card .tool-output pre{background:var(--code-bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;white-space:pre-wrap;word-break:break-word;margin:0}
-.cmd-box{flex-shrink:0;border-top:1px solid var(--line);background:var(--bg-alt);max-height:45vh;display:none;flex-direction:column;min-height:0}
+/* Sized against the VIEW, not the viewport: with views stacked, 45vh was nearly a whole
+   view, so output squeezed the transcript to nothing and pushed the composer off-screen.
+   45% of the body leaves both. position/z-index put it above .tr-wrap and .transcript,
+   which are position:relative and so would otherwise paint over this box's own header. */
+.cmd-box{flex:0 1 auto;min-height:0;max-height:45%;position:relative;z-index:1;
+  border-top:1px solid var(--line);background:var(--bg);display:none;flex-direction:column}
 .cmd-box.show{display:flex}
-.cmd-box.max{flex:4 1 0;max-height:none}
+/* Maximized: leave the flex flow and cover the whole window. //cat and //ll output is
+   the thing you want to read, and inside one column of a split view there is no room. */
+.cmd-box.max{position:fixed;inset:0;max-height:none;z-index:50;border-top:none}
 .cmd-box.min{flex:0 0 auto}
-.cmd-head{flex-shrink:0;display:flex;align-items:center;gap:6px;padding:8px 20px;border-bottom:1px solid var(--line);font-size:12px;color:var(--ink-soft)}
-.cmd-title{font-family:ui-monospace,Menlo,monospace;font-weight:600;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Title bar in the same idiom as .view-bar, so output reads as its own pane rather than
+   a slab wedged into the transcript. The dot marks it as command output. */
+.cmd-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:6px 10px 6px 14px;
+  background:var(--bg-alt);border-bottom:1px solid var(--line);min-height:34px;font-size:12px;color:var(--ink-soft)}
+.cmd-head::before{content:'';flex-shrink:0;width:8px;height:8px;border-radius:50%;background:var(--accent);opacity:.75}
+.cmd-title{font-family:ui-monospace,Menlo,monospace;font-weight:600;color:var(--ink);
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cmd-btns{margin-left:auto;display:flex;gap:2px;flex-shrink:0}
-.cmd-btn{background:none;border:none;color:var(--ink-soft);font-size:15px;cursor:pointer;line-height:1;padding:3px 7px;border-radius:6px;font-family:inherit}
+.cmd-btn{background:none;border:none;color:var(--ink-soft);font-size:14px;cursor:pointer;line-height:1;padding:4px 8px;border-radius:6px;font-family:inherit}
 .cmd-btn:hover{background:var(--line);color:var(--ink)}
 .cmd-content{overflow:auto;padding:14px 20px;flex:1 1 auto;min-height:0}
 .cmd-box.min .cmd-content{display:none}
-.cmd-content pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:12.5px;line-height:1.5;overflow:auto;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+.cmd-content pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:12.5px;line-height:1.5;overflow:auto;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
 .cmd-content.code pre,.cmd-content.md pre{white-space:pre;word-break:normal}
 .cmd-content.md{font-size:14px;line-height:1.6}
 .cmd-content code.hljs{background:none;padding:0;font-family:inherit}
@@ -376,8 +420,6 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .send-btn{background:var(--accent);border:none;color:#fff;width:30px;height:30px;border-radius:9px;font-size:15px;cursor:pointer;font-family:inherit;flex-shrink:0;display:flex;align-items:center;justify-content:center}
 .send-btn:hover:not(:disabled){background:var(--accent-hover,#a84f34)}
 .send-btn:disabled{opacity:.4;cursor:default}
-.input-hint{font-size:11px;color:var(--ink-faint);margin-top:6px;text-align:center;width:100%;max-width:740px}
-.input-hint.off{color:#cf7a4a}
 /* toast (replaces alert(): alerts block browser automation and yank focus) */
 #toast{position:fixed;bottom:18px;right:18px;background:#3d3d3a;color:#fff;border-radius:10px;padding:10px 16px;font-size:13px;z-index:99;display:none;max-width:420px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 </style>
@@ -393,7 +435,22 @@ __APP_JS__
 
 const APP_JS = `
 var PRICE_TABLE = __PRICING__;
-var INIT_OPEN = __INIT_OPEN__;   // sessionId to open on load (deep link), or null
+var SELF = __SELF__;             // this server's identity: {name, hostname}
+var INIT_OPEN = __INIT_OPEN__;   // {sessionId, server} to open on load (deep link), or null
+
+// ── multi-server addressing ───────────────────────────────────────────────────
+// Every session belongs to a server. Local sessions live under /api/…; a peer's live
+// under /peer/<name>/api/… — the SAME routes behind a prefix, so one apiBase() call
+// per view is the whole difference between driving a local and a remote session.
+function isLocal(server){ return !server || server === SELF.name; }
+function apiBase(server){ return isLocal(server) ? '' : '/peer/'+encodeURIComponent(server); }
+function sessionHref(sid, server){ return apiBase(server)+'/session/'+sid; }
+function parseSessionHref(href){
+  var m = href.match(/^\\/peer\\/([^/]+)\\/session\\/([^/?#]+)/);
+  if (m) return { server: decodeURIComponent(m[1]), sessionId: m[2] };
+  m = href.match(/^\\/session\\/([^/?#]+)/);
+  return m ? { server: null, sessionId: m[1] } : null;
+}
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -445,55 +502,66 @@ function toggleOrientation(){
   viewsEl.classList.toggle('horizontal', orientation === 'horizontal');
   relayout();
 }
-// A view's side-tab title: full when expanded, first 4 chars + ellipsis when collapsed
-// in horizontal mode (per spec). No-op for the (bar-less) vertical layout, which hides it.
-function applyTab(v){
-  if (!v.barTabEl) return;
-  var collapsed = orientation === 'horizontal' && v.el.classList.contains('collapsed');
-  var text = collapsed ? (v.fullTabText||'').slice(0,4)+'…' : (v.fullTabText||'');
-  var textEl = v.barTabEl.querySelector('.bar-tab-text');
-  if (!textEl) {
-    textEl = document.createElement('span');
-    textEl.className = 'bar-tab-text';
-    textEl.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-    v.barTabEl.appendChild(textEl);
-  }
-  textEl.textContent = text;
-}
-
 function relayout(){
+  // Folding the ONLY view would leave a bar over a blank page with nothing to reveal —
+  // so a lone view is never folded, and closing the last session unfolds the list again.
+  if (views.length < 2) views.forEach(function(v){ v.folded = false; });
   var maxed = null;
   for (var i=0;i<views.length;i++) if (views[i].maxed) maxed = views[i];
   views.forEach(function(v){
-    var collapsed = !!(maxed && v !== maxed);
+    // Two independent reasons to collapse: someone else is maximized, or this view was
+    // folded away by hand. Maximize wins while it lasts; folding outlives it.
+    var collapsed = maxed ? v !== maxed : !!v.folded;
     var was = v.el.classList.contains('collapsed');
     v.el.classList.toggle('collapsed', collapsed);
+    // Folded = deliberately stowed, so the bar strips down to its chevron. Dimmed = pushed
+    // aside by someone else's maximize, so the bar keeps its title (that's how you get
+    // back) but recedes. The two are different states and must look different.
+    v.el.classList.toggle('folded', !!v.folded);
+    v.el.classList.toggle('dimmed', !!(maxed && v !== maxed));
     var mx = v.barEl.querySelector('[data-act="max"]');
     if (mx) { mx.innerHTML = v.maxed ? '&#10064;' : '&#9633;'; mx.title = v.maxed ? 'Normal (equal heights)' : 'Maximize'; }
+    if (v.onFold) v.onFold();   // several paths clear .folded; sync the chevron from one place
     // A view that just became visible while following its bottom counts as seen.
     if (was && !collapsed && v.onExpanded) v.onExpanded();
-    applyTab(v);
     var ob = v.barEl && v.barEl.querySelector('[data-act="orient"]');
     if (ob) {
       ob.innerHTML = orientation === 'horizontal' ? '&#9636;' : '&#9637;';
       ob.title = orientation === 'horizontal' ? 'Stack vertically' : 'Stack horizontally';
     }
   });
-  // Horizontal grid sizing: equal columns normally; when one view is maxed its content
-  // spans the whole row and the collapsed tabs shrink to fit their abbreviated labels.
+  // Horizontal grid sizing: expanded views share the row; collapsed ones — maximized-away
+  // or folded — shrink to fit their clamped header. A maxed view's body spans the row.
+  //
+  // Every bar and body is pinned to its own column EXPLICITLY. A collapsed view's body is
+  // display:none, so it is not a grid item at all — leaving placement to the grid would
+  // shift every later body one column left of its own header, which is exactly what a
+  // folded list did: session 1's body landed under the list's header and the last column
+  // went blank. Maximize hid that bug because it hides every other body too.
   if (orientation === 'horizontal') {
-    viewsEl.style.gridTemplateColumns = maxed
-      ? views.map(function(v){ return v === maxed ? '1fr' : 'auto'; }).join(' ')
-      : 'repeat(' + views.length + ',1fr)';
-    views.forEach(function(v){ v.bodyEl.style.gridColumn = (maxed && v === maxed) ? '1 / -1' : ''; });
+    viewsEl.style.gridTemplateColumns = views.map(function(v){
+      return (maxed ? v === maxed : !v.folded) ? '1fr' : 'auto';
+    }).join(' ');
+    views.forEach(function(v, i){
+      v.barEl.style.gridColumn = String(i + 1);
+      v.bodyEl.style.gridColumn = (maxed && v === maxed) ? '1 / -1' : String(i + 1);
+    });
   } else {
     viewsEl.style.gridTemplateColumns = '';
-    views.forEach(function(v){ v.bodyEl.style.gridColumn = ''; });
+    views.forEach(function(v){ v.barEl.style.gridColumn = ''; v.bodyEl.style.gridColumn = ''; });
   }
 }
 function toggleMax(v){
   if (v.maxed) { v.maxed = false; }
-  else { views.forEach(function(o){ o.maxed = false; }); v.maxed = true; }
+  else { views.forEach(function(o){ o.maxed = false; }); v.maxed = true; v.folded = false; }
+  relayout();
+}
+// Fold a view away to just its bar, leaving every other view expanded — the opposite
+// gesture to maximize, and the only way to get the session list out of the way without
+// maximizing something else.
+function toggleFold(v){
+  v.folded = !v.folded;
+  if (v.folded) v.maxed = false;
   relayout();
 }
 function closeView(v){
@@ -518,10 +586,6 @@ function makeViewBar(v, barMain, buttons){
   bar.appendChild(ind);
   barMain.classList.add('bar-main');
   bar.appendChild(barMain);
-  var tab = document.createElement('span');
-  tab.className = 'bar-tab';
-  bar.appendChild(tab);
-  v.barTabEl = tab;
   var btns = document.createElement('div');
   btns.className = 'bar-btns';
   btns.innerHTML = '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
@@ -539,21 +603,29 @@ function makeViewBar(v, barMain, buttons){
       else if (b.dataset.act === 'close') closeView(v);
       return;
     }
-    // Tapping a collapsed view's bar expands it (and reveals its unviewed updates).
-    if (v.el.classList.contains('collapsed')) toggleMax(v);
+    // Tapping a collapsed view's bar reveals it (and its unviewed updates). Collapsed
+    // because something ELSE is maximized → take the maximize, as before. Collapsed
+    // because it was folded → just unfold, back to an equal share.
+    if (v.el.classList.contains('collapsed')) {
+      if (views.some(function(o){ return o.maxed && o !== v; })) toggleMax(v);
+      else if (v.folded) toggleFold(v);
+    }
   });
   v.barEl = bar;
   return bar;
 }
-function openSession(sid){
+function openSession(sid, server){
+  // A session is identified by (server, id): the same id could exist on two machines,
+  // and two views of "the same" id on different servers are two different sessions.
+  var srv = isLocal(server) ? null : server;
   for (var i=0;i<views.length;i++) {
-    if (views[i].kind === 'session' && views[i].sessionId === sid) {
+    if (views[i].kind === 'session' && views[i].sessionId === sid && (views[i].server||null) === srv) {
       if (!views[i].maxed) toggleMax(views[i]);
       return;
     }
   }
-  fetch('/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
-    var info = { sessionId: sid, title: (d&&d.title)||'', projectPath: (d&&d.projectPath)||'',
+  fetch(apiBase(srv)+'/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
+    var info = { sessionId: sid, server: srv, title: (d&&d.title)||'', projectPath: (d&&d.projectPath)||'',
                  live: !!(d&&d.live), liveStatus: (d&&d.liveStatus)||null, liveStatusAt: (d&&d.liveStatusAt)||null,
                  stats: (d&&d.stats)||null };
     var v = createSessionView(info);
@@ -571,12 +643,26 @@ function createListView(){
   el.className = 'view lv';
   var barMain = document.createElement('span');
   barMain.className = 'bar-name';
-  barMain.textContent = 'ccbb — sessions';
+  barMain.innerHTML = '<span class="fold-btn" id="foldBtn" title="Hide the session list">&#9662;</span>'+
+    '<span class="bar-title" id="barTitle"></span><span class="bar-refreshed" id="refreshed"></span>';
+  barMain.querySelector('#barTitle').textContent = 'ccbb — ' + SELF.name;
   el.appendChild(makeViewBar(v, barMain, { close:false, orient:true }));
-  v.fullTabText = 'Sessions';
+  var refreshedEl = barMain.querySelector('#refreshed');
+  // The chevron reflects THIS view's fold, not whether it happens to be collapsed —
+  // a list hidden because a session is maximized still shows itself as unfolded.
+  var foldEl = barMain.querySelector('#foldBtn');
+  v.onFold = function(){
+    // With nothing else open there is nowhere for the list to get out of the way TO,
+    // so the control isn't offered at all.
+    foldEl.style.display = views.length < 2 ? 'none' : '';
+    foldEl.innerHTML = v.folded ? '&#9656;' : '&#9662;';
+    foldEl.title = v.folded ? 'Show the session list' : 'Hide the session list';
+  };
+  foldEl.addEventListener('click', function(e){ e.stopPropagation(); toggleFold(v); });
   var body = document.createElement('div');
   body.className = 'view-body';
   body.innerHTML =
+    '<div class="srvbar" id="srvbar"></div>'+
     '<div class="summary" id="summary" style="display:none">'+
       '<div class="summary-head"><h2>Cost summary</h2>'+
       '<select id="sumScope"></select><span class="scope-cost" id="sumScopeCost"></span></div>'+
@@ -588,9 +674,60 @@ function createListView(){
   v.bodyEl = body;
 
   var sessions = [], totals = {}, costSummary = null;
+  var servers = [{ name: SELF.name, self: true, status: 'up' }];
+  var loadErrors = [];     // per-server load failures, shown inline instead of blanking the list
   var sortStack = [{col:'lastActivity', dir:'desc'}];
-  var COL_DEFAULTS = { live:'desc', title:'asc', startedAt:'desc', totalCost:'desc',
+  var COL_DEFAULTS = { live:'desc', title:'asc', startedAt:'desc', totalCost:'desc', server:'asc',
     totalTokens:'desc', turns:'desc', context:'desc', lastActivity:'desc', projectPath:'asc' };
+
+  // ── server selection ──
+  // Which servers the list draws from. Persisted, so a reload keeps your working set.
+  // A name that's no longer configured is dropped on load; a newly-configured server
+  // starts selected, so adding a peer to the config just makes its sessions appear.
+  var selected = null;
+  try { var raw = localStorage.getItem('ccbb.servers'); if (raw) selected = JSON.parse(raw); } catch(e) {}
+  if (!Array.isArray(selected)) selected = null;
+  function saveSelection(){ try { localStorage.setItem('ccbb.servers', JSON.stringify(selected)); } catch(e) {} }
+  function knownNames(){ return servers.map(function(s){ return s.name; }); }
+  function selectedServers(){
+    var known = knownNames();
+    if (!selected) return known;
+    var keep = selected.filter(function(n){ return known.indexOf(n) !== -1; });
+    // Everything deselected would show an empty page with no way back; fall back to all.
+    return keep.length ? keep : known;
+  }
+  function isSelected(name){ return selectedServers().indexOf(name) !== -1; }
+  function toggleServer(name){
+    var cur = selectedServers().slice();
+    var i = cur.indexOf(name);
+    if (i === -1) cur.push(name); else cur.splice(i, 1);
+    selected = cur; saveSelection();
+    renderServers(); load();
+  }
+  function renderServers(){
+    var bar = body.querySelector('#srvbar');
+    // With no peers configured there is nothing to filter — stay out of the way.
+    if (servers.length < 2) { bar.style.display = 'none'; return; }
+    bar.style.display = '';
+    bar.innerHTML = servers.map(function(s){
+      var on = isSelected(s.name);
+      var tip = s.name + (s.self ? ' (this server)' : '')
+        + (s.inbound ? ' — linked in (reached over its own connection)' : '')
+        + (s.status === 'down' ? ' — offline: ' + (s.error||'unreachable') : '')
+        + (s.rttMs != null && s.status === 'up' ? ' — ' + s.rttMs + 'ms' : '');
+      return '<button class="chip'+(on?' on':'')+'" data-srv="'+esc(s.name)+'" title="'+esc(tip)+'">'
+        + '<span class="sdot '+esc(s.status||'unknown')+'"></span>'
+        + '<span class="cname">'+esc(s.name)+'</span>'
+        + '</button>';
+    }).join('');
+  }
+  async function loadServers(){
+    try {
+      var r = await fetch('/api/servers');
+      var d = await r.json();
+      if (d && Array.isArray(d.servers)) { servers = d.servers; renderServers(); }
+    } catch(e) {}
+  }
 
   function clickHeader(col, shift) {
     var idx = sortStack.findIndex(function(e){ return e.col === col; });
@@ -621,34 +758,68 @@ function createListView(){
       return 0;
     });
   }
-  function load() { loadSummary(); }   // loadSummary sets the default scope, then loads the list
-  async function loadSessions(month) {
-    var out = body.querySelector('#out');
-    out.className = 'lmsg'; out.textContent = 'Loading…';
-    body.querySelector('#foot').textContent = '';
-    try {
-      var r = await fetch('/api/sessions' + (month ? '?month=' + encodeURIComponent(month) : ''));
-      var d = await r.json();
-      if (!r.ok) throw new Error(d.error || r.statusText);
-      sessions = d.sessions || []; totals = d.totals || {};
-      render();
-    } catch(e) {
-      out.className = 'err'; out.textContent = 'Error: ' + e.message;
-    }
+  // ── loading ──
+  // The list fans out: one request per selected server, in parallel, through the proxy.
+  // A server that fails contributes an error line rather than blanking the whole list —
+  // one dead ssh tunnel must not hide the sessions on every other machine.
+  //
+  // The quiet flag is set by the auto-refresh so it never flashes "Loading…" over a table you
+  // are reading; the rendered rows are simply replaced when the new data lands.
+  function load(quiet) { return loadSummary(!!quiet); }
+  async function fanOut(path) {
+    var names = selectedServers();
+    var got = await Promise.all(names.map(function(name){
+      return fetch(apiBase(name) + path)
+        .then(function(r){ return r.json().then(function(d){
+          if (!r.ok) throw new Error((d && d.error) || r.statusText);
+          return { name: name, data: d };
+        }); })
+        .catch(function(e){ return { name: name, error: e.message || String(e) }; });
+    }));
+    return got;
   }
-  async function loadSummary() {
-    try {
-      var r = await fetch('/api/cost-summary');
-      var d = await r.json();
-      if (!r.ok) throw new Error();
-      costSummary = d; buildScopeOptions(); renderSummary();
+  // Add every numeric leaf of b into a, recursively. The cost-summary buckets are
+  // uniform numeric trees (months → buckets → categories), so this merges N servers'
+  // summaries into one without knowing the shape.
+  function deepAdd(a, b){
+    if (b == null) return a;
+    if (a == null) return JSON.parse(JSON.stringify(b));
+    if (typeof a === 'number') return a + (typeof b === 'number' ? b : 0);
+    if (typeof a !== 'object' || typeof b !== 'object') return a;
+    for (var k in b) a[k] = deepAdd(a[k], b[k]);
+    return a;
+  }
+  async function loadSessions(month, quiet) {
+    var out = body.querySelector('#out');
+    if (!quiet) { out.className = 'lmsg'; out.textContent = 'Loading…'; body.querySelector('#foot').textContent = ''; }
+    var results = await fanOut('/api/sessions' + (month ? '?month=' + encodeURIComponent(month) : ''));
+    var rows = [], tot = { totalCost: 0, totalTokens: 0 }, errs = [];
+    results.forEach(function(r){
+      if (r.error) { errs.push({ server: r.name, error: r.error }); return; }
+      var d = r.data || {};
+      (d.sessions || []).forEach(function(s){ s.server = r.name; rows.push(s); });
+      if (d.totals) { tot.totalCost += d.totals.totalCost || 0; tot.totalTokens += d.totals.totalTokens || 0; }
+    });
+    sessions = rows; totals = tot; loadErrors = errs;
+    render();
+    stampRefreshed();
+  }
+  async function loadSummary(quiet) {
+    var results = await fanOut('/api/cost-summary');
+    var merged = null;
+    results.forEach(function(r){ if (!r.error) merged = deepAdd(merged, r.data); });
+    if (merged) {
+      costSummary = merged; buildScopeOptions(); renderSummary();
       body.querySelector('#summary').style.display = '';
-    } catch(e) { body.querySelector('#summary').style.display = 'none'; }
+    } else { body.querySelector('#summary').style.display = 'none'; }
     // Drive the list from the selected scope (default: latest month). On summary failure
     // the selector is empty, so this falls back to the all-time list.
     var sel = body.querySelector('#sumScope');
     var val = sel ? sel.value : '';
-    loadSessions(val && val.indexOf('m:') === 0 ? val.slice(2) : null);
+    return loadSessions(val && val.indexOf('m:') === 0 ? val.slice(2) : null, quiet);
+  }
+  function stampRefreshed(){
+    refreshedEl.textContent = 'Refreshed ' + new Date().toLocaleTimeString();
   }
   var PROV_LABEL = { bedrock:'Bedrock', anthropic:'Sub' };
   function gsub(s){ return '<span class="c-sub">'+s+'</span>'; }
@@ -724,11 +895,15 @@ function createListView(){
     var st = style ? ' style="'+style+'"' : '';
     return '<th class="'+cls+'" data-col="'+col+'"'+st+'>'+label+ind+'</th>';
   }
+  // The Server column only earns its width once there IS more than one server —
+  // a single-host install would just repeat its own name down every row.
+  function multiServer(){ return servers.length > 1; }
   function rowHtml(s) {
     var sid = s.sessionId, sh = sid.slice(0,8);
+    var href = sessionHref(sid, s.server);
     var titleHtml = s.title
-      ? '<a class="ttl-text" href="/session/'+sid+'" title="'+esc(s.title)+'">'+esc(trunc(s.title,44))+'</a>'
-      : '<a class="ttl-text empty" href="/session/'+sid+'">(no title)</a>';
+      ? '<a class="ttl-text" href="'+href+'" title="'+esc(s.title)+'">'+esc(trunc(s.title,44))+'</a>'
+      : '<a class="ttl-text empty" href="'+href+'">(no title)</a>';
     var ctx = s.context, cmax = s.contextMax;
     var ctxHtml = ctx
       ? (ctx.postCompact?'~':'')+fmtTokK(ctx.tokens)
@@ -738,7 +913,8 @@ function createListView(){
     var sub = s.subTurns ? '<span class="ctx-tag">+'+s.subTurns+'</span>' : '';
     return '<tr>'
       + '<td>'+(s.live?'<span class="live-dot" title="Active"></span>':'<span class="live-dot off"></span>')+'</td>'
-      + '<td><a class="sid" href="/session/'+sid+'">'+sh+'</a></td>'
+      + (multiServer() ? '<td class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</td>' : '')
+      + '<td><a class="sid" href="'+href+'">'+sh+'</a></td>'
       + '<td class="ttl">'+titleHtml+'</td>'
       + '<td class="cost">'+fc(s.totalCost)+'</td>'
       + '<td class="tok">'+ft(s.totalTokens)+'</td>'
@@ -752,9 +928,19 @@ function createListView(){
   function render() {
     var rows = applySort(sessions);
     var out = body.querySelector('#out');
-    if (!rows.length) { out.className = 'lmsg'; out.textContent = 'No sessions found.'; return; }
-    var html = '<table><thead><tr>'
-      + thSort('','live','width:1%') + '<th>ID</th>' + thSort('Title','title')
+    // Unreachable servers are reported above the table, never instead of it: the
+    // sessions that DID load stay usable while one peer's tunnel is down.
+    var errHtml = loadErrors.map(function(e){
+      return '<div class="srv-err">'+esc(e.server)+': '+esc(e.error)+'</div>';
+    }).join('');
+    if (!rows.length) {
+      out.className = ''; out.innerHTML = errHtml + '<div class="lmsg">No sessions found.</div>';
+      body.querySelector('#foot').textContent = '';
+      return;
+    }
+    var html = errHtml + '<table><thead><tr>'
+      + thSort('','live','width:1%') + (multiServer() ? thSort('Server','server') : '')
+      + '<th>ID</th>' + thSort('Title','title')
       + thSort('Cost','totalCost','text-align:right')
       + thSort('Tokens','totalTokens','text-align:right')
       + thSort('Turns','turns','text-align:right')
@@ -769,39 +955,67 @@ function createListView(){
       ? 'Total: '+(tc?fc(totals.totalCost):'')+(tc&&tt?' | ':'')+(tt?ft(totals.totalTokens)+' tokens':'') : '';
   }
   body.addEventListener('click', function(e) {
+    var chip = e.target.closest('.chip[data-srv]');
+    if (chip) { toggleServer(chip.dataset.srv); return; }
     // Session links open a stacked view instead of navigating (middle-click still works).
-    var a = e.target.closest('a[href^="/session/"]');
-    if (a) { e.preventDefault(); openSession(a.getAttribute('href').slice('/session/'.length)); return; }
+    var a = e.target.closest('a[href*="/session/"]');
+    if (a) {
+      var ref = parseSessionHref(a.getAttribute('href'));
+      if (ref) { e.preventDefault(); openSession(ref.sessionId, ref.server); return; }
+    }
     var th = e.target.closest('th[data-col]');
     if (th) clickHeader(th.dataset.col, e.shiftKey);
   });
   body.querySelector('#sumScope').addEventListener('change', onScopeChange);
 
-  v.refresh = load;
-  load();
+  // The server list must land BEFORE the first fan-out: until it does, the only known
+  // server is this one, so a saved selection naming a peer would filter down to nothing
+  // and fall back to local-only — a first paint that silently drops every remote session.
+  function cycle(quiet){ return loadServers().then(function(){ return load(quiet); }); }
+
+  // Auto-refresh. Skipped while the tab is hidden or the view is collapsed to its bar —
+  // no point polling several machines for a table nobody is looking at.
+  var autoTimer = setInterval(function(){
+    if (document.hidden || v.el.classList.contains('collapsed')) return;
+    cycle(true);
+  }, 10000);
+  v.destroy = function(){ clearInterval(autoTimer); };
+
+  v.refresh = function(){ return cycle(false); };
+  renderServers();
+  cycle(false);
   return v;
 }
 
 // ── session view ──────────────────────────────────────────────────────────────
 // One view per session: its own DOM, WebSocket, timers, and scroll state, all held
 // in this closure. destroy() tears everything down when the view closes.
+
+// The composer keeps no hint line under it — the keys live in the send button's tooltip
+// instead, so the transcript gets the space back.
+var SEND_TIP = 'Send  ·  Ctrl+Enter  ·  Enter inserts a newline  ·  //help for commands';
+var SEND_TIP_OFF = 'Session not running in a tmux pane here — input disabled. // commands still work.';
+
 function createSessionView(INFO){
-  var v = { kind:'session', sessionId: INFO.sessionId, maxed:false, unseen:false };
+  var v = { kind:'session', sessionId: INFO.sessionId, server: INFO.server || null, maxed:false, unseen:false };
+  // Everything this view touches — history, liveness, keystroke injection, permission
+  // answers, //commands, rename, the WebSocket — hangs off this one prefix. A remote
+  // session is therefore driven by exactly the local code path, on the peer's host.
+  var API = apiBase(INFO.server);
+  var SRV = INFO.server || SELF.name;
   var el = document.createElement('div');
   el.className = 'view sv';
   v.el = el;
 
-  // — bar: status dot + renamable title —
+  // — bar: status dot + originating server + renamable title —
   var barMain = document.createElement('div');
   barMain.style.cssText = 'display:flex;align-items:center;gap:10px;flex:1;min-width:0';
-  barMain.innerHTML = '<div class="status-dot"></div><div class="hdr-title">Loading…</div>';
+  barMain.innerHTML = '<div class="status-dot"></div>'
+    + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
+    + '<div class="hdr-title">Loading…</div>';
   el.appendChild(makeViewBar(v, barMain, { close:true }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
-  var tabDotEl = document.createElement('div');
-  tabDotEl.className = 'status-dot';
-  tabDotEl.style.cssText = 'margin-right:6px';
-  v.barTabEl.insertBefore(tabDotEl, v.barTabEl.firstChild);
 
   // — body —
   var body = document.createElement('div');
@@ -824,9 +1038,8 @@ function createSessionView(INFO){
     '</div>'+
     '<div class="input-area"><div class="input-inner"><div class="input-row">'+
       '<textarea class="input-box" placeholder="Message the session…  (// for commands)" rows="1"></textarea>'+
-      '<button class="send-btn" title="Send">&#8593;</button>'+
-    '</div></div>'+
-    '<div class="input-hint">Enter to send &nbsp;&#183;&nbsp; Shift+Enter for newline &nbsp;&#183;&nbsp; //help for commands</div></div>';
+      '<button class="send-btn" title="'+SEND_TIP+'">&#8593;</button>'+
+    '</div></div></div>';
   el.appendChild(body);
   v.bodyEl = body;
   var projEl = body.querySelector('.hdr-proj');
@@ -840,7 +1053,6 @@ function createSessionView(INFO){
   var cmdContent = body.querySelector('.cmd-content');
   var inputBox = body.querySelector('.input-box');
   var sendBtn = body.querySelector('.send-btn');
-  var inputHint = body.querySelector('.input-hint');
 
   var ws, reconnectTimer, destroyed = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
@@ -858,28 +1070,14 @@ function createSessionView(INFO){
     titleEl.textContent = INFO.title || '(untitled — ' + INFO.sessionId.slice(0,8) + ')';
     titleEl.className = 'hdr-title' + (INFO.title ? '' : ' empty');
     titleEl.title = 'Click to rename';
-    v.fullTabText = INFO.title || INFO.sessionId.slice(0,8);
-    applyTab(v);
   }
   titleEl.addEventListener('click', function(e){
     if (el.classList.contains('collapsed')) return;   // bar handler expands instead
     e.stopPropagation();
     editSessionTitle();
   });
-  // In horizontal mode .bar-main (with titleEl) is hidden and the tab shows the name — let
-  // clicking the tab rename too. Guard against the collapsed-bar handler and the button row.
-  v.barTabEl.addEventListener('click', function(e){
-    if (orientation !== 'horizontal') return;
-    if (el.classList.contains('collapsed')) return;   // bar handler expands instead
-    if (e.target.closest('.vb-btn')) return;
-    e.stopPropagation();
-    editSessionTitle();
-  });
   function editSessionTitle() {
-    var horiz = orientation === 'horizontal';
-    // Insert the input where the name is actually visible: the tab (horizontal) or the
-    // hidden-in-horizontal .bar-main title (vertical).
-    var anchor = horiz ? (v.barTabEl.querySelector('.bar-tab-text') || v.barTabEl) : titleEl;
+    var anchor = titleEl;
     var inp = document.createElement('input');
     inp.className = 'hdr-title-input';
     inp.value = INFO.title || '';
@@ -894,7 +1092,7 @@ function createSessionView(INFO){
       var val = inp.value.trim();
       if (save && val !== (INFO.title || '')) {
         INFO.title = val;
-        fetch('/api/session/' + INFO.sessionId, {
+        fetch(API+'/api/session/' + INFO.sessionId, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title: val })
         }).catch(function(){});
@@ -949,10 +1147,8 @@ function createSessionView(INFO){
     var idle = live && status === 'idle';
     var className = 'status-dot' + (live ? (idle ? ' idle' : ' live') : '');
     dotEl.className = className;
-    tabDotEl.className = className;
     var title = !live ? 'Not running' : (idle ? 'Waiting for input' : 'Working');
     dotEl.title = title;
-    tabDotEl.title = title;
     if (idle) {
       var at = d.statusUpdatedAt, since = relSince(at);
       statusRow.innerHTML = '⏸ finished responding' + (at ? ' at <b>'+esc(fd(at))+'</b>' : '') +
@@ -966,7 +1162,9 @@ function createSessionView(INFO){
   var queryCount = 0;
   function queryStart(){ queryCount++; queryEl.classList.add('show'); }
   function queryEnd(){ queryCount = Math.max(0, queryCount-1); if (!queryCount) queryEl.classList.remove('show'); }
-  function qfetch(url, opts){ queryStart(); return fetch(url, opts).finally(queryEnd); }
+  // Every session-scoped call goes through here, so the API prefix (local or peer)
+  // is applied in exactly one place.
+  function qfetch(url, opts){ queryStart(); return fetch(API+url, opts).finally(queryEnd); }
   function pollLive() {
     qfetch('/api/session/'+INFO.sessionId+'/live').then(function(r){return r.json();})
       .then(function(d){ setStatus(d); }).catch(function(){});
@@ -1420,7 +1618,7 @@ function createSessionView(INFO){
     if (destroyed) return;
     clearTimeout(reconnectTimer);
     var proto = location.protocol==='https:'?'wss:':'ws:';
-    ws = new WebSocket(proto+'//'+location.host+'/ws/'+INFO.sessionId);
+    ws = new WebSocket(proto+'//'+location.host+API+'/ws/'+INFO.sessionId);
     ws.onmessage = function(e){ handleWsMsg(JSON.parse(e.data)); };
     ws.onclose = function(){ if (!destroyed) reconnectTimer = setTimeout(connect, 2000); };
   }
@@ -1504,12 +1702,10 @@ function createSessionView(INFO){
   function setDrivable(ok) {
     canDrive = ok;
     if (ok) {
-      inputHint.className = 'input-hint';
-      inputHint.innerHTML = 'Enter to send &nbsp;&middot;&nbsp; Shift+Enter for newline &nbsp;&middot;&nbsp; //help for commands';
+      sendBtn.title = SEND_TIP;
       inputBox.placeholder = 'Message the session…  (/compact, // for commands)';
     } else {
-      inputHint.className = 'input-hint off';
-      inputHint.innerHTML = 'Session not running in a tmux pane here — input disabled. // commands still work.';
+      sendBtn.title = SEND_TIP_OFF;
       inputBox.placeholder = 'Session not attachable — // commands still work';
     }
   }
@@ -1568,20 +1764,34 @@ function createSessionView(INFO){
     }
     cmdBox.classList.remove('min', 'max');   // fresh output restores the default size
     cmdBox.classList.add('show');
+    syncCmdBtns();
     cmdContent.scrollTop = 0;
   }
-  function hideCmd() { cmdBox.classList.remove('show','min','max'); }
+  function hideCmd() { cmdBox.classList.remove('show','min','max'); syncCmdBtns(); }
+  // Same glyph language as the view bar: hollow square to maximize, filled to come back.
+  function syncCmdBtns() {
+    var on = cmdBox.classList.contains('max');
+    var mx = body.querySelector('.cmd-btn[data-c="max"]');
+    if (mx) { mx.innerHTML = on ? '&#10064;' : '&#9633;'; mx.title = on ? 'Restore' : 'Maximize'; }
+  }
   body.querySelector('.cmd-btns').addEventListener('click', function(e){
     var b = e.target.closest('.cmd-btn');
     if (!b) return;
     if (b.dataset.c === 'min') { cmdBox.classList.toggle('min'); cmdBox.classList.remove('max'); }
     else if (b.dataset.c === 'max') { cmdBox.classList.toggle('max'); cmdBox.classList.remove('min'); }
     else hideCmd();
+    syncCmdBtns();
   });
   sendBtn.addEventListener('click', sendMessage);
   inputBox.addEventListener('input', function(){ autoGrow(inputBox); });
+  // Plain Enter is a newline: a prompt is usually several lines, and a stray Enter firing
+  // one off half-written into a live session is not a recoverable mistake. Ctrl/Cmd+Enter
+  // is the deliberate two-key send, same as the button.
   inputBox.addEventListener('keydown', function(e){
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      sendMessage();
+    }
   });
 
   // — refresh / destroy —
@@ -1622,15 +1832,17 @@ var listView = createListView();
 views.push(listView);
 viewsEl.appendChild(listView.el);
 relayout();
-if (INIT_OPEN) openSession(INIT_OPEN);
+if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
 `;
 
 // ── Page HTML assembly ─────────────────────────────────────────────────────────
-function appPageHtml(initOpenSessionId) {
+function appPageHtml(initOpenSessionId, initOpenServer) {
+  const open = initOpenSessionId ? { sessionId: initOpenSessionId, server: initOpenServer || null } : null;
   return APP_HTML.replace('__APP_JS__',
     () => APP_JS
       .replace('__PRICING__', () => JSON.stringify(priceTable))
-      .replace('__INIT_OPEN__', () => JSON.stringify(initOpenSessionId || null)));
+      .replace('__SELF__', () => JSON.stringify(serverIdentity()))
+      .replace('__INIT_OPEN__', () => JSON.stringify(open)));
 }
 
 // ── Web: live transcript tailing (rides the shared tailer in ccbb-common) ────────
@@ -1866,6 +2078,334 @@ function readBody(req, done) {
   req.on('end', () => done(body));
 }
 
+// ── Peers: auth, health, proxy ─────────────────────────────────────────────────
+// Multi-server ccbb is a mesh of equals. This server serves ITS OWN sessions under
+// /api/… and every peer's under /peer/<name>/api/… — the same routes, reverse-proxied
+// by name. The browser therefore drives a remote session through exactly the code
+// path it uses for a local one: only a prefix differs.
+//
+// /peer/<name>/session/<id> is the one exception — it is a deep LINK, served locally
+// as this app's page, because proxying it would return the peer's whole app.
+const TOKEN_HEADER = 'x-ccbb-token';
+const VIA_HEADER = 'x-ccbb-via';
+const LEGACY_COOKIE = 'ccbb_token';
+// Cookies are scoped to the HOST, not the origin — the port is ignored — so several ccbb
+// servers reached as 127.0.0.1:<port> (your own, plus every peer you tunnel to a local
+// port) would all read and overwrite one another's cookie, and logging into one would log
+// you out of the next. Naming the cookie after the port keeps them separate.
+//
+// The port must come from the REQUEST's Host header, not from what we listen on: every
+// ccbb tends to listen on 8590, and a peer tunnelled to the browser as 127.0.0.1:8591 is
+// still :8590 on its own host. Two servers both naming their cookie after 8590 would
+// collide all over again. The Host header is what the browser actually typed, so it is
+// the only value that is unique per login.
+let serverPort = DEFAULT_PORT;
+function tokenCookieName(req) {
+  const m = String((req && req.headers && req.headers.host) || '').match(/:(\d+)$/);
+  return LEGACY_COOKIE + '_' + (m ? m[1] : serverPort);
+}
+
+function safeEq(a, b) {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+function cookieToken(req) {
+  const raw = req.headers.cookie || '';
+  const m = raw.match(new RegExp('(?:^|;\\s*)' + tokenCookieName(req) + '=([^;]*)'));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+// Auth, when config sets peerToken. The token can arrive as a header (peer proxies and
+// the hook curl), a cookie (the browser, after one ?token=… visit), or a query param.
+// Unset peerToken = no auth at all, which is the pre-existing single-host behavior.
+function authOk(req, query) {
+  const want = peerToken();
+  if (!want) return true;
+  const got = req.headers[TOKEN_HEADER] || (query && query.get('token')) || cookieToken(req);
+  return !!got && safeEq(got, want);
+}
+function sendUnauthorized(res, wantsHtml, cookieName) {
+  if (wantsHtml) {
+    const body = Buffer.from('<!DOCTYPE html><meta charset="utf-8"><title>ccbb</title>' +
+      '<body style="font:15px ui-sans-serif,system-ui;padding:40px;color:#3d3d3a">' +
+      '<h2>ccbb — token required</h2><p>This server has <code>peerToken</code> set. ' +
+      'Open it once as <code>?token=&lt;your token&gt;</code>; the token is then remembered in a cookie ' +
+      `(<code>${cookieName}</code>, named per port so each ccbb server keeps its own).</p>`);
+    res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': body.length });
+    return res.end(body);
+  }
+  send(res, 401, { error: 'unauthorized' });
+}
+
+// Peer health. Polled in the background so /api/servers answers instantly and a dead
+// peer shows as down instead of hanging the session list behind a TCP timeout.
+const peerHealth = new Map();   // name → { status, hostname, rttMs, lastSeen, error }
+function peerRequest(peer, subPath, opts, cb) {
+  const target = new URL(peer.url + subPath);
+  const mod = target.protocol === 'https:' ? https : http;
+  const headers = Object.assign({}, opts.headers || {});
+  headers.host = target.host;
+  if (peer.token) headers[TOKEN_HEADER] = peer.token;
+  headers[VIA_HEADER] = serverIdentity().name;
+  return mod.request(target, { method: opts.method || 'GET', headers, timeout: opts.timeout || 0 }, cb);
+}
+function probePeer(peer) {
+  const started = Date.now();
+  let done = false;
+  const finish = rec => { if (done) return; done = true; peerHealth.set(peer.name, rec); };
+  const req = peerRequest(peer, '/api/identity', { timeout: 5000 }, res => {
+    let buf = '';
+    res.setEncoding('utf8');
+    res.on('data', c => { buf += c; });
+    res.on('end', () => {
+      let id = null; try { id = JSON.parse(buf); } catch {}
+      if (res.statusCode === 401) return finish({ status: 'down', error: 'unauthorized (token mismatch)', rttMs: Date.now() - started });
+      if (res.statusCode !== 200 || !id || !id.name) return finish({ status: 'down', error: 'HTTP ' + res.statusCode, rttMs: Date.now() - started });
+      finish({ status: 'up', hostname: id.hostname || '', remoteName: id.name, rttMs: Date.now() - started, lastSeen: new Date().toISOString() });
+    });
+  });
+  req.on('timeout', () => { req.destroy(new Error('timed out')); });
+  req.on('error', e => finish({ status: 'down', error: e.message, rttMs: Date.now() - started }));
+  req.end();
+}
+function pollPeers() { for (const p of peerList()) probePeer(p); }
+// Merged view of the mesh: this server first, then every configured peer with its last
+// known health. `hostname` is what the PEER reported about itself, not what we guessed.
+function serversPayload() {
+  const self = serverIdentity();
+  const list = [{ name: self.name, hostname: self.hostname, self: true, status: 'up' }];
+  for (const p of peerList()) {
+    const h = peerHealth.get(p.name) || { status: 'unknown' };
+    list.push({
+      name: p.name, self: false, url: p.url,
+      hostname: h.hostname || '', remoteName: h.remoteName || '',
+      status: h.status, rttMs: h.rttMs, lastSeen: h.lastSeen, error: h.error,
+    });
+  }
+  // Peers we never configured, reachable only because they called us and left a link
+  // open. As far as the UI is concerned they are ordinary peers.
+  for (const [name, link] of inboundLinks) {
+    if (list.some(x => x.name === name)) continue;   // already configured — that route wins
+    list.push({ name, self: false, inbound: true, hostname: '',
+      status: link.ws.readyState === 1 ? 'up' : 'down' });
+  }
+  return { self, servers: list };
+}
+
+// Reverse-proxy one request to a peer. Hop-by-hop and auth headers are rebuilt rather
+// than forwarded: our cookie is OUR token, and the peer wants ITS token.
+function proxyHttp(peer, subPath, req, res) {
+  const headers = {};
+  for (const k of ['content-type', 'accept']) if (req.headers[k]) headers[k] = req.headers[k];
+  const preq = peerRequest(peer, subPath, { method: req.method, headers, timeout: 30000 }, pres => {
+    const out = {};
+    for (const k of ['content-type', 'content-length', 'cache-control']) if (pres.headers[k]) out[k] = pres.headers[k];
+    res.writeHead(pres.statusCode || 502, out);
+    pres.pipe(res);
+  });
+  preq.on('timeout', () => preq.destroy(new Error('timed out')));
+  preq.on('error', e => {
+    if (!res.headersSent) send(res, 502, { error: `peer "${peer.name}" unreachable: ${e.message}` });
+    else res.destroy();
+  });
+  req.pipe(preq);
+}
+// Proxy a WebSocket upgrade: dial the peer, replay the handshake, then splice the two
+// sockets. Keeps live transcript tailing and permission cards working for remote sessions.
+function proxyUpgrade(peer, subPath, req, socket, head) {
+  const headers = {};
+  for (const k of ['upgrade', 'connection', 'sec-websocket-key', 'sec-websocket-version',
+                   'sec-websocket-protocol', 'sec-websocket-extensions']) {
+    if (req.headers[k]) headers[k] = req.headers[k];
+  }
+  const preq = peerRequest(peer, subPath, { method: 'GET', headers, timeout: 15000 }, () => socket.destroy());
+  preq.on('upgrade', (pres, psock, phead) => {
+    const lines = ['HTTP/1.1 101 Switching Protocols'];
+    for (const [k, v] of Object.entries(pres.headers)) lines.push(`${k}: ${v}`);
+    socket.write(lines.join('\r\n') + '\r\n\r\n');
+    if (phead && phead.length) socket.write(phead);
+    if (head && head.length) psock.write(head);
+    const kill = () => { try { socket.destroy(); } catch {} try { psock.destroy(); } catch {} };
+    socket.on('error', kill); psock.on('error', kill);
+    socket.on('close', kill); psock.on('close', kill);
+    psock.pipe(socket); socket.pipe(psock);
+  });
+  preq.on('timeout', () => preq.destroy(new Error('timed out')));
+  preq.on('error', () => socket.destroy());
+  preq.end();
+}
+
+// ── Peer links: making an INBOUND peer a real peer ─────────────────────────────
+// A configured peer is reachable because we hold its URL. The reverse is not true: the
+// server we call has no address for us — over an ssh tunnel our side has no listening
+// address in its namespace at all — so a peer that only ever calls IN could never be
+// browsed back. Adding config on both sides would fix it, but only for people who can
+// open a tunnel each way.
+//
+// Instead, the CALLER keeps a WebSocket open to every peer it knows (/peer-link). The
+// callee then sends requests back DOWN that socket. One direction of connectivity is
+// enough for a two-way mesh, and the receiving side needs no configuration at all.
+//
+// The trick that keeps this small: a link is just a tunnel to the caller's OWN server.
+// On receiving a request the caller replays it against 127.0.0.1:<its port> and pipes the
+// answer back — so every route, including the live-tailing WebSocket, works over a link
+// exactly as it does over HTTP, with no second implementation to keep in step.
+const inboundLinks = new Map();   // name → link we ACCEPTED (we can call them back)
+const outboundLinks = new Map();  // name → { ws, timer } we OPENED to a configured peer
+
+function makeLink(ws, name) {
+  const link = { name, ws, seq: 0, pending: new Map(), sockets: new Map(), openedAt: Date.now() };
+  ws.on('message', raw => {
+    let f; try { f = JSON.parse(raw); } catch { return; }
+    try { handleLinkFrame(link, f); } catch (e) { console.error('[link]', e.message); }
+  });
+  const drop = () => {
+    for (const cb of link.pending.values()) cb({ status: 502, body: JSON.stringify({ error: `link to "${name}" closed` }) });
+    link.pending.clear();
+    for (const s of link.sockets.values()) { try { s.close(); } catch {} }
+    link.sockets.clear();
+  };
+  ws.on('close', drop);
+  ws.on('error', drop);
+  return link;
+}
+function linkSend(link, obj) {
+  if (link.ws.readyState !== 1) return false;
+  try { link.ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+// Ask the peer on the other end of this link to run an HTTP request against itself.
+function linkRequest(link, method, path, body) {
+  return new Promise(resolve => {
+    const id = ++link.seq;
+    const timer = setTimeout(() => {
+      link.pending.delete(id);
+      resolve({ status: 504, body: JSON.stringify({ error: `peer "${link.name}" timed out` }) });
+    }, 30000);
+    link.pending.set(id, res => { clearTimeout(timer); resolve(res); });
+    if (!linkSend(link, { t: 'req', id, method, path, body: body || '' })) {
+      clearTimeout(timer); link.pending.delete(id);
+      resolve({ status: 502, body: JSON.stringify({ error: `link to "${link.name}" is down` }) });
+    }
+  });
+}
+
+// Frames. Requests/opens flow callee→caller; responses and socket traffic flow back.
+function handleLinkFrame(link, f) {
+  if (f.t === 'res') {
+    const cb = link.pending.get(f.id);
+    if (cb) { link.pending.delete(f.id); cb({ status: f.status, ctype: f.ctype, body: f.body }); }
+    return;
+  }
+  if (f.t === 'req') return serveLinkRequest(link, f);
+  if (f.t === 'wsopen') return serveLinkWsOpen(link, f);
+  if (f.t === 'wsmsg') {
+    const s = link.sockets.get(f.id);
+    if (s) { if (s.onRemote) s.onRemote(f.data); else if (s.readyState === 1) { try { s.send(f.data); } catch {} } }
+    return;
+  }
+  if (f.t === 'wsclose') {
+    const s = link.sockets.get(f.id);
+    link.sockets.delete(f.id);
+    if (s) { if (s.onRemoteClose) s.onRemoteClose(); else { try { s.close(); } catch {} } }
+  }
+}
+
+// ── caller side: replay what came down the link against our own server ──
+function loopbackHeaders() {
+  const h = { 'content-type': 'application/json' };
+  const tok = peerToken();
+  if (tok) h[TOKEN_HEADER] = tok;
+  return h;
+}
+function serveLinkRequest(link, f) {
+  // A link reaches OUR sessions, never onward to our peers — that would be a second hop
+  // with no loop guard, since link traffic carries no X-Ccbb-Via.
+  if (/^\/peer\//.test(f.path)) {
+    return linkSend(link, { t: 'res', id: f.id, status: 403, body: JSON.stringify({ error: 'peer links are one hop' }) });
+  }
+  const req = http.request({ host: '127.0.0.1', port: serverPort, path: f.path, method: f.method,
+    headers: loopbackHeaders(), timeout: 30000 }, res => {
+    let buf = '';
+    res.setEncoding('utf8');
+    res.on('data', c => { buf += c; });
+    res.on('end', () => linkSend(link, { t: 'res', id: f.id, status: res.statusCode, ctype: res.headers['content-type'], body: buf }));
+  });
+  req.on('timeout', () => req.destroy(new Error('timed out')));
+  req.on('error', e => linkSend(link, { t: 'res', id: f.id, status: 502, body: JSON.stringify({ error: e.message }) }));
+  if (f.body) req.write(f.body);
+  req.end();
+}
+function serveLinkWsOpen(link, f) {
+  if (!WS) return linkSend(link, { t: 'wsclose', id: f.id });
+  let ws;
+  try {
+    ws = new WS('ws://127.0.0.1:' + serverPort + f.path, { headers: loopbackHeaders() });
+  } catch { return linkSend(link, { t: 'wsclose', id: f.id }); }
+  link.sockets.set(f.id, ws);
+  ws.on('message', d => linkSend(link, { t: 'wsmsg', id: f.id, data: String(d) }));
+  ws.on('close', () => { link.sockets.delete(f.id); linkSend(link, { t: 'wsclose', id: f.id }); });
+  ws.on('error', () => { link.sockets.delete(f.id); linkSend(link, { t: 'wsclose', id: f.id }); });
+}
+
+// ── callee side: serve a browser request/upgrade by going out over the link ──
+function proxyHttpOverLink(link, subPath, req, res) {
+  readBody(req, async body => {
+    const r = await linkRequest(link, req.method, subPath, body);
+    const out = { 'Content-Type': r.ctype || 'application/json' };
+    const buf = Buffer.from(r.body == null ? '' : String(r.body));
+    out['Content-Length'] = buf.length;
+    res.writeHead(r.status || 502, out);
+    res.end(buf);
+  });
+}
+function proxyUpgradeOverLink(link, subPath, req, socket, head) {
+  if (!WS) return socket.destroy();
+  const wss = new WS.Server({ noServer: true });
+  wss.handleUpgrade(req, socket, head, browser => {
+    const id = ++link.seq;
+    const entry = {
+      onRemote: d => { if (browser.readyState === 1) try { browser.send(d); } catch {} },
+      onRemoteClose: () => { try { browser.close(); } catch {} },
+      close: () => { try { browser.close(); } catch {} },
+    };
+    link.sockets.set(id, entry);
+    if (!linkSend(link, { t: 'wsopen', id, path: subPath })) return browser.close();
+    browser.on('message', d => linkSend(link, { t: 'wsmsg', id, data: String(d) }));
+    browser.on('close', () => { link.sockets.delete(id); linkSend(link, { t: 'wsclose', id }); });
+    browser.on('error', () => { link.sockets.delete(id); linkSend(link, { t: 'wsclose', id }); });
+  });
+}
+
+// ── caller side: keep a link open to every configured peer ──
+function connectLink(peer) {
+  if (!WS) return;
+  const existing = outboundLinks.get(peer.name);
+  if (existing && existing.ws && existing.ws.readyState <= 1) return;   // connecting or open
+  const url = peer.url.replace(/^http/, 'ws') + '/peer-link?name=' + encodeURIComponent(serverIdentity().name);
+  const headers = {};
+  if (peer.token) headers[TOKEN_HEADER] = peer.token;
+  let ws;
+  try { ws = new WS(url, { headers }); } catch { return; }
+  const rec = { ws, ping: null };
+  outboundLinks.set(peer.name, rec);
+  ws.on('open', () => {
+    makeLink(ws, peer.name);
+    // A link can sit idle for hours; keep it warm so an idle tunnel can't drop it silently.
+    rec.ping = setInterval(() => { try { ws.ping(); } catch {} }, 30000);
+    if (rec.ping.unref) rec.ping.unref();
+  });
+  // Forget this attempt ONLY if the map still holds it. A later attempt may already have
+  // replaced it, and deleting that one would strand a healthy link and set off a redial
+  // loop: poll dials again, the peer drops the socket it had as superseded, repeat.
+  // pollLinks provides the retry cadence, so there is no timer here to go stale.
+  const gone = () => {
+    if (rec.ping) { clearInterval(rec.ping); rec.ping = null; }
+    if (outboundLinks.get(peer.name) === rec) outboundLinks.delete(peer.name);
+  };
+  ws.on('close', gone);
+  ws.on('error', gone);
+}
+function pollLinks() { for (const p of peerList()) connectLink(p); }
+
 function runWeb(args) {
   let port = DEFAULT_PORT;
   let withWebex = false, withConfluence = false;
@@ -1876,16 +2416,64 @@ function runWeb(args) {
     else if (args[i] === '-h' || args[i] === '--help') {
       console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port] [--webex] [--confluence]\n\n` +
         `  --webex        also run the Webex front-end (shares this server's prompt path)\n` +
-        `  --confluence   also run the Confluence page front-end`);
+        `  --confluence   also run the Confluence page front-end\n\n` +
+        `Multi-server: set "server".name and "peers" in ${CLAUDE_DIR}/ccbb-config.json to list\n` +
+        `and drive other machines' sessions from this UI. See peers.md.`);
       return;
     }
   }
 
+  serverPort = port;   // the cookie is named after it, so it must be set before we listen
+
   const server = http.createServer((req, res) => {
     const { method } = req;
     const pathname = req.url.split('?')[0];
-    const query = new URLSearchParams(req.url.split('?')[1] || '');
+    const qs = req.url.split('?')[1] || '';
+    const query = new URLSearchParams(qs);
     let m;
+
+    const isPage = method === 'GET' && (pathname === '/' || pathname === '/index.html' ||
+      /^\/session\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/session\/[^/]+$/.test(pathname));
+    if (!authOk(req, query)) return sendUnauthorized(res, isPage, tokenCookieName(req));
+    // A page opened as ?token=… banks the token in a cookie and reloads clean, so the
+    // secret stops riding in the URL bar (and in every link copied out of it).
+    if (isPage && peerToken() && query.get('token')) {
+      const rest = new URLSearchParams(qs); rest.delete('token');
+      const loc = pathname + (rest.toString() ? '?' + rest.toString() : '');
+      res.writeHead(302, {
+        // The second cookie expires the pre-port-scoped one, so a browser that already
+        // has a shared ccbb_token from another server stops carrying it around.
+        'Set-Cookie': [
+          `${tokenCookieName(req)}=${encodeURIComponent(query.get('token'))}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000`,
+          `${LEGACY_COOKIE}=; Path=/; Max-Age=0`,
+        ],
+        Location: loc,
+      });
+      return res.end();
+    }
+
+    // ── peer mesh ──
+    if (method === 'GET' && pathname === '/api/identity') {
+      const self = serverIdentity();
+      return send(res, 200, { name: self.name, hostname: self.hostname, port, version: VERSION });
+    }
+    if (method === 'GET' && pathname === '/api/servers') return send(res, 200, serversPayload());
+    if ((m = pathname.match(/^\/peer\/([^/]+)(\/.*)$/))) {
+      const name = decodeURIComponent(m[1]);
+      const peer = peerByName(name);
+      const link = peer ? null : inboundLinks.get(name);   // configured URL wins; else call back down their link
+      if (!peer && !link) return send(res, 404, { error: `unknown server "${name}"` });
+      // One hop only. A request that already came through a peer's proxy must not be
+      // forwarded again, or a peers-of-peers cycle would bounce forever.
+      if (req.headers[VIA_HEADER]) return send(res, 403, { error: 'peer proxying is one hop' });
+      const sub = m[2];
+      // Deep link into a remote session: OUR page, remembering which server it lives on.
+      if (method === 'GET' && (m = sub.match(/^\/session\/([^/]+)$/)))
+        return sendHtml(res, appPageHtml(m[1], name));
+      const full = sub + (qs ? '?' + qs : '');
+      return peer ? proxyHttp(peer, full, req, res) : proxyHttpOverLink(link, full, req, res);
+    }
+
     if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) return sendHtml(res, appPageHtml(null));
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');
@@ -1982,8 +2570,16 @@ function runWeb(args) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`ccbb http://127.0.0.1:${port}`);
+    const self = serverIdentity();
+    console.log(`ccbb http://127.0.0.1:${port}  (server "${self.name}" on ${self.hostname})`);
+    const peers = peerList();
+    if (peers.length) console.log(`ccbb peers: ${peers.map(p => p.name + ' → ' + p.url).join(', ')}`);
+    if (peerToken()) console.log('ccbb: peerToken set — open the UI once as ?token=<token>');
   });
+  // Peer health runs on a timer so /api/servers never blocks on a dead tunnel.
+  pollPeers();
+  pollLinks();
+  setInterval(() => { pollPeers(); pollLinks(); }, 15000).unref();
 
   // Optional in-process front-ends. They subscribe to the event bus (onServerEvent) and
   // drive sessions via the exported answer/inject/command helpers, so the permission path
@@ -1999,8 +2595,6 @@ function runWeb(args) {
     catch (e) { console.error('ccbb: --webex failed:', e.message); }
   }
 
-  let WS;
-  try { WS = require('ws'); } catch {}
   if (WS) {
     const wss = new WS.Server({ noServer: true });
     const clients = new Map(); // sessionId -> Set<ws>
@@ -2012,7 +2606,34 @@ function runWeb(args) {
     };
     wsSend = sendTo;
     server.on('upgrade', (req, socket, head) => {
-      const m = req.url && req.url.match(/^\/ws\/([^/?]+)/);
+      const url = req.url || '';
+      if (!authOk(req, new URLSearchParams(url.split('?')[1] || ''))) return socket.destroy();
+      // A peer opening its reverse channel to us. It authenticated above like any other
+      // request; from here on we can call back into it whenever the UI asks.
+      if (/^\/peer-link(\?|$)/.test(url)) {
+        const name = new URLSearchParams(url.split('?')[1] || '').get('name');
+        if (!name || name === serverIdentity().name) return socket.destroy();
+        return wss.handleUpgrade(req, socket, head, ws => {
+          const prev = inboundLinks.get(name);
+          if (prev && prev.ws !== ws) { try { prev.ws.close(); } catch {} }
+          const link = makeLink(ws, name);
+          inboundLinks.set(name, link);
+          console.log(`ccbb: peer "${name}" linked in`);
+          const bye = () => { if (inboundLinks.get(name) === link) inboundLinks.delete(name); };
+          ws.on('close', bye); ws.on('error', bye);
+        });
+      }
+      const pm = url.match(/^\/peer\/([^/]+)(\/.*)$/);
+      if (pm) {
+        const name = decodeURIComponent(pm[1]);
+        if (req.headers[VIA_HEADER]) return socket.destroy();
+        const peer = peerByName(name);
+        if (peer) return proxyUpgrade(peer, pm[2], req, socket, head);
+        const link = inboundLinks.get(name);
+        if (!link) return socket.destroy();
+        return proxyUpgradeOverLink(link, pm[2], req, socket, head);
+      }
+      const m = url.match(/^\/ws\/([^/?]+)/);
       if (!m) return socket.destroy();
       wss.handleUpgrade(req, socket, head, ws => {
         const sessionId = m[1];
