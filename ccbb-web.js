@@ -197,7 +197,10 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
    grid-template-columns and the maxed body's column span are set per-relayout in JS. ── */
 #views.horizontal{display:grid;grid-template-rows:auto minmax(0,1fr)}
 #views.horizontal .view{display:contents}
-#views.horizontal .view-bar{grid-row:1;border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+/* min-width:0 so the bar can be narrower than its own content, and overflow:hidden so
+   what does not fit is clipped inside its own column instead of spilling across the
+   neighbour's. The body already had both; the bar is the grid item that did not. */
+#views.horizontal .view-bar{grid-row:1;min-width:0;overflow:hidden;border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
 #views.horizontal .view:last-child .view-bar{border-right:none}
 #views.horizontal .view-body{grid-row:2;min-width:0;border-right:1px solid var(--line)}
 #views.horizontal .view:last-child .view-body{border-right:none}
@@ -640,8 +643,12 @@ function relayout(){
   // folded list did: session 1's body landed under the list's header and the last column
   // went blank. Maximize hid that bug because it hides every other body too.
   if (orientation === 'horizontal') {
+    // minmax(0,1fr), not 1fr: a bare 1fr is minmax(AUTO,1fr), so a column can never shrink
+    // below its own min-content and one stubborn header silently steals width from every
+    // other column — three views came out 480/480/515 instead of thirds. The rows above
+    // already say minmax(0,1fr) for exactly this reason.
     viewsEl.style.gridTemplateColumns = views.map(function(v){
-      return (maxed ? v === maxed : !v.folded) ? '1fr' : 'auto';
+      return (maxed ? v === maxed : !v.folded) ? 'minmax(0,1fr)' : 'auto';
     }).join(' ');
     views.forEach(function(v, i){
       v.barEl.style.gridColumn = String(i + 1);
@@ -2781,7 +2788,6 @@ function tmuxAttachFor(sessionId) {
 // third possibility). Rather than key off process.platform and hope, ask the binary that
 // is actually here: run each shape once, keep the one that works. Both are told to write
 // their typescript to /dev/null — we read the pty through the pipe, not the file.
-let scriptStyle = null;
 const SCRIPT_STYLES = {
   linux: cmd => ['-q', '-f', '-c', cmd, '/dev/null'],
   bsdF:  cmd => ['-q', '-F', '/dev/null', '/bin/sh', '-c', cmd],
@@ -2799,23 +2805,44 @@ const SCRIPT_STYLES = {
 // util-linux script does not care, but the wrapper is used everywhere anyway. Two spawn
 // shapes would mean two kill paths and two process-tree shapes for termPts() to know
 // about, for no gain on the platform that already worked.
-function scriptCommandLine(cmd) {
-  if (!scriptStyle) {
-    const order = process.platform === 'darwin' ? ['bsdF', 'bsd', 'linux'] : ['linux', 'bsdF', 'bsd'];
-    // Probe through the wrapper, exactly as a real terminal runs. Probing a bare script
-    // with /dev/null on stdin is what hid this bug: it proved the arguments parsed, not
-    // that the thing could run.
-    for (const style of order) {
-      const r = spawnSync('/bin/sh', ['-c', wrapScript(SCRIPT_STYLES[style]('exit 0'))],
-        { timeout: 5000, stdio: 'ignore' });
-      if (!r.error && r.status === 0) { scriptStyle = style; break; }
-    }
-    if (!scriptStyle) {
-      scriptStyle = process.platform === 'darwin' ? 'bsdF' : 'linux';
-      console.log(`ccbb: no script(1) invocation worked; terminals will try ${scriptStyle} style anyway`);
+// The wrapper is NOT used unconditionally. `{ cat & } | …` puts an asynchronous command
+// in a pipeline, and on WSL2 that construct silently forwards nothing: the fds are wired
+// correctly — cat's stdout and script's stdin are the same pipe — but no byte ever
+// crosses it, so the shell came up, printed its prompt, and then ignored every keystroke.
+// It fails there under both dash and bash, and passes on native Linux, which is why "use
+// the wrapper everywhere, it costs nothing" was wrong. So each machine is asked which
+// shapes work and the simplest one wins: unwrapped everywhere, wrapper first on macOS
+// where it is the whole point.
+//
+// The probe writes a marker in and waits to see it come back out, because that is the
+// only question worth asking. Checking an exit status is what hid the WSL2 break, the
+// same way probing with /dev/null on stdin hid the macOS one: both proved the arguments
+// parsed, neither proved data moves.
+let termSpawn = null;   // { style, wrapped }
+function probeTermSpawn(style, wrapped) {
+  const args = SCRIPT_STYLES[style]('exec cat');
+  const opts = { input: 'CCBB-PROBE\n', encoding: 'utf8', timeout: 5000 };
+  const r = wrapped ? spawnSync('/bin/sh', ['-c', wrapScript(args)], opts)
+                    : spawnSync('script', args, opts);
+  return !r.error && String(r.stdout || '').indexOf('CCBB-PROBE') !== -1;
+}
+function resolveTermSpawn() {
+  if (termSpawn) return termSpawn;
+  const mac = process.platform === 'darwin';
+  const styles = mac ? ['bsdF', 'bsd', 'linux'] : ['linux', 'bsdF', 'bsd'];
+  for (const wrapped of (mac ? [true, false] : [false, true])) {
+    for (const style of styles) {
+      if (probeTermSpawn(style, wrapped)) {
+        termSpawn = { style, wrapped };
+        console.log(`ccbb: terminals use script(1) ${style} style${wrapped ? ' behind a cat pipeline' : ''}`);
+        return termSpawn;
+      }
     }
   }
-  return wrapScript(SCRIPT_STYLES[scriptStyle](cmd));
+  termSpawn = mac ? { style: 'bsdF', wrapped: true } : { style: 'linux', wrapped: false };
+  console.log('ccbb: no script(1) invocation passed the probe; terminals will try ' +
+    `${termSpawn.style} style${termSpawn.wrapped ? ' behind a cat pipeline' : ''} anyway`);
+  return termSpawn;
 }
 // Every piece of this line is load-bearing:
 //   `cat &`   — a shell waits for every member of a pipeline, and cat stays blocked on
@@ -2856,14 +2883,20 @@ function openTerm(cols, rows, sessionId) {
               (attach || `exec ${shell} -l`);
   let child;
   try {
-    // detached: our child leads its own process group, so closing the terminal can signal
-    // the whole pipeline at once. Killing the sh alone would strand cat and script.
-    child = spawn('/bin/sh', ['-c', scriptCommandLine(cmd)], {
+    // detached either way: our child leads its own process group, so closing the terminal
+    // can signal everything at once. With the wrapper that matters most — killing the sh
+    // alone would strand cat and script — but keeping it for the plain shape too means
+    // one kill path and one process-tree shape instead of two.
+    const shape = resolveTermSpawn();
+    const args = SCRIPT_STYLES[shape.style](cmd);
+    const opts = {
       cwd: os.homedir(),
       env: Object.assign({}, process.env, { TERM: 'xterm-256color' }),
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
-    });
+    };
+    child = shape.wrapped ? spawn('/bin/sh', ['-c', wrapScript(args)], opts)
+                          : spawn('script', args, opts);
   } catch (e) { return { error: 'could not start script(1): ' + e.message }; }
   const t = { id, child, ptsFile, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
               pts: null, alive: true, exitCode: null, graceTimer: null, idleSince: Date.now() };
