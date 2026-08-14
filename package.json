@@ -21,6 +21,7 @@
     "ccbb-common.js",
     "ccbb-stats.js",
     "ccbb-web.js",
+    "ccbb-mobile.js",
     "ccbb-webex.js",
     "ccbb-confluence.js",
     "ccbb-embed.js",

@@ -17,6 +17,8 @@ const crypto = require('crypto');
 const { spawnSync, spawn } = require('child_process');
 
 const common = require('./ccbb-common');
+// The phone front-end. Same server, same API, its own page — see ccbb-mobile.js.
+const { mobilePageHtml, isMobileUA, serveVendor } = require('./ccbb-mobile');
 const {
   serverIdentity, peerList, peerByName, peerToken,
   CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSubagentHistory, getSessionStats,
@@ -2898,7 +2900,10 @@ function openTerm(cols, rows, sessionId) {
     child = shape.wrapped ? spawn('/bin/sh', ['-c', wrapScript(args)], opts)
                           : spawn('script', args, opts);
   } catch (e) { return { error: 'could not start script(1): ' + e.message }; }
+  // ptsCols/ptsRows: the geometry the pty already has. The stty above runs inside it
+  // before the shell starts, so at birth it matches what was asked for.
   const t = { id, child, ptsFile, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
+              ptsCols: cols, ptsRows: rows,
               pts: null, alive: true, exitCode: null, graceTimer: null, idleSince: Date.now() };
   terms.set(id, t);
   child.stdout.on('data', c => termPush(t, c));
@@ -3039,13 +3044,27 @@ function sttySize(dev, rows, cols) {
   }
   return false;
 }
-function termResize(t, cols, rows) {
+// t.cols/t.rows are what the window WANTS; t.ptsCols/t.ptsRows are what the pty actually
+// got. Keeping them apart is what makes a resize retryable: the pty does not name itself
+// until script(1) has started the shell inside it, so a size that arrives in the first
+// moments after open — which is exactly when a browser sends its real geometry — finds no
+// device to set. Recording it as done there left the shell at 80x24 forever, with the
+// browser drawing a grid the program on the other end had never heard of.
+function termResize(t, cols, rows, tries) {
   const c = clampInt(cols, 20, 500, t.cols), r = clampInt(rows, 5, 200, t.rows);
-  if (c === t.cols && r === t.rows) return { ok: true, resized: false, cols: c, rows: r };
   t.cols = c; t.rows = r;
+  if (t.ptsCols === c && t.ptsRows === r) return { ok: true, resized: false, cols: c, rows: r };
   const pts = termPts(t);
-  if (!pts) return { ok: true, resized: false, cols: c, rows: r };
-  return { ok: true, resized: sttySize(pts, r, c), cols: c, rows: r };
+  if (!pts) {
+    if (t.alive && (tries || 0) < 12) {
+      const h = setTimeout(() => termResize(t, t.cols, t.rows, (tries || 0) + 1), 200);
+      if (h.unref) h.unref();
+    }
+    return { ok: true, resized: false, cols: c, rows: r };
+  }
+  const done = sttySize(pts, r, c);
+  if (done) { t.ptsCols = c; t.ptsRows = r; }
+  return { ok: true, resized: done, cols: c, rows: r };
 }
 
 // SIGKILL, and not as a last resort: script(1) absorbs both SIGHUP and SIGTERM without
@@ -3150,6 +3169,14 @@ function tokenCookieName(req) {
 function safeEq(a, b) {
   const x = Buffer.from(String(a)), y = Buffer.from(String(b));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+// Which UI this browser asked for, if it has said. Set by ?ui=mobile / ?ui=desktop; with
+// no cookie the user agent decides. A cookie, not localStorage: the choice has to be
+// known on the server, before a byte of the page is written.
+const UI_COOKIE = 'ccbb_ui';
+function uiPref(req) {
+  const m = String(req.headers.cookie || '').match(/(?:^|;\s*)ccbb_ui=(mobile|desktop)/);
+  return m ? m[1] : '';
 }
 function cookieToken(req) {
   const raw = req.headers.cookie || '';
@@ -3474,8 +3501,14 @@ function runWeb(args) {
     const query = new URLSearchParams(qs);
     let m;
 
-    const isPage = method === 'GET' && (pathname === '/' || pathname === '/index.html' ||
+    const isDesktopPage = method === 'GET' && (pathname === '/' || pathname === '/index.html' ||
       /^\/session\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/session\/[^/]+$/.test(pathname));
+    const isMobilePage = method === 'GET' && (pathname === '/m' || pathname === '/m/' ||
+      pathname === '/m/index.html' || /^\/m\/session\/[^/]+$/.test(pathname) ||
+      /^\/m\/peer\/[^/]+\/session\/[^/]+$/.test(pathname));
+    // Both UIs' pages: what the ?token=… hand-off and the HTML 401 apply to. A /m page
+    // left out here would take the JSON-401 branch and could never bank the token.
+    const isPage = isDesktopPage || isMobilePage;
     if (!authOk(req, query)) return sendUnauthorized(res, isPage, tokenCookieName(req));
     // A page opened as ?token=… banks the token in a cookie and reloads clean, so the
     // secret stops riding in the URL bar (and in every link copied out of it).
@@ -3492,6 +3525,39 @@ function runWeb(args) {
         Location: loc,
       });
       return res.end();
+    }
+
+    // ── which UI ──
+    // Strictly after the token hand-off above: redirecting first would drop the ?token=
+    // and leave a phone's first visit in a 401 loop.
+    if (isPage && (query.get('ui') === 'mobile' || query.get('ui') === 'desktop')) {
+      const rest = new URLSearchParams(qs); rest.delete('ui');
+      res.writeHead(302, {
+        'Set-Cookie': `${UI_COOKIE}=${query.get('ui')}; Path=/; SameSite=Strict; Max-Age=31536000`,
+        Location: pathname + (rest.toString() ? '?' + rest.toString() : ''),
+      });
+      return res.end();
+    }
+    // A phone gets the phone UI — including on a deep link, which is how a session URL
+    // copied off a desktop is usually opened. `?ui=desktop` once, and it stops.
+    if (isDesktopPage) {
+      const pref = uiPref(req);
+      if (pref === 'mobile' || (!pref && isMobileUA(req.headers['user-agent']))) {
+        const loc = '/m' + (pathname === '/' || pathname === '/index.html' ? '' : pathname);
+        res.writeHead(302, { Location: loc + (qs ? '?' + qs : '') });
+        return res.end();
+      }
+    }
+    // marked/xterm, fetched by us and cached — see ccbb-mobile.js.
+    if (method === 'GET' && serveVendor(pathname, res)) return;
+    if (isMobilePage) {
+      const self = serverIdentity();
+      if (pathname === '/m' || pathname === '/m/' || pathname === '/m/index.html')
+        return sendHtml(res, mobilePageHtml(null, null, self, priceTable));
+      if ((m = pathname.match(/^\/m\/session\/([^/]+)$/)))
+        return sendHtml(res, mobilePageHtml(m[1], null, self, priceTable));
+      if ((m = pathname.match(/^\/m\/peer\/([^/]+)\/session\/([^/]+)$/)))
+        return sendHtml(res, mobilePageHtml(m[2], decodeURIComponent(m[1]), self, priceTable));
     }
 
     // ── peer mesh ──

@@ -343,8 +343,14 @@ function computeSessionStats(sessionId, opts) {
   const firstSeen = {};   // per usage-source path: has the first billable msg passed?
   const modelMap = {};
   const providerMap = {};
+  // lastAssistantAt/cacheTtl answer "is the prompt cache still warm?" — the question the
+  // status line's resend cost turns on. lastActivity can't: it is the max over EVERY
+  // entry, so a user message typed a moment ago reads warm while Claude last answered
+  // twenty minutes back. The TTL is read off the last response that carried a
+  // cache_creation breakdown (1h if it asked for the 1-hour cache), never guessed.
   const s = { startedAt: null, lastActivity: null, totalTokens: 0, cost: 0, turns: 0,
-    categories, models: [], providers: [], context: null, contextMax: null, subTurns: 0, hasUsage: false, title: '' };
+    categories, models: [], providers: [], context: null, contextMax: null, subTurns: 0, hasUsage: false, title: '',
+    lastAssistantAt: null, cacheTtl: null };
   let lastCtxTs = null, lastCtx = null, maxCtx = null;
   const ctxSamples = []; const seenCtxIds = new Set();
   let lastCompactTs = null, lastCompactTokens = 0;
@@ -410,6 +416,11 @@ function computeSessionStats(sessionId, opts) {
         const cw5 = cc ? (cc.ephemeral_5m_input_tokens || 0) : cw;
         const cw1 = cc ? (cc.ephemeral_1h_input_tokens || 0) : 0;
         const cCw = (cw5 * p.cacheWrite5m + cw1 * p.cacheWrite1h) / 1e6;
+        if (isMain && d.timestamp && (!s.lastAssistantAt || d.timestamp > s.lastAssistantAt)) {
+          s.lastAssistantAt = d.timestamp;
+          if (cw1 > 0) s.cacheTtl = 3600;
+          else if (cw5 > 0) s.cacheTtl = 300;
+        }
         const isFirst = !firstSeen[filePath];
         firstSeen[filePath] = true;
         const miss = (cr === 0 && !isFirst);
@@ -634,9 +645,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 8 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 9 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 8, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 9, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 function saveStatsCache() {
