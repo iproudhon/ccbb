@@ -3475,15 +3475,29 @@ function connectLink(peer) {
 }
 function pollLinks() { for (const p of peerList()) connectLink(p); }
 
+// Interface addresses worth printing: the ones a phone on the same network can dial.
+function lanAddrs() {
+  const out = [];
+  const ifs = os.networkInterfaces();
+  for (const name of Object.keys(ifs)) {
+    if (/^(lo|utun|awdl|llw|bridge)/.test(name)) continue;
+    for (const a of ifs[name] || []) if (a.family === 'IPv4' && !a.internal) out.push(a.address);
+  }
+  return out;
+}
+
 function runWeb(args) {
   let port = DEFAULT_PORT;
+  let host = '127.0.0.1';
   let withWebex = false, withConfluence = false;
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) port = parseInt(args[++i], 10);
+    else if (args[i] === '--host' && args[i + 1]) host = args[++i];
     else if (args[i] === '--webex') withWebex = true;
     else if (args[i] === '--confluence') withConfluence = true;
     else if (args[i] === '-h' || args[i] === '--help') {
-      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port] [--webex] [--confluence]\n\n` +
+      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port] [--host addr] [--webex] [--confluence]\n\n` +
+        `  --host         address to bind (default 127.0.0.1; use 0.0.0.0 to reach it from the LAN)\n` +
         `  --webex        also run the Webex front-end (shares this server's prompt path)\n` +
         `  --confluence   also run the Confluence page front-end\n\n` +
         `Multi-server: set "server".name and "peers" in ${CLAUDE_DIR}/ccbb-config.json to list\n` +
@@ -3694,9 +3708,10 @@ function runWeb(args) {
     send(res, 404, { error: 'Not found' });
   });
 
-  server.listen(port, '127.0.0.1', () => {
+  server.listen(port, host, () => {
     const self = serverIdentity();
     console.log(`ccbb http://127.0.0.1:${port}  (server "${self.name}" on ${self.hostname})`);
+    if (host !== '127.0.0.1') for (const a of lanAddrs()) console.log(`ccbb http://${a}:${port}`);
     const peers = peerList();
     if (peers.length) console.log(`ccbb peers: ${peers.map(p => p.name + ' → ' + p.url).join(', ')}`);
     if (peerToken()) console.log('ccbb: peerToken set — open the UI once as ?token=<token>');

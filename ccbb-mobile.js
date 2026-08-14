@@ -45,6 +45,14 @@ const VENDOR = {
 };
 const vendorInflight = new Map();   // name → Promise<Buffer>
 
+// A host with no outbound route does not refuse the connection, it swallows it,
+// so the only signal is the clock. Once it has timed out, stop trying for a
+// while: the page has a CDN fallback for every one of these, and reaching it a
+// second sooner matters more than another attempt that will fail the same way.
+const VENDOR_TIMEOUT_MS = 4000;
+const VENDOR_RETRY_MS = 10 * 60 * 1000;
+const vendorFailedAt = new Map();   // name → Date.now() of last failure
+
 function vendorPath(name) { return path.join(CLAUDE_DIR, 'ccbb-vendor', VENDOR[name].file); }
 
 function vendorFetch(name) {
@@ -76,7 +84,9 @@ function vendorFetch(name) {
       res.on('end', () => resolve(Buffer.concat(chunks)));
     });
     req.on('error', reject);
-    req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+    // Short, because nothing waits politely on this: /vendor/<x> is a blocking
+    // <script> in the head, so every second here is a second the page is blank.
+    req.setTimeout(VENDOR_TIMEOUT_MS, () => req.destroy(new Error('timeout')));
     req.end();
   }).then(buf => {
     if (!buf.length) throw new Error('empty body');
@@ -103,13 +113,25 @@ function serveVendor(pathname, res) {
       'Cache-Control': 'public, max-age=604800' });
     res.end(buf);
   };
+  const fail = msg => {
+    const body = Buffer.from('/* ccbb: could not fetch ' + name + ': ' + msg + ' */');
+    res.writeHead(502, { 'Content-Type': spec.type, 'Content-Length': body.length });
+    res.end(body);
+  };
+
   let cached;
   try { cached = fs.readFileSync(vendorPath(name)); } catch {}
   if (cached && cached.length) return sendBuf(cached), true;
+
+  const failedAt = vendorFailedAt.get(name);
+  if (failedAt && Date.now() - failedAt < VENDOR_RETRY_MS) {
+    fail('no route to the CDN, and no cached copy');   // answer now, let the page fall back
+    return true;
+  }
+
   vendorFetch(name).then(sendBuf).catch(e => {
-    const body = Buffer.from('/* ccbb: could not fetch ' + name + ': ' + e.message + ' */');
-    res.writeHead(502, { 'Content-Type': spec.type, 'Content-Length': body.length });
-    res.end(body);
+    vendorFailedAt.set(name, Date.now());
+    fail(e.message);
   });
   return true;
 }
@@ -336,17 +358,27 @@ body.has-max .panel:not(.max){display:none}
   font-size:11.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word;overflow:auto}
 .cmd-content.code pre{white-space:pre;word-break:normal}
 /* ── composer ── */
-.composer{flex:0 0 auto;border-top:1px solid var(--line);background:var(--bg);padding:8px 10px}
-.crow{display:flex;gap:6px;align-items:flex-end;background:var(--surface);border:1px solid var(--line);
-  border-radius:16px;padding:5px 5px 5px 12px}
-.crow:focus-within{border-color:var(--accent)}
+/* The buttons sit on their own row under the box, not beside it: a phone line is ~40
+   characters wide as it is, and four controls in the same row cost a third of it. */
+.composer{flex:0 0 auto;display:flex;flex-direction:column;gap:6px;
+  border-top:1px solid var(--line);background:var(--bg);padding:8px 10px}
 /* 16px exactly: anything smaller and iOS Safari zooms the page on focus, which leaves the
    layout scaled and the composer half off-screen after the keyboard closes. */
-.cbox{flex:1;border:none;background:none;padding:6px 0;font-size:16px;line-height:1.4;
-  font-family:ui-monospace,Menlo,Consolas,monospace;resize:none;min-height:32px;max-height:38vh;
+.cbox{width:100%;box-sizing:border-box;background:var(--surface);border:1px solid var(--line);
+  border-radius:14px;padding:8px 12px;font-size:16px;line-height:1.4;
+  font-family:ui-monospace,Menlo,Consolas,monospace;resize:none;min-height:38px;max-height:38vh;
   overflow-y:auto;color:var(--ink)}
-.cbox:focus{outline:none}
-.cbtns{display:flex;align-items:center;gap:3px;flex-shrink:0}
+.cbox:focus{outline:none;border-color:var(--accent)}
+.cbtns{display:flex;align-items:center;gap:6px;flex-shrink:0}
+/* Prompt history is a maximized-editor affordance: at one visible line, replacing the box
+   contents from under the caret is more surprise than help. */
+.cbtn.hist{display:none}
+.pbody.cmax .cbtn.hist{display:flex}
+.cbtns .send{margin-left:auto}
+/* Maximized: the editor takes the panel, the way a maximized panel takes the screen. */
+.pbody.cmax .trwrap,.pbody.cmax .cmd-box{display:none}
+.pbody.cmax .composer{flex:1 1 auto;min-height:0}
+.pbody.cmax .cbox{flex:1 1 auto;height:auto!important;max-height:none}
 .cbtn{background:none;border:1px solid var(--line);color:var(--ink-soft);width:36px;height:36px;
   border-radius:10px;font-size:12px;font-family:inherit;display:flex;align-items:center;justify-content:center}
 .cbtn:disabled{opacity:.35}
@@ -749,14 +781,15 @@ function createSessionPanel(sid, server){
         '<button class="pbtn" data-c="close">&#10005;</button></div>'+
       '<div class="cmd-content" data-r="cmdbody"></div>'+
     '</div>'+
-    '<div class="composer"><div class="crow">'+
+    '<div class="composer">'+
       '<textarea class="cbox" data-r="box" rows="1" placeholder="Message the session…"></textarea>'+
       '<div class="cbtns">'+
-        '<button class="cbtn" data-c="prev" title="Previous prompt">'+ICON.up+'</button>'+
-        '<button class="cbtn" data-c="next" title="Next prompt">'+ICON.down+'</button>'+
+        '<button class="cbtn" data-c="cmax" title="Maximize editor">'+ICON.max+'</button>'+
+        '<button class="cbtn hist" data-c="prev" title="Previous prompt">'+ICON.up+'</button>'+
+        '<button class="cbtn hist" data-c="next" title="Next prompt">'+ICON.down+'</button>'+
         '<button class="send" data-c="send" title="Send">'+ICON.send+'</button>'+
       '</div>'+
-    '</div></div>');
+    '</div>');
   root.appendChild(body);
 
   var dotEl = head.querySelector('[data-r="dot"]');
@@ -1267,21 +1300,37 @@ function createSessionPanel(sid, server){
       .then(function(d){ setDrivable(!!(d && d.pane)); })
       .catch(function(){ setDrivable(false); });
   }
+  // Maximized, the box is sized by flex, so the measured height must not fight it.
+  var composerMax = false;
   function autoGrow(){
+    if (composerMax) { boxEl.style.height = ''; return; }
     boxEl.style.height = 'auto';
-    boxEl.style.height = Math.min(window.innerHeight*0.38, Math.max(32, boxEl.scrollHeight)) + 'px';
+    boxEl.style.height = Math.min(window.innerHeight*0.38, Math.max(38, boxEl.scrollHeight)) + 'px';
   }
   boxEl.addEventListener('input', autoGrow);
+  function setComposerMax(on){
+    composerMax = !!on;
+    body.classList.toggle('cmax', composerMax);
+    var b = body.querySelector('[data-c="cmax"]');
+    b.innerHTML = composerMax ? ICON.restore : ICON.max;
+    b.title = composerMax ? 'Restore editor' : 'Maximize editor';
+    b.classList.toggle('on', composerMax);
+    autoGrow();
+    if (composerMax) boxEl.focus();
+    else if (following) transcript.scrollTop = transcript.scrollHeight;
+  }
   function send(){
     var text = boxEl.value;
     if (!text.trim()) return;
-    if (text.trim().slice(0,2) === '//') { histAdd(text); runCmd(text.trim()); boxEl.value=''; autoGrow(); return; }
+    // A // command answers into .cmd-box, which the maximized editor covers.
+    if (text.trim().slice(0,2) === '//') { histAdd(text); runCmd(text.trim()); boxEl.value=''; setComposerMax(false); autoGrow(); return; }
     if (!canDrive) { toast('Session is not running in a tmux pane on '+SRV+' — cannot send.'); return; }
     api('/api/session/'+sid+'/input', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ text: text }) })
       .then(function(r){ return r.json(); })
       .then(function(d){
-        if (d && d.ok) { histAdd(text); boxEl.value=''; autoGrow(); }
+        // Drop back to the transcript once it is sent — the reply is the point.
+        if (d && d.ok) { histAdd(text); boxEl.value=''; setComposerMax(false); autoGrow(); }
         else toast((d && d.error) || 'Send failed');
       })
       .catch(function(e){ toast(String(e)); });
@@ -1351,6 +1400,7 @@ function createSessionPanel(sid, server){
     var b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.c === 'send') send();
+    else if (b.dataset.c === 'cmax') setComposerMax(!composerMax);
     else if (b.dataset.c === 'prev') histWalk(-1);
     else if (b.dataset.c === 'next') histWalk(1);
   });
