@@ -1187,7 +1187,7 @@ function createSessionView(INFO){
   var histPrevBtn = body.querySelector('.hist-btn[data-h="prev"]');
   var histNextBtn = body.querySelector('.hist-btn[data-h="next"]');
 
-  var ws, reconnectTimer, destroyed = false;
+  var ws, reconnectTimer, destroyed = false, connected = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
   // Timing: response time = assistant entry ts − last USER entry ts (prompt/tool_result), anchored
   // to the last user entry since one response spans several assistant entries (thinking/text/tool).
@@ -1195,6 +1195,10 @@ function createSessionView(INFO){
   // assistant entry's time, paired on the result card to show how long the tool took.
   var lastUserTs = null, lastAsstTs = null, toolStart = {};
   var historyLoaded = false, pendingTranscript = [], pendingAsk = null;
+  // How many history entries we have already taken. /ws/ has no resume cursor —
+  // it tails from end-of-file — so anything written while the socket was down is
+  // never sent. The JSONL only ever grows, so the count is a valid resume point.
+  var histCount = 0;
   var permEls = {};    // fp -> element
   var askCards = {};   // tool_use id -> card element
   var statEls = {}, statTurnNo = {}, statTurns = 0, statSeenFirst = false;
@@ -1752,7 +1756,14 @@ function createSessionView(INFO){
     if (destroyed) return;
     clearTimeout(reconnectTimer);
     var proto = location.protocol==='https:'?'wss:':'ws:';
+    var first = !connected;
     ws = new WebSocket(proto+'//'+location.host+API+'/ws/'+INFO.sessionId);
+    // The tail starts at end-of-file, so every entry written while we were
+    // disconnected is gone from this view unless we go back for it. Cheap on a
+    // LAN and rare; through a tunnel, where a phone drops the socket on every
+    // screen lock, this is the difference between a live transcript and one
+    // with silent holes in it.
+    ws.onopen = function(){ connected = true; if (!first) loadHistory(true); };
     ws.onmessage = function(e){ handleWsMsg(JSON.parse(e.data)); };
     ws.onclose = function(){ if (!destroyed) reconnectTimer = setTimeout(connect, 2000); };
   }
@@ -1809,15 +1820,21 @@ function createSessionView(INFO){
   }
 
   // — history —
-  async function loadHistory() {
+  async function loadHistory(resume) {
     var r, d;
     try { r = await qfetch('/api/session/'+INFO.sessionId+'/history'); d = await r.json(); }
     catch(e) { historyLoaded = true; flushPending(); return; }
     var entries = (d&&d.history)||[];
-    for (var i=0;i<entries.length;i++) processEntry(entries[i], true);
+    // On a resume, replay only what is new. processEntry also dedups by uuid,
+    // but not every entry carries one, and the index is exact.
+    var from = resume ? Math.min(histCount, entries.length) : 0;
+    for (var i=from;i<entries.length;i++) processEntry(entries[i], true);
+    histCount = entries.length;
     historyLoaded = true;
     flushPending();
-    scrollBottom(true);
+    // Don't yank the view back if the reader has scrolled up to read something.
+    if (!resume) scrollBottom(true);
+    else if (i > from) { if (following) scrollBottom(true); noteUpdate(); }
   }
   function flushPending() {
     for (var i=0;i<pendingTranscript.length;i++) { processEntry(pendingTranscript[i], false); }
@@ -2017,7 +2034,7 @@ function createSessionView(INFO){
     transcript.innerHTML = '';
     msgEls = {}; toolEls = {}; seenUuids = {}; askCards = {}; lastUserTs = null; lastAsstTs = null; toolStart = {};
     statEls = {}; statTurnNo = {}; statTurns = 0; statSeenFirst = false;
-    historyLoaded = false; pendingTranscript = []; pendingAsk = null;
+    historyLoaded = false; pendingTranscript = []; pendingAsk = null; histCount = 0;
     following = true; anchorEl = null;
     // The transcript is about to be replayed, and every user message re-seeds the input
     // history — so clear it first, or a refresh would double every prompt. // commands

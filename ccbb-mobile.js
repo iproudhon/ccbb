@@ -805,8 +805,14 @@ function createSessionPanel(sid, server){
   var boxEl = body.querySelector('[data-r="box"]');
 
   var INFO = null, STATS = null;
-  var destroyed = false, ws = null, reconnectTimer = null;
+  var destroyed = false, ws = null, reconnectTimer = null, connected = false;
   var historyLoaded = false, pendingTranscript = [], pendingAsk = null;
+  // How many history entries we have already taken. /ws/ tails from end-of-file
+  // with no resume cursor, so anything written while the socket is down never
+  // arrives. The JSONL only grows, so the count is a valid resume point. This
+  // matters more here than on the desktop: a screen lock drops the socket every
+  // single time.
+  var histCount = 0;
   var seenUuids = {}, msgEls = {}, toolEls = {}, askCards = {}, permEls = {}, toolStart = {};
   var lastUserTs = null, lastAsstTs = null;
   var canDrive = false, cmdCwd = '';
@@ -1252,13 +1258,18 @@ function createSessionPanel(sid, server){
   jumpEl.addEventListener('click', function(){ scrollBottom(true); });
 
   // — history + socket —
-  function loadHistory(){
+  function loadHistory(resume){
     return api('/api/session/'+sid+'/history').then(function(r){ return r.json(); }).then(function(d){
       var entries = (d && d.history) || [];
-      for (var i=0;i<entries.length;i++) processEntry(entries[i], true);
+      // On a resume, replay only what is new. processEntry dedups by uuid too,
+      // but not every entry carries one, and the index is exact.
+      var from = resume ? Math.min(histCount, entries.length) : 0;
+      for (var i=from;i<entries.length;i++) processEntry(entries[i], true);
+      histCount = entries.length;
       historyLoaded = true;
       flushPending();
-      scrollBottom(true);
+      // Do not yank the view back if the reader scrolled up to read something.
+      if (!resume || following) scrollBottom(true);
     }).catch(function(){ historyLoaded = true; flushPending(); });
   }
   function flushPending(){
@@ -1270,8 +1281,12 @@ function createSessionPanel(sid, server){
     if (destroyed) return;
     clearTimeout(reconnectTimer);
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var first = !connected;
     try { ws = new WebSocket(proto+'//'+location.host+API+'/ws/'+sid); }
     catch(e) { reconnectTimer = setTimeout(connect, 3000); return; }
+    // The tail starts at end-of-file, so entries written while we were
+    // disconnected are gone from this view unless we go back for them.
+    ws.onopen = function(){ connected = true; if (!first) loadHistory(true); };
     ws.onmessage = function(e){
       var m; try { m = JSON.parse(e.data); } catch(err) { return; }
       if (m.type === 'transcript') {
