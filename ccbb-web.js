@@ -21,7 +21,7 @@ const common = require('./ccbb-common');
 const { mobilePageHtml, isMobileUA, serveVendor } = require('./ccbb-mobile');
 const {
   serverIdentity, peerList, peerByName, peerToken,
-  CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
+  CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionStats, watchSessionChanges,
   sessionLiveness, renameSession, paneForSession, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
@@ -271,6 +271,18 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .lv .sum-table .c-sub{color:#8c959f;font-size:10px;margin-left:2px}
 .lv .sum-table tfoot td{border-top:1px solid #d0d7de;border-bottom:none;font-weight:600;color:#1f2328;padding-top:6px}
 .lv .sum-table.prov{min-width:640px}
+/* Subscriptions: what a plan has actually spent of its two rolling windows. */
+.lv .summary-head .scope-win{color:#57606a;font-weight:500;font-size:12px}
+.lv .subs{margin-top:14px;border-top:1px solid #eaeef2;padding-top:10px}
+.lv .subs h3{font-size:11px;font-weight:600;color:#8c959f;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.lv .subs-table{min-width:560px}
+.lv .subs-table .c-pct{color:#1f2328;white-space:nowrap}
+/* Bar first, number after: the eye reads the fill, the number confirms it. */
+.lv .ubar{display:inline-block;width:52px;height:5px;border-radius:3px;background:#eaeef2;vertical-align:middle;margin-right:6px;overflow:hidden}
+.lv .ubar i{display:block;height:100%;background:#1a7f37;border-radius:3px}
+.lv .ubar i.warm{background:#bf8700}
+.lv .ubar i.hot{background:#cf222e}
+.lv .subs-table .upct{display:inline-block;min-width:30px;text-align:right}
 /* ── session view ── */
 /* Which machine this session actually runs on — muted when it's this one. */
 .srv-badge{flex-shrink:0;font-size:11px;font-weight:600;border-radius:5px;padding:1px 7px;background:#ddf4e4;color:#1a7f37;border:1px solid #aceebb}
@@ -286,6 +298,9 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .hdr-stats{font-size:11px;color:var(--ink-faint);line-height:1.55;font-variant-numeric:tabular-nums;display:block}
 .hdr-stats b{font-weight:600;color:var(--ink-soft)}
 .hdr-stats .sub{color:var(--ink-faint)}
+/* Plan windows, hung directly off the session cost with no separator — "$1.23/5h:24%/w:41%"
+   is one figure, the way the status line reads it. */
+.hdr-stats .plan-win{color:var(--ink-soft);cursor:help}
 .subturns{font-size:0.8em;color:var(--ink-faint)}
 .status-dot{width:9px;height:9px;border-radius:50%;background:var(--ink-faint);flex-shrink:0}
 .status-dot.live{background:#2da44e;animation:pulse 1.6s ease-in-out infinite}
@@ -603,6 +618,47 @@ function fmtCost(c){ return '$'+(c||0).toFixed(2); }
 function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s'; var m=Math.floor(s/60); if(m<60)return m+'m '+Math.round(s%60)+'s'; var h=Math.floor(m/60); if(h<24)return h+'h '+(m%60)+'m'; return Math.floor(h/24)+'d '+(h%24)+'h'; }
 function fmtPct(part,whole){ return (whole>0?(100*part/whole):0).toFixed(1)+'%'; }
 function fmtStatDate(iso){ return fd(iso); }
+// ── subscription windows ──
+// A Claude.ai plan runs out of WINDOW, not money, so the two rolling limits travel next
+// to every dollar figure: "$1.23/5h:24%/w:41%", the same shape the status line uses.
+// A window that the account doesn't report is dropped rather than shown as 0%.
+function subPct(w){ return w ? Math.round(w.pct)+'%' : '—'; }
+// How long until a window resets. Whole-ish units — this is read at a glance, and the
+// seconds on a 4-hour countdown are noise.
+function fmtUntil(iso){
+  if(!iso) return '—';
+  var t = Date.parse(iso); if (isNaN(t)) return '—';
+  var s = Math.round((t - Date.now())/1000);
+  if (s <= 0) return 'due';
+  var m = Math.floor(s/60), h = Math.floor(m/60), d = Math.floor(h/24);
+  if (d > 0) return d+'d '+(h%24)+'h';
+  if (h > 0) return h+'h '+(m%60)+'m';
+  return m+'m';
+}
+function subWinStr(win){
+  if (!win) return '';
+  var p = [];
+  if (win.fiveHour) p.push('5h:'+subPct(win.fiveHour));
+  if (win.sevenDay) p.push('w:'+subPct(win.sevenDay));
+  return p.length ? '/'+p.join('/') : '';
+}
+// Where the reading came from and how old it is — a percentage with no provenance is
+// indistinguishable from a stale one.
+function subWinTitle(sub){
+  if (!sub || !sub.windows) return '';
+  var w = sub.windows, parts = [];
+  if (w.fiveHour) parts.push('5-hour window '+subPct(w.fiveHour)+' used, resets in '+fmtUntil(w.fiveHour.resetsAt));
+  if (w.sevenDay) parts.push('7-day window '+subPct(w.sevenDay)+' used, resets in '+fmtUntil(w.sevenDay.resetsAt));
+  if (sub.fetchedAt) parts.push('read '+fmtUntilAge(sub.fetchedAt)+' ago from '+(sub.source==='api'?'the account API':'Claude Code\\'s cache'));
+  return parts.join('\\n');
+}
+function fmtUntilAge(ms){
+  var s = Math.max(0, Math.round((Date.now()-ms)/1000));
+  if (s < 60) return s+'s';
+  var m = Math.floor(s/60); if (m < 60) return m+'m';
+  var h = Math.floor(m/60); if (h < 24) return h+'h';
+  return Math.floor(h/24)+'d';
+}
 function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown'; var x=m.replace(/^claude-/,'').replace(/-\\d{6,}$/,''); var parts=x.split('-'); var name=(parts.shift()||''); name=name.charAt(0).toUpperCase()+name.slice(1); var ver=parts.join('.'); return ver?name+' '+ver:name; }
 function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
   m=m.replace(/^(us|eu|apac|au|global)\\./,'').replace(/^(anthropic|bedrock)[./]/,'').replace(/[:-]v\\d+(:\\d+)?$/,'');
@@ -881,7 +937,12 @@ function createListView(){
     '<div class="summary" id="summary" style="display:none">'+
       '<div class="summary-head"><h2>Cost summary</h2>'+
       '<select id="sumScope"></select><span class="scope-cost" id="sumScopeCost"></span></div>'+
-      '<div id="sumProvider" class="sum-wrap"></div></div>'+
+      '<div id="sumProvider" class="sum-wrap"></div>'+
+      // Subscriptions sit under the provider breakdown and share its scope selector: the
+      // USD column is that scope's subscription-billed spend, the windows are live.
+      '<div id="subs" class="subs" style="display:none">'+
+        '<h3>Subscriptions</h3><div id="subsTable" class="sum-wrap"></div></div>'+
+    '</div>'+
     '<div class="wrap"><div id="out" class="lmsg">Loading…</div></div>'+
     '<div class="foot" id="foot"></div>';
   el.appendChild(body);
@@ -889,6 +950,11 @@ function createListView(){
   v.bodyEl = body;
 
   var sessions = [], totals = {}, costSummary = null;
+  // The merged summary above answers "what did everything cost"; these two keep the
+  // per-server split the subscriptions table needs, since a plan belongs to one login on
+  // one set of machines, not to the fan-out as a whole.
+  var sumByServer = {};    // server → its own /api/cost-summary
+  var subsByServer = {};   // server → its own /api/subscription (absent when not on a plan)
   var servers = [{ name: SELF.name, self: true, status: 'up' }];
   var loadErrors = [];     // per-server load failures, shown inline instead of blanking the list
   var sortStack = [{col:'lastActivity', dir:'desc'}];
@@ -1154,15 +1220,30 @@ function createListView(){
   async function loadSummary(force) {
     var results = await fanOut('/api/cost-summary');
     var merged = null;
-    results.forEach(function(r){ if (!r.error) merged = deepAdd(merged, r.data); });
+    // deepAdd copies the first summary rather than mutating it, so the per-server
+    // originals stay intact and can be re-scoped without another round trip.
+    sumByServer = {};
+    results.forEach(function(r){ if (!r.error) { sumByServer[r.name] = r.data; merged = deepAdd(merged, r.data); } });
     if (merged) {
       costSummary = merged; buildScopeOptions(); renderSummary();
       body.querySelector('#summary').style.display = '';
     } else { body.querySelector('#summary').style.display = 'none'; }
+    renderSubs();   // its USD column comes from these summaries, whichever load lands first
     // Drive the list from the selected scope (default: latest month). On summary failure
     // the selector is empty, so this falls back to the all-time list.
     scopeMonth = scopeFromSelect();
     pushScope(!!force);
+  }
+  // Plan windows move turn by turn, so unlike the summary this is re-polled on its own
+  // clock. A server that fails just drops out of the table — one unreachable peer must
+  // not take the other accounts' rows with it.
+  async function loadSubs() {
+    var results = await fanOut('/api/subscription');
+    var next = {};
+    results.forEach(function(r){ if (!r.error && r.data && r.data.account) next[r.name] = r.data; });
+    subsByServer = next;
+    renderSubs();
+    if (costSummary) renderSummary();   // the inline "/5h:…/w:…" beside the scope cost
   }
   // The bar shows how old the table is, not when a request last completed: it is stamped by
   // a delta that changed something, so "3m" means the sessions have been quiet for 3
@@ -1193,14 +1274,35 @@ function createListView(){
       : (months.length ? 'm:'+months[0] : 'all');
   }
   function onScopeChange() {
-    renderSummary();
+    renderSummary(); renderSubs();
     scopeMonth = scopeFromSelect();
     pushScope(false);
+  }
+  function scopeLabel() {
+    var val = body.querySelector('#sumScope').value;
+    return (val && val.indexOf('m:') === 0) ? fmtMonth(val.slice(2)) : 'All time';
   }
   function currentScope() {
     var val = body.querySelector('#sumScope').value;
     if (val === 'all' || !val) return costSummary.overall;
     return costSummary.months[val.slice(2)] || costSummary.overall;
+  }
+  // Same scope, applied to ONE server's summary. Unlike currentScope this returns null
+  // for a month the server has no spend in — falling back to its all-time total there
+  // would quietly bill a quiet machine for its whole history.
+  function serverScope(name) {
+    var cs = sumByServer[name];
+    if (!cs) return null;
+    var val = body.querySelector('#sumScope').value;
+    if (val === 'all' || !val) return cs.overall || null;
+    return (cs.months || {})[val.slice(2)] || null;
+  }
+  // What that server put through its subscription in the selected scope. Bedrock and
+  // API-key traffic on the same machine is somebody else's bill and is left out.
+  function subCostFor(name) {
+    var sc = serverScope(name);
+    var b = sc && sc.byProvider && sc.byProvider.anthropic;
+    return b ? (b.cost || 0) : 0;
   }
   function catCell(cat, totCost){
     if (!cat || !cat.tokens) return '<td class="c-tok">—</td>';
@@ -1244,8 +1346,69 @@ function createListView(){
   function renderSummary() {
     if (!costSummary) return;
     var scope = currentScope();
-    body.querySelector('#sumScopeCost').textContent = fc(scope.all.cost);
+    var costEl = body.querySelector('#sumScopeCost');
+    // "$1.23/5h:24%/w:41%" — but only with ONE plan in view. Two accounts have two sets
+    // of windows and no meaningful sum, so there the table alone speaks for them.
+    var groups = subGroups(), one = groups.length === 1 ? groups[0] : null;
+    costEl.innerHTML = esc(fc(scope.all.cost))
+      + (one && one.windows ? '<span class="scope-win" title="'+esc(subWinTitle(one))+'">'+esc(subWinStr(one.windows))+'</span>' : '');
     body.querySelector('#sumProvider').innerHTML = providerTableHtml(scope);
+  }
+  // One row per ACCOUNT, not per server: the windows belong to a login, so two machines
+  // sharing one would otherwise show the same percentages twice and read as double the
+  // usage. Their spend is summed; the freshest of their readings wins.
+  function subGroups() {
+    var byAcct = {};
+    selectedServers().forEach(function(name){
+      var s = subsByServer[name];
+      if (!s || !s.account) return;
+      var g = byAcct[s.account.accountUuid] || (byAcct[s.account.accountUuid] =
+        { account: s.account, plan: s.plan || '', servers: [], windows: null, fetchedAt: 0, source: null, cost: 0 });
+      g.servers.push(name);
+      if (s.windows && (s.fetchedAt || 0) >= g.fetchedAt) {
+        g.windows = s.windows; g.fetchedAt = s.fetchedAt || 0; g.source = s.source;
+      }
+      g.cost += subCostFor(name);
+    });
+    return Object.keys(byAcct).map(function(k){ return byAcct[k]; })
+      .sort(function(a, b){ return b.cost - a.cost; });
+  }
+  // Percentage plus a proportional bar, so a nearly-spent window is visible without
+  // reading the number. Amber past 70%, red past 90%.
+  function subPctCell(w) {
+    if (!w) return '<td class="c-tok">—</td>';
+    var p = Math.max(0, Math.min(100, w.pct));
+    var cls = p >= 90 ? ' hot' : p >= 70 ? ' warm' : '';
+    return '<td class="c-pct"><span class="ubar"><i class="'+cls.trim()+'" style="width:'+p.toFixed(1)+'%"></i></span>'
+      + '<span class="upct">'+subPct(w)+'</span></td>';
+  }
+  function subRowHtml(g) {
+    var w = g.windows || {};
+    var acct = esc(g.account.name)
+      + (g.plan ? ' <span class="c-sub">'+esc(g.plan)+'</span>' : '')
+      + (multiServer() ? '<span class="c-sub"> '+esc(g.servers.join(', '))+'</span>' : '');
+    var tip = [g.account.email, g.account.org].filter(Boolean).join(' · ');
+    var stale = g.fetchedAt ? '<span class="c-sub" title="'+esc(subWinTitle(g))+'">'+esc(fmtUntilAge(g.fetchedAt))+'</span>' : '';
+    return '<tr><td title="'+esc(tip)+'">'+acct+'</td>'
+      + '<td class="c-usd">'+fc(g.cost)+'</td>'
+      + subPctCell(w.fiveHour)
+      + '<td class="c-tok">'+esc(fmtUntil(w.fiveHour && w.fiveHour.resetsAt))+'</td>'
+      + subPctCell(w.sevenDay)
+      + '<td class="c-tok">'+esc(fmtUntil(w.sevenDay && w.sevenDay.resetsAt))+'</td>'
+      + '<td class="c-tok">'+stale+'</td>'
+      + '</tr>';
+  }
+  function renderSubs() {
+    var groups = subGroups();
+    var wrap = body.querySelector('#subs');
+    // Nothing to say on a Bedrock-only or API-key install — an empty table would just be
+    // a heading over a blank row.
+    if (!groups.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    var thead = '<thead><tr><th>Account</th><th>USD ('+esc(scopeLabel())+')</th>'
+      + '<th>5h used</th><th>5h resets</th><th>Week used</th><th>Week resets</th><th>Read</th></tr></thead>';
+    body.querySelector('#subsTable').innerHTML =
+      '<table class="sum-table subs-table">'+thead+'<tbody>'+groups.map(subRowHtml).join('')+'</tbody></table>';
   }
   function thSort(label, col, style) {
     var entry = sortStack.find(function(e){ return e.col === col; });
@@ -1336,13 +1499,22 @@ function createListView(){
   // server is this one, so a saved selection naming a peer would filter down to nothing
   // and connect local-only — a first paint that silently drops every remote session.
   function cycle(force){
-    return loadServers().then(function(){ syncSockets(); return loadSummary(force); });
+    return loadServers().then(function(){
+      syncSockets();
+      loadSubs();                       // independent of the summary; don't make it wait
+      return loadSummary(force);
+    });
   }
 
-  // The only timer left: the age label counts up between pushes.
-  var ageTimer = setInterval(renderAge, 10000);
+  // Two timers. The age label counts up between pushes, and the same tick re-renders the
+  // subscriptions table so its reset countdowns move without another round trip.
+  var ageTimer = setInterval(function(){ renderAge(); renderSubs(); }, 10000);
+  // Plan windows are account state, not transcript state — nothing pushes them, so they
+  // are the one thing here that still polls.
+  var subsTimer = setInterval(loadSubs, 60000);
   v.destroy = function(){
     clearInterval(ageTimer);
+    clearInterval(subsTimer);
     for (var name in socks) closeSocket(name);
   };
 
@@ -1510,8 +1682,29 @@ function createSessionView(INFO){
       else if (e.key === 'Escape') { finish(false); }
     });
   }
+  // This session's server, when it's on a Claude.ai plan. Its two rolling windows ride
+  // beside the session cost as "$1.23/5h:24%/w:41%" — on a plan the dollars are notional
+  // list price and the windows are the figure that actually runs out.
+  var subInfo = null, lastStats = null;
+  function planWinHtml(st) {
+    if (!subInfo || !subInfo.windows) return '';
+    // A Bedrock or API-key session on a machine that also has a login is not billed to
+    // that plan, so its windows say nothing about this session.
+    var onPlan = (st.providers||[]).some(function(p){ return p.provider === 'anthropic' && p.cost > 0; });
+    if (!onPlan) return '';
+    var s = subWinStr(subInfo.windows);
+    return s ? '<span class="plan-win" title="'+esc(subWinTitle(subInfo))+'">'+esc(s)+'</span>' : '';
+  }
+  function fetchSub() {
+    fetch(API+'/api/subscription').then(function(r){ return r.json(); })
+      .then(function(d){
+        subInfo = (d && d.account) ? d : null;
+        if (lastStats) renderStats(lastStats);
+      }).catch(function(){});
+  }
   function renderStats(st) {
     if (!st) { statsEl.textContent = ''; return; }
+    lastStats = st;
     projEl.innerHTML = (INFO.projectPath?'<b>'+esc(INFO.projectPath)+'</b>':'') +
       '  &middot;  last '+esc(fmtStatDate(st.lastActivity))+'  &middot;  started '+esc(fmtStatDate(st.startedAt));
     var models = (st.models||[]).filter(function(m){ return m.cost>=0.005; });
@@ -1531,7 +1724,7 @@ function createSessionView(INFO){
     var turns = st.turns||0, subTurns = st.subTurns||0;
     var subStr = subTurns>0?' <span class="subturns">+'+subTurns+'</span>':'';
     statsEl.innerHTML = '<b>'+turns+'</b>'+subStr+' turn'+(turns===1?'':'s')+
-      '  &middot;  <b>'+fmtCost(st.cost)+'</b>'+modelStr+
+      '  &middot;  <b>'+fmtCost(st.cost)+'</b>'+planWinHtml(st)+modelStr+
       '  &middot;  <b>'+fmtTokShort(st.totalTokens)+'</b>  '+tokStr+ctxStr;
   }
   // Session state from the live sidecar: busy = Claude is working, idle = it finished the
@@ -2394,9 +2587,11 @@ function createSessionView(INFO){
   // a session is attached or killed; 15s is plenty.
   var statusTimer = setInterval(function(){ if (lastStatus) setStatus(lastStatus); }, 10000);
   var drivePollTimer = setInterval(refreshDrivable, 15000);
+  // Plan windows belong to the account, not the transcript, so nothing pushes them.
+  var subTimer = setInterval(fetchSub, 60000);
   v.destroy = function(){
     destroyed = true;
-    clearInterval(statusTimer); clearInterval(drivePollTimer);
+    clearInterval(statusTimer); clearInterval(drivePollTimer); clearInterval(subTimer);
     clearTimeout(reconnectTimer); clearTimeout(statsTimer);
     if (gapObserver) { try { gapObserver.disconnect(); } catch(e) {} }
     if (scrollObserver) { try { scrollObserver.disconnect(); } catch(e) {} }
@@ -2406,6 +2601,7 @@ function createSessionView(INFO){
   renderTitle();
   renderStats(INFO.stats);
   setStatus({ live: INFO.live, status: INFO.liveStatus, statusUpdatedAt: INFO.liveStatusAt });
+  fetchSub();
   refreshDrivable();
   connect();
   loadHistory();
@@ -4074,6 +4270,11 @@ function runWeb(args) {
       return send(res, 200, getSessions(filter));
     }
     if (method === 'GET' && pathname === '/api/cost-summary') return send(res, 200, getCostSummary());
+    // This server's Claude.ai plan windows. `{}` — not a 404 — when it isn't on a
+    // subscription, so a Bedrock peer in a fan-out contributes nothing rather than an error.
+    // Windows only, no spend: this is polled every minute and both front-ends already have
+    // the dollars — the desktop from its cost summaries, the phone from the list totals.
+    if (method === 'GET' && pathname === '/api/subscription') return send(res, 200, getSubscription() || {});
     // Just the month keys, for a scope selector that has no use for the summary's numbers —
     // the phone would otherwise pull a full cost breakdown to fill one dropdown.
     if (method === 'GET' && pathname === '/api/months')

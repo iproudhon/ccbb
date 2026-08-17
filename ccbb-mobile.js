@@ -229,11 +229,15 @@ body.has-max .panel:not(.max){display:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .ago{font-size:11.5px;color:var(--ink-faint);flex-shrink:0}
 /* ── session list ── */
-.srvbar{flex:0 0 auto;display:flex;gap:6px;padding:8px 12px;overflow-x:auto;border-bottom:1px solid var(--line);background:var(--bg)}
+/* Scope and servers share one row. The scope select is pinned and the chips scroll past
+   it, so the month you are looking at stays on screen however many servers there are. */
+.topbar{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;
+  border-bottom:1px solid var(--line);background:var(--bg)}
+.srvbar{flex:1 1 auto;min-width:0;display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.srvbar::-webkit-scrollbar{display:none}
 /* Cost scope: all time, or one month — the same choice the desktop summary offers. */
-.scopebar{flex:0 0 auto;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--bg)}
-.scope{font:inherit;font-size:12px;color:var(--ink);background:var(--bg);border:1px solid var(--line);
-  border-radius:6px;padding:4px 8px;width:100%}
+.scope{flex:0 0 auto;max-width:45%;font:inherit;font-size:12px;color:var(--ink);
+  background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
 .chip{flex-shrink:0;display:flex;align-items:center;gap:6px;border:1px solid var(--line);
   border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--ink-soft);background:var(--bg-alt)}
 .chip.on{border-color:var(--accent);color:var(--ink);background:var(--accent-soft)}
@@ -256,9 +260,30 @@ body.has-max .panel:not(.max){display:none}
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
 .lmsg{padding:20px 14px;color:var(--ink-faint);font-size:13.5px;text-align:center}
 .lerr{padding:8px 12px;color:var(--err);font-size:12.5px;border-bottom:1px solid var(--line)}
-.foot{flex:0 0 auto;padding:8px 12px;border-top:1px solid var(--line);font-size:11.5px;
-  color:var(--ink-faint);display:flex;gap:10px;align-items:center;background:var(--bg-alt)}
-.foot a{color:var(--ink-soft);margin-left:auto}
+.foot{flex:0 0 auto;padding:8px 12px;border-top:1px solid var(--line);font-size:11px;
+  color:var(--ink-faint);display:flex;gap:8px;align-items:center;background:var(--bg-alt)}
+/* Session count, spend and the plan windows on one line that has to fit 393px without
+   scrolling. Everything is fixed-width except the account name, so overflow eats the
+   name first — it is the one part the pills next to it can imply. */
+.foot .tot{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:6px;
+  overflow:hidden;white-space:nowrap;font-variant-numeric:tabular-nums}
+.foot .fsep{color:var(--ink-faint);opacity:.6}
+.foot .fcnt,.foot .fsub{flex:0 0 auto}
+.foot .fsub{color:var(--ink-soft)}
+.foot .fgrp{flex:0 1 auto;min-width:0;display:flex;align-items:center;gap:5px}
+.foot .fname{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  font-weight:600;color:var(--ink)}
+/* One window is a single pill: the bar is the pill's own fill and the text sits on top of
+   it, so a window costs one object's width instead of three. The fill is translucent so
+   the label stays legible over it; amber past 70%, red past 90%, as on the desktop. */
+.foot .fwin{position:relative;flex:0 0 auto;display:inline-flex;align-items:baseline;
+  gap:4px;padding:2px 6px;border-radius:5px;background:var(--line);overflow:hidden}
+.foot .fwin i{position:absolute;left:0;top:0;bottom:0;background:var(--ok);opacity:.42}
+.foot .fwin.warm i{background:var(--warn)}
+.foot .fwin.hot i{background:var(--err)}
+.foot .fwin b{position:relative;font-weight:600;color:var(--ink)}
+/* Smaller so the window's name reads first and the numbers stay detail. */
+.foot .fwin em{position:relative;font-style:normal;font-size:9px;color:var(--ink-soft)}
 /* ── session panel ── */
 .subhead{flex:0 0 auto;padding:6px 12px 7px;background:var(--bg-alt);border-bottom:1px solid var(--line);
   font-size:11.5px;color:var(--ink-soft);display:flex;flex-direction:column;gap:3px}
@@ -531,6 +556,32 @@ function fmtMonth(mk){ var p=String(mk).split('-'), names=['Jan','Feb','Mar','Ap
 // Age of the list, counted up between pushes: "12s", "3m", "2h".
 function fmtAge(ms){ var s=Math.round(ms/1000); if(s<60)return s+'s'; var m=Math.round(s/60);
   if(m<60)return m+'m'; return Math.round(m/60)+'h'; }
+// ── subscription windows ──
+// A Claude.ai plan runs out of WINDOW, not money. The two rolling limits come from
+// /api/subscription and travel next to the dollars in both panels: "$1.23/5h:22%/w:27%",
+// the shape statusline-instructions.md defines. A window the account doesn't report is
+// dropped rather than drawn as 0%.
+function subPct(w){ return w ? Math.round(w.pct)+'%' : '—'; }
+function subWinStr(win){
+  if (!win) return '';
+  var p = [];
+  if (win.fiveHour) p.push('5h:'+subPct(win.fiveHour));
+  if (win.sevenDay) p.push('w:'+subPct(win.sevenDay));
+  return p.length ? '/'+p.join('/') : '';
+}
+// Time until a window resets. Whole-ish units — the seconds on a four-hour countdown are
+// noise — and unspaced ("4h21m"), so the compound stays one visual token in a foot that
+// is already packed. The desktop keeps its spaced form; it has columns to sit in.
+function fmtUntil(iso){
+  if (!iso) return '—';
+  var t = Date.parse(iso); if (isNaN(t)) return '—';
+  var s = Math.round((t - Date.now())/1000);
+  if (s <= 0) return 'due';
+  var m = Math.floor(s/60), h = Math.floor(m/60), d = Math.floor(h/24);
+  if (d > 0) return d+'d'+(h%24)+'h';
+  if (h > 0) return h+'h'+(m%60)+'m';
+  return m+'m';
+}
 function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms';
   var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s';
   var m=Math.floor(s/60); if(m<60)return m+'m'+(Math.round(s%60)?' '+Math.round(s%60)+'s':'');
@@ -715,10 +766,12 @@ function createListPanel(){
   ]));
   root.appendChild(head);
   var body = el('div','pbody',
-    '<div class="srvbar" data-r="srv"></div>'+
-    '<div class="scopebar"><select class="scope" data-r="scope"></select></div>'+
+    // Scope and servers share the top row; the rest of the height belongs to the sessions.
+    '<div class="topbar"><select class="scope" data-r="scope"></select>'+
+      '<div class="srvbar" data-r="srv"></div></div>'+
     '<div class="rows" data-r="rows"><div class="lmsg">Loading…</div></div>'+
-    '<div class="foot"><span data-r="tot"></span><a href="/?ui=desktop">desktop UI &#8599;</a></div>');
+    // The foot carries the whole summary — count, spend, and each plan's two windows.
+    '<div class="foot"><span class="tot" data-r="tot"></span></div>');
   root.appendChild(body);
   var agoEl = head.querySelector('[data-r="ago"]');
   var srvEl = body.querySelector('[data-r="srv"]');
@@ -789,11 +842,38 @@ function createListPanel(){
         return '<div class="lerr">'+esc(e.server)+': '+esc(e.error)+'</div>';
       }).join(''));
     }
+    renderFoot();
+  }
+  // "×164 · $1328.85 · Steve Jung [5h 3% 4h21m] [7d 28% 22h33m]", each window a filled
+  // pill. The month is not repeated here — it is the scope select two rows up, and the
+  // cost already follows it.
+  function renderFoot(){
     var cost = 0;
     for (var n in srvRows) if (selectedServers().indexOf(n) !== -1)
       cost += (srvRows[n].totals && srvRows[n].totals.totalCost) || 0;
-    totEl.textContent = sessions.length + ' session' + (sessions.length===1?'':'s') + '  ·  ' + fmtCost(cost) +
-      (scopeMonth ? '  ·  ' + fmtMonth(scopeMonth) : '');
+    // "×164" rather than "164 sessions": the count sits where a count is expected and the
+    // word was the longest thing on the line that carried no information.
+    var html = '<span class="fcnt">×'+sessions.length+'</span>'+
+      '<span class="fsep">·</span><span class="fsub">'+fmtCost(cost)+'</span>';
+    subGroups().forEach(function(g){
+      html += '<span class="fsep">·</span>' + subFootHtml(g);
+    });
+    totEl.innerHTML = html;
+  }
+  function subFootHtml(g){
+    var w = g.windows || {};
+    return '<span class="fgrp"><span class="fname">'+esc(g.account.name)+'</span>'+
+      subFootWin('5h', w.fiveHour) + subFootWin('7d', w.sevenDay) + '</span>';
+  }
+  function subFootWin(label, w){
+    if (!w) return '';
+    var pc = Math.max(0, Math.min(100, w.pct));
+    var cls = pc >= 90 ? ' hot' : pc >= 70 ? ' warm' : '';
+    // A few percent of a short pill is a sub-pixel sliver that renders as nothing, which
+    // reads as an untouched window. Any nonzero usage gets at least a visible edge.
+    var fill = 'width:'+pc.toFixed(1)+'%' + (pc > 0 ? ';min-width:3px' : '');
+    return '<span class="fwin'+cls+'"><i style="'+fill+'"></i>'+
+      '<b>'+label+'</b><em>'+subPct(w)+' '+esc(fmtUntil(w.resetsAt))+'</em></span>';
   }
   rowsEl.addEventListener('click', function(e){
     var r = e.target.closest('[data-sid]');
@@ -943,6 +1023,39 @@ function createListPanel(){
       renderScope();
     }).catch(function(){});
   }
+  // ── subscriptions ──
+  // Windows only — no ?cost=1. The foot's dollar figure is the session list's own total,
+  // which the sockets already deliver under the current scope, so the phone never pays
+  // for a cost-summary pass. One request per selected server; a server that fails just
+  // drops out, so one dead tunnel can't take the other accounts' windows with it.
+  var subs = {};
+  function loadSubs(){
+    return Promise.all(selectedServers().map(function(n){
+      return fetch(apiBase(n) + '/api/subscription').then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){ return (d && d.account) ? { name:n, data:d } : null; })
+        .catch(function(){ return null; });
+    })).then(function(got){
+      var next = {};
+      got.forEach(function(g){ if (g) next[g.name] = g.data; });
+      subs = next;
+      renderFoot();
+    });
+  }
+  // One entry per ACCOUNT, not per server: the windows belong to a login, so two machines
+  // sharing one would otherwise print the same percentages twice and read as double the
+  // usage. The freshest of their readings wins.
+  function subGroups(){
+    var byAcct = {}, order = [];
+    selectedServers().forEach(function(n){
+      var s = subs[n];
+      if (!s || !s.account) return;
+      var k = s.account.accountUuid;
+      if (!byAcct[k]) { byAcct[k] = { account:s.account, windows:null, fetchedAt:0 }; order.push(k); }
+      var g = byAcct[k];
+      if (s.windows && (s.fetchedAt||0) >= g.fetchedAt) { g.windows = s.windows; g.fetchedAt = s.fetchedAt||0; }
+    });
+    return order.map(function(k){ return byAcct[k]; });
+  }
   function renderScope(){
     var prev = scopeEl.value;
     scopeEl.innerHTML = ['<option value="">All time</option>'].concat(months.map(function(mk){
@@ -984,20 +1097,31 @@ function createListPanel(){
   // A manual refresh re-reads the server list and the months, then asks each socket for a
   // fresh snapshot — waking any that were sitting out a reconnect backoff.
   function refresh(){
-    return loadServers().then(function(){ load(); loadMonths(); pushScope(true); });
+    return loadServers().then(function(){ load(); loadMonths(); loadSubs(); pushScope(true); });
   }
 
-  // Nothing polls any more; this only counts the age label up.
-  setInterval(tickAgo, 10000);
+  // The age label counts up, and the same tick moves the windows' reset countdowns —
+  // no request involved, the reset times are already in hand.
+  var agoTimer = setInterval(function(){ tickAgo(); renderFoot(); }, 10000);
+  // Plan windows are account state: no socket carries them, so they are the one thing
+  // this panel still polls. Skipped while the screen is off or the list is collapsed —
+  // a phone in a pocket must not sit there making requests.
+  var subsTimer = setInterval(function(){
+    if (document.hidden || p.state === 'min') return;
+    loadSubs();
+  }, 60000);
   // A phone drops sockets on screen lock. Coming back, reconnect at once rather than
   // waiting out a backoff that started while the screen was off.
   document.addEventListener('visibilitychange', function(){
-    if (!document.hidden && p.state !== 'min') pushScope(true);
+    if (!document.hidden && p.state !== 'min') { pushScope(true); loadSubs(); }
   });
 
   p.refresh = refresh;
-  p.destroy = function(){ for (var n in socks) closeSocket(n); };
-  loadServers().then(function(){ load(); loadMonths(); });
+  p.destroy = function(){
+    clearInterval(agoTimer); clearInterval(subsTimer);
+    for (var n in socks) closeSocket(n);
+  };
+  loadServers().then(function(){ load(); loadMonths(); loadSubs(); });
   return p;
 }
 
@@ -1109,9 +1233,27 @@ function createSessionPanel(sid, server){
     else if (INFO && INFO.live) bits.push('working');
     whenEl.textContent = bits.join('  ·  ');
   }
-  // The status line of statusline-instructions.md, minus the fields ccbb cannot know:
-  // there is no subscription-window or month-to-date figure here, and the cost is ccbb's
-  // own list-price estimate rather than Claude Code's reported spend.
+  // This session's server, when it is on a Claude.ai plan. The two rolling windows hang
+  // off the cost as "$1.23/5h:22%/w:27%", exactly as the status line renders them.
+  var SUB = null;
+  function planWin(){
+    if (!SUB || !SUB.windows || !STATS) return '';
+    // A Bedrock or API-key session on a machine that also has a login is not billed to
+    // that plan, so the plan's windows say nothing about this session.
+    var onPlan = (STATS.providers||[]).some(function(x){ return x.provider === 'anthropic' && x.cost > 0; });
+    return onPlan ? subWinStr(SUB.windows) : '';
+  }
+  function loadSub(){
+    // No ?cost=1: this panel wants the windows, not a whole-history cost pass.
+    return api('/api/subscription').then(function(r){ return r.json(); }).then(function(d){
+      if (destroyed) return;
+      SUB = (d && d.account) ? d : null;
+      renderStatusLine();
+    }).catch(function(){});
+  }
+  // The status line of statusline-instructions.md, minus the one field ccbb cannot know:
+  // the month-to-date figure. The cost is ccbb's own list-price estimate rather than
+  // Claude Code's reported spend — on a plan the windows beside it are the real limit.
   function renderStatusLine(){
     if (!STATS) { slineEl.innerHTML = ''; return; }
     var st = STATS;
@@ -1127,7 +1269,8 @@ function createSessionPanel(sid, server){
     var turns = 'turns:' + (st.turns||0) + ((st.subTurns||0) ? '+' + st.subTurns : '');
     var ctxs = 'ctx:' + fmtK(ctx) + '/' + fmtK(peak) + '/' + fmtCost(read) +
       (cold && ctx ? '<span class="sl-cold">-&gt;' + fmtCost(write) + '</span>' : '');
-    slineEl.innerHTML = esc(prettyModel(model)) + '  ' + fmtCost(st.cost) + '  ' + turns + '  ' + ctxs;
+    slineEl.innerHTML = esc(prettyModel(model)) + '  ' + fmtCost(st.cost) + esc(planWin()) +
+      '  ' + turns + '  ' + ctxs;
   }
   // Wall-clock, not data: the cache goes cold with nothing written anywhere, so nothing
   // but a timer can notice. 10s, the same cadence the status-line spec asks of the shell.
@@ -1135,6 +1278,12 @@ function createSessionPanel(sid, server){
     if (p.state === 'min' || document.hidden) return;
     renderStatusLine(); renderWhen();
   }, 10000);
+  // Plan windows belong to the account, not the transcript, so no socket pushes them.
+  // Idle while collapsed or backgrounded, for the same reason as the list panel.
+  var subTick = setInterval(function(){
+    if (p.state === 'min' || document.hidden) return;
+    loadSub();
+  }, 60000);
 
   function loadInfo(){
     return api('/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
@@ -1802,7 +1951,7 @@ function createSessionPanel(sid, server){
       return;
     }
     var k = b.dataset.k;
-    if (k === 'refresh') { loadInfo(); refreshDrivable(); }
+    if (k === 'refresh') { loadInfo(); loadSub(); refreshDrivable(); }
     else if (k === 'max') setState(p, p.state === 'max' ? 'exp' : 'max');
     else if (k === 'term') openTerminal(server, sid);
     else if (k === 'close') removePanel(p);
@@ -1845,7 +1994,7 @@ function createSessionPanel(sid, server){
     // Before anything else: a closing panel that still owns the full-screen composer
     // would leave document.body wearing comp-max with nothing left to fill it.
     if (composerMax) setComposerMax(false);
-    clearInterval(tick); clearTimeout(reconnectTimer);
+    clearInterval(tick); clearInterval(subTick); clearTimeout(reconnectTimer);
     if (gapObserver) { try { gapObserver.disconnect(); } catch(e){} }
     try { mo.disconnect(); } catch(e){}
     if (ws) { try { ws.close(); } catch(e){} }
@@ -1861,6 +2010,7 @@ function createSessionPanel(sid, server){
   // overlap.
   connect();
   loadInfo().then(loadHistory);
+  loadSub();
   refreshDrivable();
   return p;
 }

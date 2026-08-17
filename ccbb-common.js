@@ -250,6 +250,163 @@ const PRICING = PRICE_TABLE.tiers;
 function priceForModel(model) { return priceForModelIn(model, PRICE_TABLE); }
 function contextMaxFor(model) { return 200000; }
 
+// ── Subscription usage windows ───────────────────────────────────────────────
+// A Claude.ai plan is not billed in dollars, it is rationed by two rolling RATE-LIMIT
+// WINDOWS — five-hour and seven-day — each reported as a percentage used plus when it
+// resets. The dollar figures ccbb computes from transcripts are list-price notional
+// there; the windows are what actually runs out. Nothing in a transcript carries them
+// (they are a property of the account, not the conversation), so there are two sources:
+//
+//   1. `cachedUsageUtilization` in Claude Code's own .claude.json — free and offline,
+//      but only as fresh as the last time Claude Code itself asked.
+//   2. GET /api/oauth/usage with the OAuth access token from .credentials.json —
+//      always current, at the cost of one authenticated call on the user's login.
+//
+// Both are read; whichever reading is newer wins. (2) refreshes into ccbb's own cache
+// file in the background and NEVER blocks a response — a caller gets the best value on
+// hand and the next poll picks up the result. The cache holds only percentages and
+// reset times, never the token.
+const CREDENTIALS_FILE = path.join(CLAUDE_DIR, '.credentials.json');
+const USAGE_FILE = path.join(CLAUDE_DIR, 'ccbb-usage.json');
+const USAGE_ATTEMPT_FILE = path.join(CLAUDE_DIR, 'ccbb-usage.attempt');
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_BETA = 'oauth-2025-04-20';
+const USAGE_MAX_AGE_MS = 60 * 1000;        // a window percentage moves turn by turn
+const USAGE_RETRY_MS = 5 * 60 * 1000;      // …but back off after a failure (offline throttle)
+
+// Claude Code keeps .claude.json beside its config dir when CLAUDE_CONFIG_DIR is set,
+// and in the home directory otherwise. Resolved per call: the file can appear later.
+function claudeJsonFile() {
+  const beside = path.join(CLAUDE_DIR, '.claude.json');
+  try { if (fs.statSync(beside).isFile()) return beside; } catch {}
+  return path.join(os.homedir(), '.claude.json');
+}
+// That file runs to tens of KB and is re-read on every poll, so cache the parse against
+// size+mtime the way the session stats cache does.
+let claudeJsonCache = { key: '', data: null };
+function readClaudeJson() {
+  const file = claudeJsonFile();
+  let st;
+  try { st = fs.statSync(file); } catch { return null; }
+  const key = `${file}:${st.size}:${st.mtimeMs}`;
+  if (claudeJsonCache.key === key) return claudeJsonCache.data;
+  let data = null;
+  try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { data = null; }
+  claudeJsonCache = { key, data };
+  return data;
+}
+// The logged-in Claude.ai account, or null when this machine runs on Bedrock / an API
+// key — in which case there is no subscription to report and no row to draw.
+function subscriptionAccount() {
+  const j = readClaudeJson();
+  const a = j && j.oauthAccount;
+  if (!a || !a.accountUuid) return null;
+  return {
+    accountUuid: String(a.accountUuid),
+    name: String(a.displayName || a.emailAddress || a.accountUuid.slice(0, 8)),
+    email: String(a.emailAddress || ''),
+    org: String(a.organizationName || ''),
+    orgType: String(a.organizationType || ''),
+    tier: String(a.organizationRateLimitTier || a.userRateLimitTier || ''),
+  };
+}
+function oauthCreds() {
+  try {
+    const o = (JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8')) || {}).claudeAiOauth;
+    if (!o || !o.accessToken) return null;
+    return {
+      token: String(o.accessToken),
+      expiresAt: Number(o.expiresAt) || 0,
+      subscriptionType: String(o.subscriptionType || ''),
+    };
+  } catch { return null; }
+}
+// Both sources return the same payload shape, so one normalizer serves both. Returns
+// null when neither window is present — an empty object would read as "0% used".
+function normalizeUsageWindows(u) {
+  if (!u || typeof u !== 'object') return null;
+  const win = k => {
+    const w = u[k];
+    if (!w || typeof w.utilization !== 'number' || !isFinite(w.utilization)) return null;
+    return { pct: w.utilization, resetsAt: w.resets_at || null };
+  };
+  const fiveHour = win('five_hour'), sevenDay = win('seven_day');
+  if (!fiveHour && !sevenDay) return null;
+  return { fiveHour, sevenDay };
+}
+let usageRefreshing = false;
+// Fire-and-forget refresh of USAGE_FILE. Never blocks, never throws, never renews the
+// token: an expired one is Claude Code's to refresh, and rewriting the credentials file
+// underneath it would be a good way to log the user out. Falls back to the cache instead.
+function maybeRefreshUsage() {
+  try {
+    if (usageRefreshing) return;
+    if (fileAgeMs(USAGE_FILE) <= USAGE_MAX_AGE_MS) return;
+    if (fileAgeMs(USAGE_ATTEMPT_FILE) <= USAGE_RETRY_MS) return;
+    const account = subscriptionAccount();
+    const creds = oauthCreds();
+    if (!account || !creds) return;
+    if (creds.expiresAt && creds.expiresAt <= Date.now()) return;
+    usageRefreshing = true;
+    // Stamped BEFORE the request, so a hung fetch can't let a second one start.
+    try { fs.writeFileSync(USAGE_ATTEMPT_FILE, new Date().toISOString()); } catch {}
+    fetch(USAGE_URL, {
+      headers: {
+        authorization: 'Bearer ' + creds.token,
+        'anthropic-beta': USAGE_BETA,
+        accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then(u => {
+        // A 200 carrying no windows is a failure, not an empty account — writing it
+        // would park a useless file in front of Claude Code's own usable cache.
+        if (!normalizeUsageWindows(u)) throw new Error('no usage windows in response');
+        atomicWrite(USAGE_FILE, {
+          _comment: 'Auto-generated by ccbb from the account usage endpoint. Percentages and reset times only — no credentials. Safe to delete.',
+          accountUuid: account.accountUuid,
+          fetchedAtMs: Date.now(),
+          utilization: u,
+        });
+        try { fs.unlinkSync(USAGE_ATTEMPT_FILE); } catch {}
+      })
+      .catch(() => { /* leave the previous file and let the throttle hold us off */ })
+      .finally(() => { usageRefreshing = false; });
+  } catch { usageRefreshing = false; }
+}
+// This server's subscription, or null when it isn't on one. Kicks the background
+// refresh and answers from whatever is already on disk.
+function getSubscription() {
+  const account = subscriptionAccount();
+  if (!account) return null;
+  maybeRefreshUsage();
+  const readings = [];
+  let live = null;
+  try { live = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch {}
+  // A reading stamped with a different account is a leftover from a previous login.
+  if (live && live.accountUuid === account.accountUuid)
+    readings.push({ at: Number(live.fetchedAtMs) || 0, u: live.utilization, source: 'api' });
+  const cached = (readClaudeJson() || {}).cachedUsageUtilization;
+  if (cached && (!cached.accountUuid || cached.accountUuid === account.accountUuid))
+    readings.push({ at: Number(cached.fetchedAtMs) || 0, u: cached.utilization, source: 'claude-code' });
+  readings.sort((a, b) => b.at - a.at);
+  const creds = oauthCreds();
+  const out = {
+    server: serverIdentity().name,
+    account,
+    plan: (creds && creds.subscriptionType) || account.orgType || '',
+    windows: null, fetchedAt: null, source: null,
+  };
+  for (const r of readings) {
+    const windows = normalizeUsageWindows(r.u);
+    if (!windows) continue;
+    out.windows = windows; out.fetchedAt = r.at || null; out.source = r.source;
+    break;
+  }
+  return out;
+}
+
 // ── Period keys ──────────────────────────────────────────────────────────────
 // Local-time period bucket key for a timestamp: day→YYYY-MM-DD, month→YYYY-MM,
 // week→the Monday of the local week as YYYY-MM-DD.
@@ -1562,6 +1719,8 @@ module.exports = {
   loadStatsCache, saveStatsCache, sessionSig, pruneStatsCache,
   // listing + cost summary
   getSessions, listSessions, sessionContribution, getCostSummary,
+  // subscription usage windows
+  getSubscription, subscriptionAccount, maybeRefreshUsage, USAGE_FILE,
   // liveness + mutation
   pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
