@@ -420,36 +420,72 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .cmd-content.diff .hljs-addition{background:#e6ffec;color:#1a7f37;display:inline-block;width:100%}
 .cmd-content.diff .hljs-deletion{background:#ffebe9;color:#cf222e;display:inline-block;width:100%}
 .input-area{border-top:1px solid var(--line);padding:10px 16px;background:var(--bg);flex-shrink:0;display:flex;flex-direction:column;align-items:center}
-.input-inner{width:100%;max-width:740px}
-.input-row{display:flex;gap:8px;align-items:flex-end;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:6px 6px 6px 14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.input-inner{position:relative;width:100%;max-width:740px}
+/* History and expand live ABOVE the box, and only while it has focus: at rest the composer
+   is one line and a send button, and three cold controls would cost the transcript a row
+   for nothing. Driven by :focus-within rather than a blur handler — focusout fires before
+   the button's own click, so JS that hid this row would eat every press on it.
+   Floating (absolute, out of flow) rather than a row of its own: appearing and vanishing
+   as the focus comes and goes, an in-flow row would shove the whole transcript up and
+   back down again on every click into the box. Out of flow it costs nothing and moves
+   nothing — it just hangs over the last line of the transcript while you type. */
+.input-tools{position:absolute;right:0;bottom:100%;margin-bottom:6px;z-index:6;
+  display:flex;align-items:center;gap:4px;
+  opacity:0;transform:translateY(4px);pointer-events:none;
+  transition:opacity .12s ease,transform .12s ease}
+.input-inner:focus-within>.input-tools{opacity:1;transform:none}
+/* Only the buttons take clicks, never the gaps between them: this thing hovers over the
+   transcript, and its dead space must not swallow a click meant for what is underneath. */
+.input-tools>*{pointer-events:none}
+.input-inner:focus-within>.input-tools>*{pointer-events:auto}
+.input-row{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:5px 5px 5px 12px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .input-row:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-/* Fixed-width, like the terminal: a prompt is usually code, paths and flags, and a
+/* A contenteditable, not a textarea, for one reason: the send button sits in a notch cut
+   out of the LAST line of the text — the floated ::after below — so every line above it
+   runs the full width of the box. Nothing flows around a float inside a textarea. The
+   rest of the file still talks to this like a textarea; asTextarea() is what makes that
+   true. Fixed-width, like the terminal: a prompt is usually code, paths and flags, and a
    proportional font makes those hard to line up and hard to proofread. */
-.input-box{flex:1;border:none;background:none;padding:4px 0;font-size:13px;
-  font-family:ui-monospace,Menlo,Consolas,'Cascadia Code',monospace;resize:none;
-  min-height:28px;max-height:200px;line-height:1.5;overflow-y:auto;color:var(--ink)}
-.input-box:focus{outline:none}
+.input-box{border:none;background:none;padding:3px 0;font-size:13px;
+  font-family:ui-monospace,Menlo,Consolas,'Cascadia Code',monospace;
+  min-height:24px;max-height:200px;line-height:1.5;overflow-y:auto;color:var(--ink);
+  white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;outline:none;cursor:text}
+/* The notch itself. overflow-y:auto above is load-bearing twice over: it scrolls a long
+   prompt AND makes this box a block formatting context, without which the float would
+   escape the box instead of stretching it to fit. */
+.input-box::after{content:'';display:block;float:right;width:32px;height:24px}
+.input-box.empty::before{content:attr(data-ph);color:var(--ink-faint);pointer-events:none}
 /* Maximized composer: the whole content area of the session, for writing something long
    enough that a five-line box is in the way. Everything above it is hidden rather than
-   scrolled off, so the textarea gets the full height instead of a share of it. */
+   scrolled off, so the editor gets the full height instead of a share of it. The notch
+   goes away here — the text starts at the top of a tall box while the button stays in the
+   corner, so a last-line cutout would be nowhere near it; a reserved strip does the job. */
 .view-body.input-max>.sv-stats,.view-body.input-max>.tr-wrap,.view-body.input-max>.cmd-box{display:none}
 .view-body.input-max>.input-area{flex:1 1 auto;min-height:0;border-top:none}
 .view-body.input-max .input-inner{max-width:none;height:100%;display:flex;flex-direction:column}
-.view-body.input-max .input-row{flex:1 1 auto;min-height:0;align-items:stretch}
-.view-body.input-max .input-box{max-height:none;height:100%}
-.view-body.input-max .input-btns{align-self:flex-end}
-/* Laid out in a ROW, not a column: stacked buttons make this box taller than a one-line
-   textarea, and with align-items:flex-end that surplus becomes dead space above the
-   textarea that swallows clicks instead of focusing it. */
-.input-btns{display:flex;align-items:center;gap:4px;flex-shrink:0}
-.exp-btn,.hist-btn{background:none;border:1px solid var(--line);color:var(--ink-soft);
-  width:28px;height:30px;border-radius:9px;font-size:12px;cursor:pointer;font-family:inherit;
-  flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
+.view-body.input-max .input-row{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+.view-body.input-max .input-box{flex:1 1 auto;min-height:0;max-height:none;padding-bottom:32px}
+.view-body.input-max .input-box::after{display:none}
+/* Maximized there is no transcript left to float over, and the row is wanted whether or
+   not the box has the focus — so it goes back into the flow, at the top of the editor. */
+.view-body.input-max .input-tools{position:static;margin:0 0 5px;justify-content:flex-end;
+  opacity:1;transform:none;pointer-events:auto}
+.view-body.input-max .input-tools>*{pointer-events:auto}
+/* Opaque, and shadowed: floating over the transcript, a transparent button would have
+   somebody else's words showing through it. */
+.exp-btn,.hist-btn{background:var(--surface);border:1px solid var(--line);color:var(--ink-soft);
+  width:28px;height:28px;border-radius:9px;font-size:12px;cursor:pointer;font-family:inherit;
+  flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0;
+  box-shadow:0 1px 4px rgba(0,0,0,.10)}
 .exp-btn:hover:not(:disabled),.hist-btn:hover:not(:disabled){border-color:var(--accent);color:var(--ink);background:var(--accent-soft)}
 .exp-btn:disabled,.hist-btn:disabled{opacity:.35;cursor:default}
 .hist-btn{font-size:10px}
-.hist-sep{width:1px;height:20px;background:var(--line);flex-shrink:0;margin:0 2px}
-.send-btn{background:var(--accent);border:none;color:#fff;width:30px;height:30px;border-radius:9px;font-size:15px;cursor:pointer;font-family:inherit;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+/* A spacer, not a rule: a bare 1px line hanging over the transcript reads as a rendering
+   artifact, and the buttons already separate themselves now that each has a background.
+   Called .tool-gap and not .hist-sep because that name is already taken further up by the
+   dashed "older history" divider, whose border-bottom was showing through this one. */
+.tool-gap{width:5px;flex-shrink:0}
+.send-btn{position:absolute;right:5px;bottom:5px;background:var(--accent);border:none;color:#fff;width:24px;height:24px;border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;padding:0}
 .send-btn:hover:not(:disabled){background:var(--accent-hover,#a84f34)}
 .send-btn:disabled{opacity:.4;cursor:default}
 /* ── ssh terminal ──
@@ -578,7 +614,66 @@ function toast(msg){
   t.textContent = msg; t.style.display = 'block';
   clearTimeout(toastTimer); toastTimer = setTimeout(function(){ t.style.display = 'none'; }, 4000);
 }
-function autoGrow(el){ el.style.height='auto'; el.style.height=Math.min(200, Math.max(28, el.scrollHeight))+'px'; }
+// ── the composer's editable ───────────────────────────────────────────────────
+// Makes a contenteditable div answer to the three textarea properties the composer code
+// uses — value, placeholder, setSelectionRange — so the swap costs nothing above this
+// line. It has to be a div: the send button sits in a notch cut out of the last line by
+// a floated ::after, and a textarea has no inline content for a float to displace.
+// Sizing is CSS now (min-height/max-height), so there is no autoGrow to call: a div is
+// exactly as tall as its text.
+function asTextarea(el){
+  el.setAttribute('contenteditable', 'plaintext-only');
+  el.setAttribute('spellcheck', 'false');
+  // Paste is flattened by hand rather than left to plaintext-only: Firefox before 136
+  // ignores that value and silently falls back to full rich-text editing, and a pasted
+  // stack trace would arrive as markup. execCommand, deprecated as it is, is the only
+  // insert that the browser's own undo stack still knows about.
+  el.addEventListener('paste', function(e){
+    var cd = e.clipboardData || window.clipboardData;
+    if (!cd) return;
+    e.preventDefault();
+    document.execCommand('insertText', false, cd.getData('text/plain'));
+  });
+  // :empty is not usable for the placeholder — browsers leave a stray <br> behind in an
+  // "empty" editable — so the class is maintained by hand.
+  function sync(){ el.classList.toggle('empty', !el.innerText); }
+  el.addEventListener('input', sync);
+  Object.defineProperty(el, 'value', {
+    // innerText, not textContent: it is the one reader that turns however this browser
+    // chose to represent the line breaks (<br>, nested divs) back into real newlines.
+    // Trailing ones go: an editable keeps a bogus block after the last line, so a prompt
+    // ended with Enter would arrive at the pane with a blank line after it — which in a
+    // pane that submits on Enter is not a cosmetic difference.
+    get: function(){ return el.innerText.replace(/\\n+$/, ''); },
+    set: function(v){ el.textContent = v == null ? '' : String(v); sync(); }
+  });
+  Object.defineProperty(el, 'placeholder', {
+    get: function(){ return el.getAttribute('data-ph') || ''; },
+    set: function(v){ el.setAttribute('data-ph', v == null ? '' : String(v)); }
+  });
+  // Only ever called collapsed (start === end): the history buttons put the caret at one
+  // end of what they just dropped in.
+  el.setSelectionRange = function(_start, end){ edCaret(el, end); };
+  sync();
+  return el;
+}
+function edCaret(el, pos){
+  var sel = window.getSelection();
+  if (!sel) return;
+  var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+  var n, seen = 0, node = null, off = 0;
+  while ((n = walker.nextNode())) {
+    node = n; off = n.nodeValue.length;
+    if (seen + off >= pos) { off = pos - seen; break; }
+    seen += off;
+  }
+  var r = document.createRange();
+  if (node) r.setStart(node, Math.max(0, Math.min(off, node.nodeValue.length)));
+  else r.selectNodeContents(el);
+  r.collapse(true);
+  sel.removeAllRanges(); sel.addRange(r);
+  el.focus();
+}
 function toggleTool(hdr) {
   var body = hdr.nextElementSibling, toggle = hdr.querySelector('.tool-toggle');
   var open = body.classList.toggle('open');
@@ -1159,16 +1254,18 @@ function createSessionView(INFO){
         '</div></div>'+
       '<div class="cmd-content"></div>'+
     '</div>'+
-    '<div class="input-area"><div class="input-inner"><div class="input-row">'+
-      '<textarea class="input-box" placeholder="Message the session…  (// for commands)" rows="1"></textarea>'+
-      '<div class="input-btns">'+
+    '<div class="input-area"><div class="input-inner">'+
+      '<div class="input-tools">'+
         '<button class="hist-btn" data-h="prev" title="'+HIST_PREV_TIP+'">&#9650;</button>'+
         '<button class="hist-btn" data-h="next" title="'+HIST_NEXT_TIP+'">&#9660;</button>'+
-        '<span class="hist-sep"></span>'+
+        '<span class="tool-gap"></span>'+
         '<button class="exp-btn" title="'+EXPAND_TIP+'">&#9633;</button>'+
+      '</div>'+
+      '<div class="input-row">'+
+        '<div class="input-box" data-ph="Message the session…  (// for commands)"></div>'+
         '<button class="send-btn" title="'+SEND_TIP+'">&#8593;</button>'+
       '</div>'+
-    '</div></div></div>';
+    '</div></div>';
   el.appendChild(body);
   v.bodyEl = body;
   var projEl = body.querySelector('.hdr-proj');
@@ -1180,10 +1277,10 @@ function createSessionView(INFO){
   var cmdBox = body.querySelector('.cmd-box');
   var cmdTitle = body.querySelector('.cmd-title');
   var cmdContent = body.querySelector('.cmd-content');
-  var inputBox = body.querySelector('.input-box');
+  var inputBox = asTextarea(body.querySelector('.input-box'));
   var sendBtn = body.querySelector('.send-btn');
   var expBtn = body.querySelector('.exp-btn');
-  var inputBtns = body.querySelector('.input-btns');
+  var inputTools = body.querySelector('.input-tools');
   var histPrevBtn = body.querySelector('.hist-btn[data-h="prev"]');
   var histNextBtn = body.querySelector('.hist-btn[data-h="next"]');
 
@@ -1942,7 +2039,6 @@ function createSessionView(INFO){
     syncCmdBtns();
   });
   sendBtn.addEventListener('click', sendMessage);
-  inputBox.addEventListener('input', function(){ if (!inputMaxed()) autoGrow(inputBox); });
 
   // — expand —
   function inputMaxed(){ return body.classList.contains('input-max'); }
@@ -1950,8 +2046,6 @@ function createSessionView(INFO){
     body.classList.toggle('input-max', !!on);
     expBtn.innerHTML = on ? '&#10064;' : '&#9633;';
     expBtn.title = on ? 'Shrink the composer back' : EXPAND_TIP;
-    if (on) inputBox.style.height = '';   // the class drives the height from here
-    else autoGrow(inputBox);
     inputBox.focus();
   }
   expBtn.addEventListener('click', function(){ setInputMax(!inputMaxed()); });
@@ -1980,7 +2074,6 @@ function createSessionView(INFO){
   }
   function histShow(text, toEnd){
     inputBox.value = text;
-    if (!inputMaxed()) autoGrow(inputBox);
     var at = toEnd ? text.length : 0;
     try { inputBox.setSelectionRange(at, at); } catch(e) {}
     histSync();
@@ -2001,7 +2094,7 @@ function createSessionView(INFO){
   }
   // mousedown is where focus is lost, so that is where it is refused: the caret stays in
   // the textarea and the click never takes it away.
-  inputBtns.addEventListener('mousedown', function(e){ if (e.target.closest('.hist-btn,.exp-btn')) e.preventDefault(); });
+  inputTools.addEventListener('mousedown', function(e){ if (e.target.closest('.hist-btn,.exp-btn')) e.preventDefault(); });
   histPrevBtn.addEventListener('click', function(){ histWalk(-1); inputBox.focus(); });
   histNextBtn.addEventListener('click', function(){ histWalk(1); inputBox.focus(); });
   // Clicking anywhere in the composer's frame — the padding, the gap beside the buttons —
@@ -2056,7 +2149,6 @@ function createSessionView(INFO){
   renderTitle();
   renderStats(INFO.stats);
   setStatus({ live: INFO.live, status: INFO.liveStatus, statusUpdatedAt: INFO.liveStatusAt });
-  autoGrow(inputBox);
   refreshDrivable();
   connect();
   loadHistory();

@@ -165,6 +165,12 @@ const MOBILE_HTML = `<!DOCTYPE html>
   --ink-faint:#9b998f; --line:#e6e3da; --accent:#c96442; --accent-soft:#f5e9e3;
   --code-bg:#f5f3ec; --warn:#bf5b12; --ok:#2da44e; --err:#cf222e;
   --head-h:44px;
+  /* Every safe-area inset in this file goes through these two rather than calling env()
+     at each site, so that the whole set can be reasoned about — and overridden — in one
+     place. Note they are 0 in an ordinary Safari tab, where the page never reaches the
+     unsafe areas in the first place; they only become real in standalone (Home Screen),
+     which is how this front-end is meant to be run. */
+  --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
 }
 @media (prefers-color-scheme: dark){
   :root{
@@ -177,13 +183,20 @@ const MOBILE_HTML = `<!DOCTYPE html>
 html,body{overscroll-behavior:none}
 body{
   font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  /* This colour does more work than it looks like. iOS Safari tints its own chrome — the
+     status-bar band above the page and the strip under it that holds the floating tab
+     bar — with the page's canvas background, and those two bands are most of the screen
+     the app does not otherwise get. Keeping them the same colour as the panel headers
+     (and as .composer, below) is what makes the app read as running edge to edge instead
+     of as a page with a stripe above and below it. In standalone mode, where there is no
+     Safari chrome, this same colour fills the safe-area padding, to the same effect. */
   font-size:15px;background:var(--bg-alt);color:var(--ink);
   /* --app-h tracks visualViewport: on iOS the URL bar and the keyboard both change the
      usable height without changing 100dvh, and a stack sized to the wrong number puts
      the composer under the keyboard. Falls back to dvh before the first measurement. */
   height:var(--app-h,100dvh);
   display:flex;flex-direction:column;overflow:hidden;
-  padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);
+  padding-top:var(--safe-t);padding-bottom:var(--safe-b);
   -webkit-font-smoothing:antialiased;
 }
 #stack{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--bg)}
@@ -358,32 +371,82 @@ body.has-max .panel:not(.max){display:none}
   font-size:11.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word;overflow:auto}
 .cmd-content.code pre{white-space:pre;word-break:normal}
 /* ── composer ── */
-/* The buttons sit on their own row under the box, not beside it: a phone line is ~40
-   characters wide as it is, and four controls in the same row cost a third of it. */
-.composer{flex:0 0 auto;display:flex;flex-direction:column;gap:6px;
-  border-top:1px solid var(--line);background:var(--bg);padding:8px 10px}
-/* 16px exactly: anything smaller and iOS Safari zooms the page on focus, which leaves the
+/* --bg-alt, the header colour, not --bg: this is the bottom edge of the app, and Safari
+   tints the strip under it with the page's canvas colour (see body). Matching the two
+   means the composer runs into Safari's chrome instead of stopping at a seam. The white
+   is still there — it is the input card (.cwrap) sitting on this ground. */
+.composer{position:relative;flex:0 0 auto;display:flex;flex-direction:column;
+  border-top:1px solid var(--line);background:var(--bg-alt);padding:8px 10px}
+/* History and maximize sit ABOVE the box and only while it has focus: at rest the
+   composer is one line and a send button, which is all a phone should spend on it.
+   Floating (absolute, out of flow) rather than a row of its own: appearing and vanishing
+   with the focus, an in-flow row would shove the whole transcript up and back down on
+   every tap into the box — and on a phone the keyboard is already doing that once.
+   Two selectors for the open state, and both are needed. :focus-within is the honest one.
+   .cfocus is for iOS, which does not focus a button on tap — it just blurs whatever had
+   the focus, so :focus-within alone would fold this row away on pointerdown and the tap
+   would land on the transcript behind it. See the pressedOwn flag. */
+.cbtns{position:absolute;right:10px;bottom:100%;margin-bottom:8px;z-index:8;
+  display:flex;align-items:center;gap:6px;pointer-events:none;
+  opacity:0;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease}
+.composer:focus-within .cbtns,.composer.cfocus .cbtns,.pbody.cmax .cbtns{opacity:1;transform:none}
+/* Only the buttons take taps, never the gaps between them: this thing hovers over the
+   transcript — and over the bottom of a sticky permission card — so its dead space must
+   not swallow a tap meant for what is underneath. */
+.cbtns>*{pointer-events:none}
+.composer:focus-within .cbtns>*,.composer.cfocus .cbtns>*,.pbody.cmax .cbtns>*{pointer-events:auto}
+.cwrap{position:relative;background:var(--surface);border:1px solid var(--line);
+  border-radius:14px;padding:7px 6px 7px 12px}
+.cwrap:focus-within{border-color:var(--accent)}
+/* A contenteditable, not a textarea, for one reason: the send button sits in a notch cut
+   out of the LAST line of the text — the floated ::after below — so every line above it
+   runs the full width of the box, and 40 phone columns are too few to give any of them
+   away. Nothing flows around a float inside a textarea. See asTextarea().
+   16px exactly: anything smaller and iOS Safari zooms the page on focus, which leaves the
    layout scaled and the composer half off-screen after the keyboard closes. */
-.cbox{width:100%;box-sizing:border-box;background:var(--surface);border:1px solid var(--line);
-  border-radius:14px;padding:8px 12px;font-size:16px;line-height:1.4;
-  font-family:ui-monospace,Menlo,Consolas,monospace;resize:none;min-height:38px;max-height:38vh;
-  overflow-y:auto;color:var(--ink)}
-.cbox:focus{outline:none;border-color:var(--accent)}
-.cbtns{display:flex;align-items:center;gap:6px;flex-shrink:0}
-/* Prompt history is a maximized-editor affordance: at one visible line, replacing the box
-   contents from under the caret is more surprise than help. */
-.cbtn.hist{display:none}
-.pbody.cmax .cbtn.hist{display:flex}
-.cbtns .send{margin-left:auto}
-/* Maximized: the editor takes the panel, the way a maximized panel takes the screen. */
-.pbody.cmax .trwrap,.pbody.cmax .cmd-box{display:none}
-.pbody.cmax .composer{flex:1 1 auto;min-height:0}
-.pbody.cmax .cbox{flex:1 1 auto;height:auto!important;max-height:none}
-.cbtn{background:none;border:1px solid var(--line);color:var(--ink-soft);width:36px;height:36px;
-  border-radius:10px;font-size:12px;font-family:inherit;display:flex;align-items:center;justify-content:center}
+.cbox{font-size:16px;line-height:1.5;font-family:ui-monospace,Menlo,Consolas,monospace;
+  min-height:32px;max-height:38vh;overflow-y:auto;color:var(--ink);outline:none;
+  white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}
+/* The notch. overflow-y:auto above is load-bearing twice over: it scrolls a long prompt
+   AND makes this box a block formatting context, without which the float would escape
+   the box instead of stretching it to fit. */
+.cbox::after{content:'';display:block;float:right;width:42px;height:32px}
+.cbox.empty::before{content:attr(data-ph);color:var(--ink-faint)}
+/* Opaque, and shadowed: floating over the transcript, a transparent button would have
+   somebody else's words showing through it. */
+.cbtn{background:var(--surface);border:1px solid var(--line);color:var(--ink-soft);width:36px;height:36px;
+  border-radius:10px;font-size:12px;font-family:inherit;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 1px 5px rgba(0,0,0,.14)}
 .cbtn:disabled{opacity:.35}
-.send{background:var(--accent);border:none;color:#fff;width:38px;height:38px;border-radius:12px;font-size:17px}
+.cbtn.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.send{position:absolute;right:6px;bottom:6px;background:var(--accent);border:none;color:#fff;
+  width:32px;height:32px;border-radius:11px;font-size:16px;padding:0;
+  display:flex;align-items:center;justify-content:center}
 .send:disabled{opacity:.4}
+/* Maximized: the composer leaves its panel and takes the whole screen. A phone panel is a
+   third of the display, which is not enough to write a prompt in — and the panel is the
+   only thing worth looking at while you write anyway.
+   Sized from --app-h and never inset:0: the visual viewport shrinks under the keyboard
+   while 100vh does not, so a bottom-anchored send button would sit behind the keys. Its
+   own safe-area padding, because a fixed box is not inside body's.
+   UNVERIFIED against a real on-screen keyboard — the simulator will not raise one
+   without a physical tap. If the box turns out to be mispositioned with the keyboard up,
+   the thing to look at is visualViewport.offsetTop: iOS anchors position:fixed to the
+   LAYOUT viewport, and the keyboard can slide the visual viewport down inside it. */
+body.comp-max .pbody.cmax .composer{position:fixed;top:0;left:0;right:0;height:var(--app-h,100dvh);
+  z-index:150;border-top:none;
+  padding-top:calc(8px + var(--safe-t));
+  padding-bottom:calc(8px + var(--safe-b))}
+/* Full screen there is no transcript left to float over, and bottom:100% of a composer
+   pinned to top:0 would put the row off the top of the screen — so it goes back into the
+   flow, above the editor, where the restore button is the way back out. */
+body.comp-max .pbody.cmax .cbtns{position:static;margin:0 0 8px;justify-content:flex-end}
+body.comp-max .pbody.cmax .cwrap{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+/* No notch here — the text starts at the top of a full-screen box while the button stays
+   in the corner, so a last-line cutout would be nowhere near it. A reserved strip at the
+   bottom does the same job. */
+body.comp-max .pbody.cmax .cbox{flex:1 1 auto;min-height:0;max-height:none;padding-bottom:38px}
+body.comp-max .pbody.cmax .cbox::after{display:none}
 .jump{position:absolute;left:50%;transform:translateX(-50%);bottom:8px;display:none;
   background:var(--accent);color:#fff;border:none;border-radius:999px;padding:7px 14px;font-size:12px;
   font-family:inherit;z-index:6;box-shadow:0 2px 10px rgba(0,0,0,.25)}
@@ -394,7 +457,7 @@ body.has-max .panel:not(.max){display:none}
    fixed width, so the phone adapts by shrinking the type until 80 columns fit rather
    than by reflowing to 40 and wrapping every box-drawing line. */
 #termwrap{position:fixed;inset:0;z-index:200;display:none;flex-direction:column;background:#fff;
-  padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+  padding-top:var(--safe-t);padding-bottom:var(--safe-b)}
 #termwrap.show{display:flex}
 #termwrap.dark{background:#000}
 .thead{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding:0 4px 0 12px;min-height:var(--head-h);
@@ -417,7 +480,7 @@ body.has-max .panel:not(.max){display:none}
 /* pointer-events:none is not cosmetic: the toast sits over the composer, and a "send
    failed" message that swallowed the next tap on the send button would make the failure
    look permanent. */
-#toast{position:fixed;left:12px;right:12px;bottom:calc(14px + env(safe-area-inset-bottom));
+#toast{position:fixed;left:12px;right:12px;bottom:calc(14px + var(--safe-b));
   background:#3d3d3a;color:#fff;border-radius:12px;padding:11px 14px;font-size:13px;z-index:300;
   display:none;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none}
 </style>
@@ -502,6 +565,56 @@ function el(tag, cls, html){
   return e;
 }
 
+// ── the composer's editable ───────────────────────────────────────────────────
+// Makes a contenteditable div answer to the two textarea properties the composer code
+// uses — value and placeholder — so the swap costs nothing outside this function. It has
+// to be a div: the send button sits in a notch cut out of the last line by a floated
+// ::after, and a textarea has no inline content for a float to displace. Sizing is CSS
+// now (min-height/max-height), so there is no autoGrow: a div is as tall as its text.
+function asTextarea(el){
+  el.setAttribute('contenteditable', 'plaintext-only');
+  el.setAttribute('spellcheck', 'false');
+  // Paste is flattened by hand rather than left to plaintext-only: Firefox before 136
+  // ignores that value and silently falls back to full rich-text editing. execCommand,
+  // deprecated as it is, is the only insert the browser's own undo stack still knows.
+  el.addEventListener('paste', function(e){
+    var cd = e.clipboardData || window.clipboardData;
+    if (!cd) return;
+    e.preventDefault();
+    document.execCommand('insertText', false, cd.getData('text/plain'));
+  });
+  // :empty is not usable for the placeholder — browsers leave a stray <br> behind in an
+  // "empty" editable — so the class is maintained by hand.
+  function sync(){ el.classList.toggle('empty', !el.innerText); }
+  el.addEventListener('input', sync);
+  Object.defineProperty(el, 'value', {
+    // innerText, not textContent: it is the one reader that turns however this browser
+    // chose to represent the line breaks (<br>, nested divs) back into real newlines.
+    // Trailing ones go: an editable keeps a bogus block after the last line, so a prompt
+    // ended with Enter would arrive at the pane with a blank line after it — which in a
+    // pane that submits on Enter is not a cosmetic difference.
+    get: function(){ return el.innerText.replace(/\\n+$/, ''); },
+    set: function(v){
+      el.textContent = v == null ? '' : String(v);
+      sync();
+      // The history buttons replace the whole text; leave the caret at the end of it, the
+      // way arrowing back through a shell history does.
+      var sel = window.getSelection();
+      if (sel && document.activeElement === el) {
+        var r = document.createRange();
+        r.selectNodeContents(el); r.collapse(false);
+        sel.removeAllRanges(); sel.addRange(r);
+      }
+    }
+  });
+  Object.defineProperty(el, 'placeholder', {
+    get: function(){ return el.getAttribute('data-ph') || ''; },
+    set: function(v){ el.setAttribute('data-ph', v == null ? '' : String(v)); }
+  });
+  sync();
+  return el;
+}
+
 // ── viewport ──────────────────────────────────────────────────────────────────
 // iOS reports a 100dvh that includes the space the keyboard is covering, so the stack is
 // sized from visualViewport instead. The scrollTo(0,0) undoes Safari's habit of scrolling
@@ -509,7 +622,8 @@ function el(tag, cls, html){
 function syncViewport(){
   var vv = window.visualViewport;
   var h = vv ? vv.height : window.innerHeight;
-  document.documentElement.style.setProperty('--app-h', Math.round(h)+'px');
+  var doc = document.documentElement;
+  doc.style.setProperty('--app-h', Math.round(h)+'px');
   if (window.scrollY !== 0) window.scrollTo(0, 0);
 }
 if (window.visualViewport) {
@@ -523,9 +637,15 @@ syncViewport();
 // ── panel stack ───────────────────────────────────────────────────────────────
 var stackEl = document.getElementById('stack');
 var panels = [];
+// The maximized composer covers the whole screen, so at most one may be open; this is the
+// setter of whichever session owns it, or null. See setComposerMax.
+var compMaxOwner = null;
 // Accordion: expanding one panel minimizes the rest. 'max' additionally hides every
 // other panel's header, so a maximized session is the whole screen.
 function setState(p, st){
+  // A full-screen composer is fixed inside its panel's body, so it vanishes the moment
+  // that panel is minimized or hidden behind another's maximize. Fold it first.
+  if (compMaxOwner) compMaxOwner(false);
   if (st !== 'min') {
     panels.forEach(function(q){ if (q !== p) { q.state='min'; applyState(q); } });
   }
@@ -782,11 +902,13 @@ function createSessionPanel(sid, server){
       '<div class="cmd-content" data-r="cmdbody"></div>'+
     '</div>'+
     '<div class="composer">'+
-      '<textarea class="cbox" data-r="box" rows="1" placeholder="Message the session…"></textarea>'+
       '<div class="cbtns">'+
+        '<button class="cbtn" data-c="prev" title="Previous prompt">'+ICON.up+'</button>'+
+        '<button class="cbtn" data-c="next" title="Next prompt">'+ICON.down+'</button>'+
         '<button class="cbtn" data-c="cmax" title="Maximize editor">'+ICON.max+'</button>'+
-        '<button class="cbtn hist" data-c="prev" title="Previous prompt">'+ICON.up+'</button>'+
-        '<button class="cbtn hist" data-c="next" title="Next prompt">'+ICON.down+'</button>'+
+      '</div>'+
+      '<div class="cwrap">'+
+        '<div class="cbox" data-r="box" data-ph="Message the session…"></div>'+
         '<button class="send" data-c="send" title="Send">'+ICON.send+'</button>'+
       '</div>'+
     '</div>');
@@ -802,7 +924,7 @@ function createSessionPanel(sid, server){
   var cmdBox = body.querySelector('[data-r="cmd"]');
   var cmdTitle = body.querySelector('[data-r="cmdtitle"]');
   var cmdBody = body.querySelector('[data-r="cmdbody"]');
-  var boxEl = body.querySelector('[data-r="box"]');
+  var boxEl = asTextarea(body.querySelector('[data-r="box"]'));
 
   var INFO = null, STATS = null;
   var destroyed = false, ws = null, reconnectTimer = null, connected = false;
@@ -1315,37 +1437,35 @@ function createSessionPanel(sid, server){
       .then(function(d){ setDrivable(!!(d && d.pane)); })
       .catch(function(){ setDrivable(false); });
   }
-  // Maximized, the box is sized by flex, so the measured height must not fight it.
   var composerMax = false;
-  function autoGrow(){
-    if (composerMax) { boxEl.style.height = ''; return; }
-    boxEl.style.height = 'auto';
-    boxEl.style.height = Math.min(window.innerHeight*0.38, Math.max(38, boxEl.scrollHeight)) + 'px';
-  }
-  boxEl.addEventListener('input', autoGrow);
+  // Maximizing takes the whole screen, not just this panel, so at most one composer can
+  // own it — a second one would leave the first stranded full-screen behind it.
   function setComposerMax(on){
-    composerMax = !!on;
-    body.classList.toggle('cmax', composerMax);
+    on = !!on;
+    if (on && compMaxOwner && compMaxOwner !== setComposerMax) compMaxOwner(false);
+    composerMax = on;
+    compMaxOwner = on ? setComposerMax : (compMaxOwner === setComposerMax ? null : compMaxOwner);
+    body.classList.toggle('cmax', on);
+    document.body.classList.toggle('comp-max', on);
     var b = body.querySelector('[data-c="cmax"]');
-    b.innerHTML = composerMax ? ICON.restore : ICON.max;
-    b.title = composerMax ? 'Restore editor' : 'Maximize editor';
-    b.classList.toggle('on', composerMax);
-    autoGrow();
-    if (composerMax) boxEl.focus();
+    b.innerHTML = on ? ICON.restore : ICON.max;
+    b.title = on ? 'Restore editor' : 'Maximize editor';
+    b.classList.toggle('on', on);
+    if (on) boxEl.focus();
     else if (following) transcript.scrollTop = transcript.scrollHeight;
   }
   function send(){
     var text = boxEl.value;
     if (!text.trim()) return;
     // A // command answers into .cmd-box, which the maximized editor covers.
-    if (text.trim().slice(0,2) === '//') { histAdd(text); runCmd(text.trim()); boxEl.value=''; setComposerMax(false); autoGrow(); return; }
+    if (text.trim().slice(0,2) === '//') { histAdd(text); runCmd(text.trim()); boxEl.value=''; setComposerMax(false); return; }
     if (!canDrive) { toast('Session is not running in a tmux pane on '+SRV+' — cannot send.'); return; }
     api('/api/session/'+sid+'/input', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ text: text }) })
       .then(function(r){ return r.json(); })
       .then(function(d){
         // Drop back to the transcript once it is sent — the reply is the point.
-        if (d && d.ok) { histAdd(text); boxEl.value=''; setComposerMax(false); autoGrow(); }
+        if (d && d.ok) { histAdd(text); boxEl.value=''; setComposerMax(false); }
         else toast((d && d.error) || 'Send failed');
       })
       .catch(function(e){ toast(String(e)); });
@@ -1406,18 +1526,44 @@ function createSessionPanel(sid, server){
     if (histIx === -1) { histDraft = boxEl.value; histIx = hist.length; }
     var ix = histIx + delta;
     if (ix < 0) ix = 0;
-    if (ix >= hist.length) { histIx = -1; boxEl.value = histDraft; autoGrow(); syncHist(); return; }
+    if (ix >= hist.length) { histIx = -1; boxEl.value = histDraft; syncHist(); return; }
     histIx = ix;
     boxEl.value = hist[ix];
-    autoGrow(); syncHist();
+    syncHist();
   }
-  body.querySelector('.cbtns').addEventListener('click', function(e){
+  // Bound to .composer, not .cbtns: send lives inside the box now, in the notch on the
+  // last line.
+  //
+  // The focus class is kept by hand rather than with :focus-within, because iOS does not
+  // focus a button on tap — it just blurs whatever had the focus. Under :focus-within the
+  // tools row would therefore fold away on pointerdown and the tap would land on the
+  // transcript behind it. So: remember whether the press started on one of our own
+  // buttons, and let that press keep the row open.
+  var composerEl = body.querySelector('.composer');
+  var pressedOwn = false;
+  composerEl.addEventListener('pointerdown', function(e){ pressedOwn = !!e.target.closest('button'); });
+  boxEl.addEventListener('focus', function(){ composerEl.classList.add('cfocus'); });
+  // The flag is consumed here, not in the click handler: a press that starts on a button
+  // and is dragged off never produces a click, and a flag left standing would keep the
+  // row open for good.
+  boxEl.addEventListener('blur', function(){
+    var keep = pressedOwn; pressedOwn = false;
+    if (!keep) composerEl.classList.remove('cfocus');
+  });
+  composerEl.addEventListener('click', function(e){
+    // The other consumer of the flag. Blur usually gets there first, but a tap on a
+    // button while the box was never focused (full screen, where the row is always up)
+    // produces a click and no blur at all, and the flag must not outlive the press.
+    pressedOwn = false;
     var b = e.target.closest('button');
     if (!b) return;
-    if (b.dataset.c === 'send') send();
-    else if (b.dataset.c === 'cmax') setComposerMax(!composerMax);
+    // Send is the one button that means "I am done typing": it lets the keyboard go and
+    // the tools row with it, because the reply is what you want the screen for now.
+    if (b.dataset.c === 'send') { send(); composerEl.classList.remove('cfocus'); return; }
+    if (b.dataset.c === 'cmax') setComposerMax(!composerMax);
     else if (b.dataset.c === 'prev') histWalk(-1);
     else if (b.dataset.c === 'next') histWalk(1);
+    boxEl.focus();
   });
   boxEl.addEventListener('keydown', function(e){
     // A hardware keyboard (an iPad case, a Bluetooth one) should send on Enter the way
@@ -1488,6 +1634,9 @@ function createSessionPanel(sid, server){
 
   p.destroy = function(){
     destroyed = true;
+    // Before anything else: a closing panel that still owns the full-screen composer
+    // would leave document.body wearing comp-max with nothing left to fill it.
+    if (composerMax) setComposerMax(false);
     clearInterval(tick); clearInterval(liveTimer); clearTimeout(reconnectTimer);
     try { mo.disconnect(); } catch(e){}
     if (ws) { try { ws.close(); } catch(e){} }
