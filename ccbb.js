@@ -152,7 +152,10 @@ function sortSessions(sessions, opt) {
   if (opt.reverse) dir = dir === 'asc' ? 'desc' : 'asc';
   const col = spec.col;
   const sorted = sessions.slice().sort((a, b) => {
-    let va = a[col], vb = b[col];
+    // A just-started session has no activity yet — sort it by when it started, so it
+    // lands at the top of the default view instead of the bottom.
+    let va = col === 'lastActivity' ? (a.lastActivity || a.startedAt) : a[col];
+    let vb = col === 'lastActivity' ? (b.lastActivity || b.startedAt) : b[col];
     let cmp;
     if (va == null && vb == null) cmp = 0;
     else if (va == null) cmp = 1;

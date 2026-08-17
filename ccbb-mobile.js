@@ -230,6 +230,10 @@ body.has-max .panel:not(.max){display:none}
 .ago{font-size:11.5px;color:var(--ink-faint);flex-shrink:0}
 /* ── session list ── */
 .srvbar{flex:0 0 auto;display:flex;gap:6px;padding:8px 12px;overflow-x:auto;border-bottom:1px solid var(--line);background:var(--bg)}
+/* Cost scope: all time, or one month — the same choice the desktop summary offers. */
+.scopebar{flex:0 0 auto;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--bg)}
+.scope{font:inherit;font-size:12px;color:var(--ink);background:var(--bg);border:1px solid var(--line);
+  border-radius:6px;padding:4px 8px;width:100%}
 .chip{flex-shrink:0;display:flex;align-items:center;gap:6px;border:1px solid var(--line);
   border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--ink-soft);background:var(--bg-alt)}
 .chip.on{border-color:var(--accent);color:var(--ink);background:var(--accent-soft)}
@@ -452,6 +456,11 @@ body.comp-max .pbody.cmax .cbox::after{display:none}
   font-family:inherit;z-index:6;box-shadow:0 2px 10px rgba(0,0,0,.25)}
 .jump.show{display:block}
 .trwrap{position:relative;flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+/* The unloaded middle of a windowed transcript — fills itself in when scrolled into view. */
+.hgap{display:flex;align-items:center;justify-content:center;gap:10px;margin:8px 0;padding:5px 2px;
+  font-size:11px;color:var(--ink-faint);border-top:1px dashed var(--line);border-bottom:1px dashed var(--line)}
+.hgap button{font:inherit;font-size:11px;color:var(--accent);background:none;border:none;padding:2px 4px}
+.hgap.loading{opacity:.5;pointer-events:none}
 /* ── terminal ──
    Always full screen, and always 80 columns: Claude Code's own output is laid out for a
    fixed width, so the phone adapts by shrinking the type until 80 columns fit rather
@@ -517,6 +526,11 @@ function ltr(s){ return '\\u202A' + String(s==null?'':s) + '\\u202C'; }
 function fmtCost(c){ return '$'+(+c||0).toFixed(2); }
 function fmtTokShort(n){ n=n||0; if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+'M'; if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1)+'K'; return String(n); }
 function fmtK(n){ n=n||0; return Math.round(n/1000)+'k'; }
+function fmtMonth(mk){ var p=String(mk).split('-'), names=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return (names[+p[1]-1]||mk)+' '+p[0]; }
+// Age of the list, counted up between pushes: "12s", "3m", "2h".
+function fmtAge(ms){ var s=Math.round(ms/1000); if(s<60)return s+'s'; var m=Math.round(s/60);
+  if(m<60)return m+'m'; return Math.round(m/60)+'h'; }
 function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms';
   var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s';
   var m=Math.floor(s/60); if(m<60)return m+'m'+(Math.round(s%60)?' '+Math.round(s%60)+'s':'');
@@ -702,16 +716,21 @@ function createListPanel(){
   root.appendChild(head);
   var body = el('div','pbody',
     '<div class="srvbar" data-r="srv"></div>'+
+    '<div class="scopebar"><select class="scope" data-r="scope"></select></div>'+
     '<div class="rows" data-r="rows"><div class="lmsg">Loading…</div></div>'+
     '<div class="foot"><span data-r="tot"></span><a href="/?ui=desktop">desktop UI &#8599;</a></div>');
   root.appendChild(body);
   var agoEl = head.querySelector('[data-r="ago"]');
   var srvEl = body.querySelector('[data-r="srv"]');
+  var scopeEl = body.querySelector('[data-r="scope"]');
   var rowsEl = body.querySelector('[data-r="rows"]');
   var totEl = body.querySelector('[data-r="tot"]');
 
   var sessions = [], servers = [{ name:SELF.name, self:true, status:'up' }], errors = [];
-  var lastLoad = 0, loading = false;
+  var lastLoad = 0;
+  // Cost scope: all time, or one month. Remembered, since it is usually "this month".
+  var months = [], scopeMonth = null;
+  try { scopeMonth = localStorage.getItem('ccbb.m.scope') || null; } catch(e){}
 
   var selected = null;
   try { var raw = localStorage.getItem('ccbb.m.servers'); if (raw) selected = JSON.parse(raw); } catch(e){}
@@ -748,7 +767,9 @@ function createListPanel(){
 
   function renderRows(){
     if (!sessions.length) {
-      rowsEl.innerHTML = errors.length ? '' : '<div class="lmsg">No sessions yet.</div>';
+      // A server still opening its socket has not said "no sessions" yet.
+      var waiting = selectedServers().some(function(n){ return !srvRows[n] && !srvErr[n]; });
+      rowsEl.innerHTML = errors.length ? '' : '<div class="lmsg">'+(waiting ? 'Loading…' : 'No sessions yet.')+'</div>';
     } else {
       rowsEl.innerHTML = sessions.map(function(s){
         var live = s.live ? ' live' : '';
@@ -757,7 +778,7 @@ function createListPanel(){
             '<span class="dot'+live+'"></span>'+
             '<span class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</span>'+
             '<span class="stitle">'+esc(s.title || '(untitled)')+'</span>'+
-            '<span class="stime">'+esc(rel(s.lastActivity))+'</span>'+
+            '<span class="stime">'+esc(rel(s.lastActivity || s.startedAt))+'</span>'+
           '</div>'+
           '<div class="sdir">'+esc(ltr(s.projectPath || ''))+'</div>'+
         '</div>';
@@ -768,8 +789,11 @@ function createListPanel(){
         return '<div class="lerr">'+esc(e.server)+': '+esc(e.error)+'</div>';
       }).join(''));
     }
-    var cost = sessions.reduce(function(a,s){ return a + (s.totalCost||0); }, 0);
-    totEl.textContent = sessions.length + ' session' + (sessions.length===1?'':'s') + '  ·  ' + fmtCost(cost);
+    var cost = 0;
+    for (var n in srvRows) if (selectedServers().indexOf(n) !== -1)
+      cost += (srvRows[n].totals && srvRows[n].totals.totalCost) || 0;
+    totEl.textContent = sessions.length + ' session' + (sessions.length===1?'':'s') + '  ·  ' + fmtCost(cost) +
+      (scopeMonth ? '  ·  ' + fmtMonth(scopeMonth) : '');
   }
   rowsEl.addEventListener('click', function(e){
     var r = e.target.closest('[data-sid]');
@@ -777,17 +801,17 @@ function createListPanel(){
   });
 
   function tickAgo(){
-    agoEl.textContent = lastLoad ? 'refreshed ' + rel(lastLoad) : '';
+    // Age of the data, not of a request: "3m" means the sessions have been quiet that long.
+    agoEl.textContent = lastLoad ? fmtAge(Date.now() - lastLoad) : '';
     // Row times are relative too, and a list left open would otherwise freeze at "2m ago".
     if (lastLoad && Date.now() - lastLoad > 20000) {
       var kids = rowsEl.querySelectorAll('[data-sid]');
       for (var i = 0; i < kids.length && i < sessions.length; i++) {
         var t = kids[i].querySelector('.stime');
-        if (t) t.textContent = rel(sessions[i].lastActivity);
+        if (t) t.textContent = rel(sessions[i].lastActivity || sessions[i].startedAt);
       }
     }
   }
-  setInterval(tickAgo, 5000);
 
   function loadServers(){
     return fetch('/api/servers').then(function(r){ return r.json(); }).then(function(d){
@@ -795,28 +819,142 @@ function createListPanel(){
       renderServers();
     }).catch(function(){});
   }
-  function load(){
-    if (loading) return Promise.resolve();
-    loading = true;
-    var names = selectedServers();
-    return Promise.all(names.map(function(n){
-      var base = n === SELF.name ? '' : '/peer/'+encodeURIComponent(n);
-      return fetch(base+'/api/sessions').then(function(r){
-        if (!r.ok) throw new Error('HTTP '+r.status);
-        return r.json();
-      }).then(function(d){
-        return ((d && d.sessions) || []).map(function(s){ s.server = (n === SELF.name ? null : n); return s; });
-      }).catch(function(e){ errorsNext.push({ server:n, error:String(e.message||e) }); return []; });
-    })).then(function(lists){
-      sessions = [].concat.apply([], lists).sort(function(a,b){
-        return String(b.lastActivity||'').localeCompare(String(a.lastActivity||''));
-      });
-      errors = errorsNext; errorsNext = [];
-      lastLoad = Date.now();
-      renderRows(); tickAgo();
-    }).then(function(){ loading = false; }, function(){ loading = false; });
+  // Rows arrive over one socket per selected server: a snapshot on connect, and another on
+  // refresh or a scope change. Row-level deltas are applied too if the host is pushing them
+  // (off by default). A phone in a pocket downloads nothing at all.
+  var srvRows = {}, srvErr = {}, socks = {};
+
+  function rebuild(){
+    var rows = [], errs = [];
+    selectedServers().forEach(function(n){
+      if (srvErr[n]) errs.push({ server:n, error:srvErr[n] });
+      var e = srvRows[n];
+      if (!e) return;
+      for (var id in e.rows) { e.rows[id].server = (n === SELF.name ? null : n); rows.push(e.rows[id]); }
+    });
+    // Fall back to startedAt so a session that has yet to say anything still sorts
+    // as the newest thing in the list, not the oldest.
+    rows.sort(function(a,b){
+      return String(b.lastActivity||b.startedAt||'').localeCompare(String(a.lastActivity||a.startedAt||''));
+    });
+    sessions = rows; errors = errs;
   }
-  var errorsNext = [];
+  function applyMessage(n, d){
+    if (d.type === 'list') {
+      var rows = {};
+      (d.sessions || []).forEach(function(s){ rows[s.sessionId] = s; });
+      srvRows[n] = { rows: rows, totals: d.totals || {} };
+      return true;
+    }
+    if (d.type === 'delta') {
+      var e = srvRows[n] || (srvRows[n] = { rows:{}, totals:{} });
+      (d.upd || []).forEach(function(s){ e.rows[s.sessionId] = s; });
+      (d.del || []).forEach(function(id){ delete e.rows[id]; });
+      if (d.totals) e.totals = d.totals;
+      return true;
+    }
+    return false;
+  }
+  function wsUrl(n){
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var base = n === SELF.name ? '' : '/peer/'+encodeURIComponent(n);
+    return proto+'//'+location.host+base+'/ws/list'+(scopeMonth ? '?month='+encodeURIComponent(scopeMonth) : '');
+  }
+  function openSocket(n){
+    if (socks[n]) return;
+    var st = { ws:null, timer:null, snapTimer:null, pollTimer:null, tries:0, closed:false, opened:false, http:false };
+    socks[n] = st;
+    function stopSnapTimer(){ if (st.snapTimer) { clearTimeout(st.snapTimer); st.snapTimer = null; } }
+    function base(){ return n === SELF.name ? '' : '/peer/'+encodeURIComponent(n); }
+    function pull(){
+      fetch(base()+'/api/sessions'+(scopeMonth ? '?month='+encodeURIComponent(scopeMonth) : ''))
+        .then(function(r){ if (!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .then(function(d){
+          applyMessage(n, { type:'list', sessions: d.sessions || [], totals: d.totals || {} });
+          delete srvErr[n]; rebuild(); lastLoad = Date.now(); renderRows(); tickAgo();
+        })
+        .catch(function(e){ srvErr[n] = e.message || String(e); rebuild(); renderRows(); });
+    }
+    // A peer on an older ccbb accepts /ws/list as if "list" were a session id and then says
+    // nothing — so silence means version mismatch, not outage: poll it over HTTP instead and
+    // re-try the socket occasionally.
+    function fallback(){
+      if (st.closed) return;
+      if (st.ws) { try { st.ws.onclose = st.ws.onerror = st.ws.onmessage = null; st.ws.close(); } catch(e){} st.ws = null; }
+      stopSnapTimer();
+      if (!st.http) { st.http = true; pull(); st.pollTimer = setInterval(pull, 15000); }
+      st.timer = setTimeout(connect, 60000);
+    }
+    function retry(){
+      if (st.closed) return;
+      stopSnapTimer();
+      if (!st.http && (st.opened || st.tries > 0)) { srvErr[n] = 'disconnected'; rebuild(); renderRows(); }
+      st.timer = setTimeout(connect, Math.min(15000, 1000 * Math.pow(2, st.tries++)));
+    }
+    function connect(){
+      if (st.closed) return;
+      var ws;
+      try { ws = new WebSocket(wsUrl(n)); } catch(e) { return retry(); }
+      st.ws = ws;
+      var done = false;
+      ws.onopen = function(){ st.opened = true; st.tries = 0; st.snapTimer = setTimeout(fallback, 5000); };
+      ws.onmessage = function(ev){
+        var d; try { d = JSON.parse(ev.data); } catch(e){ return; }
+        if (!applyMessage(n, d)) return;
+        stopSnapTimer();
+        if (st.http) { clearInterval(st.pollTimer); st.pollTimer = null; st.http = false; }
+        delete srvErr[n];
+        rebuild(); lastLoad = Date.now(); renderRows(); tickAgo();
+      };
+      ws.onclose = ws.onerror = function(){ if (done) return; done = true; st.ws = null; retry(); };
+    }
+    connect();
+  }
+  function closeSocket(n){
+    var st = socks[n];
+    if (!st) return;
+    st.closed = true;
+    if (st.timer) clearTimeout(st.timer);
+    if (st.snapTimer) clearTimeout(st.snapTimer);
+    if (st.pollTimer) clearInterval(st.pollTimer);
+    if (st.ws) { try { st.ws.close(); } catch(e){} }
+    delete socks[n]; delete srvRows[n]; delete srvErr[n];
+  }
+  function load(){
+    var want = selectedServers();
+    for (var n in socks) if (want.indexOf(n) === -1) closeSocket(n);
+    want.forEach(openSocket);
+    rebuild(); renderRows();
+    return Promise.resolve();
+  }
+  // Re-scope in place: the server answers with a fresh snapshot, no reconnect.
+  function pushScope(force){
+    selectedServers().forEach(function(n){
+      var st = socks[n];
+      if (!st) return openSocket(n);
+      if (st.ws && st.ws.readyState === 1) {
+        try { st.ws.send(JSON.stringify({ type:'scope', month: scopeMonth })); } catch(e){}
+      } else if (st.http || force) { closeSocket(n); openSocket(n); }
+    });
+  }
+  function loadMonths(){
+    return fetch('/api/months').then(function(r){ return r.json(); }).then(function(d){
+      months = (d && d.months) || [];
+      renderScope();
+    }).catch(function(){});
+  }
+  function renderScope(){
+    var prev = scopeEl.value;
+    scopeEl.innerHTML = ['<option value="">All time</option>'].concat(months.map(function(mk){
+      return '<option value="'+mk+'">'+fmtMonth(mk)+'</option>';
+    })).join('');
+    scopeEl.value = prev && scopeEl.querySelector('option[value="'+prev+'"]') ? prev : (scopeMonth || '');
+  }
+  scopeEl.addEventListener('change', function(){
+    scopeMonth = scopeEl.value || null;
+    try { localStorage.setItem('ccbb.m.scope', scopeMonth || ''); } catch(e){}
+    pushScope(false);
+  });
 
   head.addEventListener('click', function(e){
     var b = e.target.closest('.pbtn');
@@ -825,7 +963,7 @@ function createListPanel(){
       if (p.state === 'min') setState(p, 'exp');
       return;
     }
-    if (b.dataset.k === 'refresh') { agoEl.textContent = 'refreshing…'; loadServers().then(load); }
+    if (b.dataset.k === 'refresh') { agoEl.textContent = '…'; refresh(); }
     else if (b.dataset.k === 'min') setState(p, p.state==='min' ? 'exp' : 'min');
     else if (b.dataset.k === 'max') setState(p, p.state==='max' ? 'exp' : 'max');
   });
@@ -840,19 +978,26 @@ function createListPanel(){
   rowsEl.addEventListener('touchstart', function(e){ pullY = rowsEl.scrollTop <= 0 ? e.touches[0].clientY : null; }, { passive:true });
   rowsEl.addEventListener('touchmove', function(e){
     if (pullY == null) return;
-    if (e.touches[0].clientY - pullY > 70) { pullY = null; agoEl.textContent = 'refreshing…'; loadServers().then(load); }
+    if (e.touches[0].clientY - pullY > 70) { pullY = null; agoEl.textContent = '…'; refresh(); }
   }, { passive:true });
 
-  // Only while it is on screen: a phone in a pocket should not be polling two machines.
-  setInterval(function(){
-    if (!document.hidden && p.state !== 'min') load();
-  }, 30000);
+  // A manual refresh re-reads the server list and the months, then asks each socket for a
+  // fresh snapshot — waking any that were sitting out a reconnect backoff.
+  function refresh(){
+    return loadServers().then(function(){ load(); loadMonths(); pushScope(true); });
+  }
+
+  // Nothing polls any more; this only counts the age label up.
+  setInterval(tickAgo, 10000);
+  // A phone drops sockets on screen lock. Coming back, reconnect at once rather than
+  // waiting out a backoff that started while the screen was off.
   document.addEventListener('visibilitychange', function(){
-    if (!document.hidden && p.state !== 'min' && Date.now() - lastLoad > 15000) load();
+    if (!document.hidden && p.state !== 'min') pushScope(true);
   });
 
-  p.refresh = load;
-  loadServers().then(load);
+  p.refresh = refresh;
+  p.destroy = function(){ for (var n in socks) closeSocket(n); };
+  loadServers().then(function(){ load(); loadMonths(); });
   return p;
 }
 
@@ -935,6 +1080,13 @@ function createSessionPanel(sid, server){
   // matters more here than on the desktop: a screen lock drops the socket every
   // single time.
   var histCount = 0;
+  // The phone opens on a window of the transcript, not all of it: the first few entries and
+  // the last screenful, with a marker between that fills itself in as you scroll up. On a
+  // tunnelled connection this is the difference between a session opening now and a session
+  // opening after a megabyte.
+  var HIST_HEAD = 5, HIST_TAIL = 10, HIST_CHUNK = 25;
+  var gapEl = null, gapFrom = 0, gapTo = 0, gapLoading = false, gapObserver = null;
+  var insertAnchor = null;
   var seenUuids = {}, msgEls = {}, toolEls = {}, askCards = {}, permEls = {}, toolStart = {};
   var lastUserTs = null, lastAsstTs = null;
   var canDrive = false, cmdCwd = '';
@@ -1017,17 +1169,6 @@ function createSessionPanel(sid, server){
   }
   var seenTurnIds = {};
 
-  function pollLive(){
-    if (destroyed || document.hidden || p.state === 'min') return;
-    api('/api/session/'+sid+'/live').then(function(r){ return r.json(); }).then(function(d){
-      if (destroyed || !INFO) return;
-      INFO.live = !!(d && d.live);
-      INFO.liveStatus = (d && d.status) || null;
-      INFO.liveStatusAt = (d && d.statusUpdatedAt) || null;
-      renderHead();
-    }).catch(function(){});
-  }
-  var liveTimer = setInterval(pollLive, 5000);
 
   // — transcript —
   function processEntry(entry, hist){
@@ -1070,7 +1211,7 @@ function createSessionPanel(sid, server){
       if (!mEl) {
         mEl = el('div','msg','<div class="msg-label">Claude</div><div class="msg-body"></div>');
         msgEls[msg.id] = mEl;
-        transcript.appendChild(mEl);
+        tAppend(mEl);
       }
       try { mEl.querySelector('.msg-body').innerHTML = marked.parse(joined); }
       catch(e) { mEl.querySelector('.msg-body').textContent = joined; }
@@ -1085,7 +1226,7 @@ function createSessionPanel(sid, server){
       card.id = id;
       card.innerHTML = '<div class="tool-hdr" data-toggle="1"><span class="think-label">&#10024; Thinking</span>'+
         '<span class="tool-toggle">&#9654;</span></div><div class="tool-body"><div class="think-body"></div></div>';
-      transcript.appendChild(card);
+      tAppend(card);
     }
     card.querySelector('.think-body').textContent = text;
   }
@@ -1119,7 +1260,7 @@ function createSessionPanel(sid, server){
       '<div class="tool-body"><div class="tool-input"><pre>'+esc(fullInput(block.name, block.input))+'</pre></div>'+
         '<div class="tool-output" id="to-'+id+'"></div></div>';
     toolEls[id] = card;
-    transcript.appendChild(card);
+    tAppend(card);
     scrollBottom();
   }
   function renderToolResults(msg, resultTs, subagent){
@@ -1207,7 +1348,7 @@ function createSessionPanel(sid, server){
       '<span class="compact-label">&#10719; Context compacted</span>'+
       '<details class="compact-details"><summary>summary</summary>'+
       '<div class="compact-summary">'+esc(summary)+'</div></details>');
-    transcript.appendChild(mk);
+    tAppend(mk);
     scrollBottom();
   }
   function renderUser(msg, hist, gap){
@@ -1219,7 +1360,7 @@ function createSessionPanel(sid, server){
       '<div class="msg-label">You'+(g?' <span class="msg-time">'+g+'</span>':'')+'</div>'+
       '<div class="msg-body">'+esc(text)+'</div>');
     histAdd(text);
-    transcript.appendChild(m);
+    tAppend(m);
     scrollBottom();
   }
 
@@ -1243,7 +1384,7 @@ function createSessionPanel(sid, server){
         body: JSON.stringify({ choice: +b.dataset.n }) }).catch(function(){});
     });
     permEls[msg.fp] = card;
-    transcript.appendChild(card);
+    tAppend(card);
     scrollBottom(true);
   }
   function clearPermission(fp){
@@ -1330,7 +1471,7 @@ function createSessionPanel(sid, server){
       });
     });
     toolEls[id] = card; askCards[id] = card;
-    transcript.appendChild(card);
+    tAppend(card);
     scrollBottom(true);
   }
   function settleAsk(id){
@@ -1380,19 +1521,79 @@ function createSessionPanel(sid, server){
   jumpEl.addEventListener('click', function(){ scrollBottom(true); });
 
   // — history + socket —
+  // Older entries go where the gap marker is, not at the bottom; the scroll observer below
+  // holds the reading position while the page grows above it.
+  function tAppend(node){
+    if (insertAnchor && insertAnchor.parentNode === transcript) transcript.insertBefore(node, insertAnchor);
+    else transcript.appendChild(node);
+  }
   function loadHistory(resume){
-    return api('/api/session/'+sid+'/history').then(function(r){ return r.json(); }).then(function(d){
-      var entries = (d && d.history) || [];
-      // On a resume, replay only what is new. processEntry dedups by uuid too,
-      // but not every entry carries one, and the index is exact.
-      var from = resume ? Math.min(histCount, entries.length) : 0;
-      for (var i=from;i<entries.length;i++) processEntry(entries[i], true);
-      histCount = entries.length;
+    var q = resume ? 'from=' + histCount : 'head=' + HIST_HEAD + '&tail=' + HIST_TAIL;
+    return api('/api/session/'+sid+'/history?'+q).then(function(r){ return r.json(); }).then(function(d){
+      if (d && d.entries) {
+        for (var i=0;i<d.entries.length;i++) processEntry(d.entries[i], true);
+        if (!resume) { gapFrom = 0; gapTo = 0; }
+      } else if (d && (d.head || d.tail)) {
+        var head = d.head || [], tail = d.tail || [];
+        for (var h=0;h<head.length;h++) processEntry(head[h], true);
+        gapTo = head.length;
+        gapFrom = d.tailFrom != null ? d.tailFrom : (d.total - tail.length);
+        showGap();
+        for (var t=0;t<tail.length;t++) processEntry(tail[t], true);
+      }
+      // Entries the socket delivered mid-fetch already counted; take whichever is further.
+      if (d && d.total != null) histCount = Math.max(histCount, d.total);
       historyLoaded = true;
       flushPending();
       // Do not yank the view back if the reader scrolled up to read something.
       if (!resume || following) scrollBottom(true);
     }).catch(function(){ historyLoaded = true; flushPending(); });
+  }
+  function showGap(){
+    var missing = gapFrom - gapTo;
+    if (missing <= 0) { hideGap(); return; }
+    if (!gapEl) {
+      gapEl = document.createElement('div');
+      gapEl.className = 'hgap';
+      gapEl.addEventListener('click', function(e){
+        var b = e.target.closest('button');
+        if (b) loadOlder(b.dataset.all ? Infinity : HIST_CHUNK);
+      });
+      if (gapObserver) gapObserver.observe(gapEl);
+    }
+    gapEl.innerHTML = '<span>'+missing+' earlier</span>'+
+      '<button data-n="1">'+Math.min(HIST_CHUNK, missing)+' more</button>'+
+      '<button data-all="1">all</button>';
+    if (gapEl.parentNode !== transcript) tAppend(gapEl);
+  }
+  function hideGap(){
+    if (!gapEl) return;
+    if (gapObserver) { try { gapObserver.unobserve(gapEl); } catch(e){} }
+    gapEl.remove(); gapEl = null;
+  }
+  function loadOlder(n){
+    if (gapLoading || !gapEl) return;
+    var to = gapFrom, from = n === Infinity ? gapTo : Math.max(gapTo, gapFrom - n);
+    if (to <= from) { hideGap(); return; }
+    gapLoading = true;
+    gapEl.classList.add('loading');
+    return api('/api/session/'+sid+'/history?from='+from+'&to='+to)
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        insertAnchor = gapEl ? gapEl.nextSibling : null;
+        try { ((d && d.entries) || []).forEach(function(e){ processEntry(e, true); }); }
+        finally { insertAnchor = null; }
+        gapFrom = from;
+        gapLoading = false;
+        if (gapEl) gapEl.classList.remove('loading');
+        if (gapFrom <= gapTo) hideGap(); else showGap();
+      })
+      .catch(function(){ gapLoading = false; if (gapEl) gapEl.classList.remove('loading'); });
+  }
+  if (window.IntersectionObserver) {
+    gapObserver = new IntersectionObserver(function(ents){
+      for (var i=0;i<ents.length;i++) if (ents[i].isIntersecting) loadOlder(HIST_CHUNK);
+    }, { root: transcript, rootMargin: '200px 0px 0px 0px' });
   }
   function flushPending(){
     for (var i=0;i<pendingTranscript.length;i++) processEntry(pendingTranscript[i], false);
@@ -1412,8 +1613,15 @@ function createSessionPanel(sid, server){
     ws.onmessage = function(e){
       var m; try { m = JSON.parse(e.data); } catch(err) { return; }
       if (m.type === 'transcript') {
+        histCount++;   // keep the resume cursor in step with the file being tailed
         if (!historyLoaded) pendingTranscript.push(m.entry);
         else processEntry(m.entry, false);
+      } else if (m.type === 'live') {
+        // Liveness is pushed by the host's registry watcher — nothing here polls for it.
+        if (INFO) {
+          INFO.live = !!m.live; INFO.liveStatus = m.status || null; INFO.liveStatusAt = m.statusAt || null;
+          renderHead();
+        }
       } else if (m.type === 'permission') showPermission(m);
       else if (m.type === 'permission_clear') clearPermission(m.fp);
       else if (m.type === 'command') showCmd(m);
@@ -1637,7 +1845,8 @@ function createSessionPanel(sid, server){
     // Before anything else: a closing panel that still owns the full-screen composer
     // would leave document.body wearing comp-max with nothing left to fill it.
     if (composerMax) setComposerMax(false);
-    clearInterval(tick); clearInterval(liveTimer); clearTimeout(reconnectTimer);
+    clearInterval(tick); clearTimeout(reconnectTimer);
+    if (gapObserver) { try { gapObserver.disconnect(); } catch(e){} }
     try { mo.disconnect(); } catch(e){}
     if (ws) { try { ws.close(); } catch(e){} }
   };

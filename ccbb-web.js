@@ -21,7 +21,8 @@ const common = require('./ccbb-common');
 const { mobilePageHtml, isMobileUA, serveVendor } = require('./ccbb-mobile');
 const {
   serverIdentity, peerList, peerByName, peerToken,
-  CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSubagentHistory, getSessionStats,
+  CLAUDE_DIR, getSessions, getCostSummary, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
+  getSubagentHistory, getSessionStats, watchSessionChanges,
   sessionLiveness, renameSession, paneForSession, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
   loadCommands, expandRun, truncTitle, looksLikeDiff, langForFile,
@@ -343,6 +344,13 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .result-line .rl-turn{color:var(--ink-faint);font-weight:600}
 .result-line .rl-lbl{color:var(--ink-faint)}
 .result-line .rl-pct{color:var(--ink-faint);font-size:10px}
+/* The unloaded middle of a windowed transcript: a marker that fills itself in when it
+   scrolls into view, with buttons for anyone who would rather ask. */
+.hist-gap{width:100%;max-width:740px;margin:10px 0;display:flex;align-items:center;justify-content:center;gap:10px;
+  font-size:11px;color:var(--ink-faint);border-top:1px dashed var(--line);border-bottom:1px dashed var(--line);padding:6px 2px}
+.hist-gap button{font:inherit;font-size:11px;color:var(--accent);background:none;border:none;cursor:pointer;padding:2px 4px}
+.hist-gap button:hover{text-decoration:underline}
+.hist-gap.loading{opacity:.5;pointer-events:none}
 .compact-marker{width:100%;max-width:740px;margin:6px 0}
 .compact-line{display:flex;align-items:center;gap:10px;color:var(--ink-faint);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 .compact-line::before,.compact-line::after{content:"";flex:1;height:1px;background:var(--line)}
@@ -909,7 +917,7 @@ function createListView(){
     var i = cur.indexOf(name);
     if (i === -1) cur.push(name); else cur.splice(i, 1);
     selected = cur; saveSelection();
-    renderServers(); load();
+    renderServers(); syncSockets();
   }
   function renderServers(){
     var bar = body.querySelector('#srvbar');
@@ -956,8 +964,10 @@ function createListView(){
     return arr.slice().sort(function(a, b) {
       for (var i = 0; i < sortStack.length; i++) {
         var col = sortStack[i].col, dir = sortStack[i].dir, cc = 0;
-        var va = col === 'context' ? ctxTokens(a) : a[col];
-        var vb = col === 'context' ? ctxTokens(b) : b[col];
+        // A session that just started has no activity yet; sort it by when it started, so
+        // the newest thing you launched lands at the top rather than the bottom.
+        var va = col === 'context' ? ctxTokens(a) : col === 'lastActivity' ? (a.lastActivity || a.startedAt) : a[col];
+        var vb = col === 'context' ? ctxTokens(b) : col === 'lastActivity' ? (b.lastActivity || b.startedAt) : b[col];
         if (va == null && vb == null) continue;
         if (va == null) cc = 1;
         else if (vb == null) cc = -1;
@@ -969,13 +979,150 @@ function createListView(){
     });
   }
   // ── loading ──
-  // The list fans out: one request per selected server, in parallel, through the proxy.
-  // A server that fails contributes an error line rather than blanking the whole list —
-  // one dead ssh tunnel must not hide the sessions on every other machine.
+  // The table is fed by one WebSocket per selected server (peers through the same proxy as
+  // everything else): a snapshot on connect and another whenever you refresh or re-scope.
+  // Nothing here polls. The server can also push row-level deltas from a filesystem watch,
+  // which is currently off by default (CCBB_LIST_WATCH=1) — the client applies them if they
+  // arrive. A server that drops contributes an error line and reconnects on its own; one
+  // dead ssh tunnel must not hide the sessions on every other machine.
   //
-  // The quiet flag is set by the auto-refresh so it never flashes "Loading…" over a table you
-  // are reading; the rendered rows are simply replaced when the new data lands.
-  function load(quiet) { return loadSummary(!!quiet); }
+  // The cost summary is the one thing still fetched over HTTP, on open / manual refresh /
+  // scope change: it is a whole-history aggregate, not something that moves per turn.
+  var srvRows = {};        // server → { rows: {sessionId: row}, totals }
+  var srvErr = {};         // server → error text, while it is unreachable
+  var socks = {};          // server → { ws, timer, tries, closed, opened }
+  var scopeMonth = null;   // null = all time
+  var lastChange = 0;      // when the table last actually changed (drives the age label)
+
+  function rebuild(){
+    var rows = [], tot = { totalCost: 0, totalTokens: 0 }, errs = [];
+    selectedServers().forEach(function(name){
+      if (srvErr[name]) errs.push({ server: name, error: srvErr[name] });
+      var e = srvRows[name];
+      if (!e) return;
+      for (var id in e.rows) { e.rows[id].server = name; rows.push(e.rows[id]); }
+      tot.totalCost += (e.totals && e.totals.totalCost) || 0;
+      tot.totalTokens += (e.totals && e.totals.totalTokens) || 0;
+    });
+    sessions = rows; totals = tot; loadErrors = errs;
+  }
+  function applyMessage(name, d){
+    if (d.type === 'list') {
+      var rows = {};
+      (d.sessions || []).forEach(function(s){ rows[s.sessionId] = s; });
+      srvRows[name] = { rows: rows, totals: d.totals || {} };
+      return true;
+    }
+    if (d.type === 'delta') {
+      var e = srvRows[name] || (srvRows[name] = { rows: {}, totals: {} });
+      (d.upd || []).forEach(function(s){ e.rows[s.sessionId] = s; });
+      (d.del || []).forEach(function(id){ delete e.rows[id]; });
+      if (d.totals) e.totals = d.totals;
+      return true;
+    }
+    return false;
+  }
+  function listWsUrl(name){
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return proto + '//' + location.host + apiBase(name) + '/ws/list'
+      + (scopeMonth ? '?month=' + encodeURIComponent(scopeMonth) : '');
+  }
+  var SNAPSHOT_MS = 5000, FALLBACK_POLL_MS = 15000, FALLBACK_RETRY_MS = 60000;
+  function openSocket(name){
+    if (socks[name]) return;
+    var st = { ws:null, timer:null, snapTimer:null, pollTimer:null, tries:0, closed:false, opened:false, http:false };
+    socks[name] = st;
+    function stopSnapTimer(){ if (st.snapTimer) { clearTimeout(st.snapTimer); st.snapTimer = null; } }
+    // HTTP fallback: one whole-list fetch, the pre-socket protocol.
+    function pull(){
+      fetch(apiBase(name) + '/api/sessions' + (scopeMonth ? '?month=' + encodeURIComponent(scopeMonth) : ''))
+        .then(function(r){ if (!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .then(function(d){
+          applyMessage(name, { type:'list', sessions: d.sessions || [], totals: d.totals || {} });
+          delete srvErr[name]; rebuild(); noteChange(); render();
+        })
+        .catch(function(e){ srvErr[name] = e.message || String(e); rebuild(); render(); });
+    }
+    // A peer running an older ccbb accepts /ws/list as though "list" were a session id and
+    // then says nothing at all — its sessions would silently vanish from the table. So
+    // silence is treated as a version mismatch, not an outage: poll that server over HTTP
+    // and re-try the socket now and then, in case it gets upgraded under us.
+    function fallback(){
+      if (st.closed) return;
+      if (st.ws) { try { st.ws.onclose = st.ws.onerror = st.ws.onmessage = null; st.ws.close(); } catch(e){} st.ws = null; }
+      stopSnapTimer();
+      if (!st.http) { st.http = true; pull(); st.pollTimer = setInterval(pull, FALLBACK_POLL_MS); }
+      st.timer = setTimeout(connect, FALLBACK_RETRY_MS);
+    }
+    function retry(){
+      if (st.closed) return;
+      stopSnapTimer();
+      // Only complain once we have actually failed — a socket still on its first
+      // handshake is not an outage worth painting across the table.
+      if (!st.http && (st.opened || st.tries > 0)) { srvErr[name] = 'disconnected'; rebuild(); render(); }
+      var wait = Math.min(15000, 1000 * Math.pow(2, st.tries++));
+      st.timer = setTimeout(connect, wait);
+    }
+    function connect(){
+      if (st.closed) return;
+      var ws;
+      try { ws = new WebSocket(listWsUrl(name)); } catch(e) { return retry(); }
+      st.ws = ws;
+      var done = false;
+      ws.onopen = function(){
+        st.opened = true; st.tries = 0;
+        st.snapTimer = setTimeout(fallback, SNAPSHOT_MS);   // no snapshot ⇒ not a list socket
+      };
+      ws.onmessage = function(ev){
+        var d; try { d = JSON.parse(ev.data); } catch(e) { return; }
+        if (d.type === 'error') { srvErr[name] = d.error || 'error'; rebuild(); render(); return; }
+        if (!applyMessage(name, d)) return;
+        stopSnapTimer();
+        if (st.http) { clearInterval(st.pollTimer); st.pollTimer = null; st.http = false; }
+        delete srvErr[name];
+        rebuild(); noteChange(); render();
+      };
+      ws.onclose = ws.onerror = function(){ if (done) return; done = true; st.ws = null; retry(); };
+    }
+    connect();
+  }
+  function closeSocket(name){
+    var st = socks[name];
+    if (!st) return;
+    st.closed = true;
+    if (st.timer) clearTimeout(st.timer);
+    if (st.snapTimer) clearTimeout(st.snapTimer);
+    if (st.pollTimer) clearInterval(st.pollTimer);
+    if (st.ws) { try { st.ws.close(); } catch(e){} }
+    delete socks[name];
+    delete srvRows[name];
+    delete srvErr[name];
+  }
+  // Sockets follow the server selection: connect what is newly selected, drop what isn't.
+  function syncSockets(){
+    var want = selectedServers();
+    for (var name in socks) if (want.indexOf(name) === -1) closeSocket(name);
+    want.forEach(openSocket);
+    rebuild(); render();
+  }
+  // Re-scope in place where we can — the server answers with a fresh snapshot, so there is
+  // no reconnect and no second HTTP round trip.
+  function pushScope(force){
+    selectedServers().forEach(function(name){
+      var st = socks[name];
+      if (!st) return openSocket(name);
+      if (st.ws && st.ws.readyState === 1) {
+        // Answered with a whole fresh list, which is also what the refresh button wants —
+        // so this one message serves both, and always carries the current scope.
+        try { st.ws.send(JSON.stringify({ type:'scope', month: scopeMonth })); } catch(e){}
+      } else if (st.http) {
+        closeSocket(name); openSocket(name);   // re-pulls under the new scope, retries the socket
+      } else if (force) {
+        // A waiting reconnect: don't make the user sit out the backoff on a manual refresh.
+        closeSocket(name); openSocket(name);
+      }
+    });
+  }
   async function fanOut(path) {
     var names = selectedServers();
     var got = await Promise.all(names.map(function(name){
@@ -999,22 +1146,12 @@ function createListView(){
     for (var k in b) a[k] = deepAdd(a[k], b[k]);
     return a;
   }
-  async function loadSessions(month, quiet) {
-    var out = body.querySelector('#out');
-    if (!quiet) { out.className = 'lmsg'; out.textContent = 'Loading…'; body.querySelector('#foot').textContent = ''; }
-    var results = await fanOut('/api/sessions' + (month ? '?month=' + encodeURIComponent(month) : ''));
-    var rows = [], tot = { totalCost: 0, totalTokens: 0 }, errs = [];
-    results.forEach(function(r){
-      if (r.error) { errs.push({ server: r.name, error: r.error }); return; }
-      var d = r.data || {};
-      (d.sessions || []).forEach(function(s){ s.server = r.name; rows.push(s); });
-      if (d.totals) { tot.totalCost += d.totals.totalCost || 0; tot.totalTokens += d.totals.totalTokens || 0; }
-    });
-    sessions = rows; totals = tot; loadErrors = errs;
-    render();
-    stampRefreshed();
+  function scopeFromSelect(){
+    var sel = body.querySelector('#sumScope');
+    var val = sel ? sel.value : '';
+    return val && val.indexOf('m:') === 0 ? val.slice(2) : null;
   }
-  async function loadSummary(quiet) {
+  async function loadSummary(force) {
     var results = await fanOut('/api/cost-summary');
     var merged = null;
     results.forEach(function(r){ if (!r.error) merged = deepAdd(merged, r.data); });
@@ -1024,12 +1161,24 @@ function createListView(){
     } else { body.querySelector('#summary').style.display = 'none'; }
     // Drive the list from the selected scope (default: latest month). On summary failure
     // the selector is empty, so this falls back to the all-time list.
-    var sel = body.querySelector('#sumScope');
-    var val = sel ? sel.value : '';
-    return loadSessions(val && val.indexOf('m:') === 0 ? val.slice(2) : null, quiet);
+    scopeMonth = scopeFromSelect();
+    pushScope(!!force);
   }
-  function stampRefreshed(){
-    refreshedEl.textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+  // The bar shows how old the table is, not when a request last completed: it is stamped by
+  // a delta that changed something, so "3m" means the sessions have been quiet for 3
+  // minutes, not that the page has stopped listening.
+  function noteChange(){ lastChange = Date.now(); renderAge(); }
+  function fmtAge(ms){
+    var s = Math.round(ms/1000);
+    if (s < 60) return s + 's';
+    var m = Math.round(s/60);
+    if (m < 60) return m + 'm';
+    return Math.round(m/60) + 'h';
+  }
+  function renderAge(){
+    if (!lastChange) { refreshedEl.textContent = ''; return; }
+    refreshedEl.textContent = fmtAge(Date.now() - lastChange);
+    refreshedEl.title = 'Last change ' + new Date(lastChange).toLocaleTimeString();
   }
   var PROV_LABEL = { bedrock:'Bedrock', anthropic:'Sub' };
   function gsub(s){ return '<span class="c-sub">'+s+'</span>'; }
@@ -1045,8 +1194,8 @@ function createListView(){
   }
   function onScopeChange() {
     renderSummary();
-    var val = body.querySelector('#sumScope').value;
-    loadSessions(val && val.indexOf('m:') === 0 ? val.slice(2) : null);
+    scopeMonth = scopeFromSelect();
+    pushScope(false);
   }
   function currentScope() {
     var val = body.querySelector('#sumScope').value;
@@ -1144,7 +1293,10 @@ function createListView(){
       return '<div class="srv-err">'+esc(e.server)+': '+esc(e.error)+'</div>';
     }).join('');
     if (!rows.length) {
-      out.className = ''; out.innerHTML = errHtml + '<div class="lmsg">No sessions found.</div>';
+      // "No sessions" is a claim about a server that answered; while one is still opening
+      // its socket the honest state is that we don't know yet.
+      var waiting = selectedServers().some(function(n){ return !srvRows[n] && !srvErr[n]; });
+      out.className = ''; out.innerHTML = errHtml + '<div class="lmsg">'+(waiting ? 'Loading…' : 'No sessions found.')+'</div>';
       body.querySelector('#foot').textContent = '';
       return;
     }
@@ -1180,20 +1332,21 @@ function createListView(){
   });
   body.querySelector('#sumScope').addEventListener('change', onScopeChange);
 
-  // The server list must land BEFORE the first fan-out: until it does, the only known
+  // The server list must land BEFORE the sockets open: until it does, the only known
   // server is this one, so a saved selection naming a peer would filter down to nothing
-  // and fall back to local-only — a first paint that silently drops every remote session.
-  function cycle(quiet){ return loadServers().then(function(){ return load(quiet); }); }
+  // and connect local-only — a first paint that silently drops every remote session.
+  function cycle(force){
+    return loadServers().then(function(){ syncSockets(); return loadSummary(force); });
+  }
 
-  // Auto-refresh. Skipped while the tab is hidden or the view is collapsed to its bar —
-  // no point polling several machines for a table nobody is looking at.
-  var autoTimer = setInterval(function(){
-    if (document.hidden || v.el.classList.contains('collapsed')) return;
-    cycle(true);
-  }, 10000);
-  v.destroy = function(){ clearInterval(autoTimer); };
+  // The only timer left: the age label counts up between pushes.
+  var ageTimer = setInterval(renderAge, 10000);
+  v.destroy = function(){
+    clearInterval(ageTimer);
+    for (var name in socks) closeSocket(name);
+  };
 
-  v.refresh = function(){ return cycle(false); };
+  v.refresh = function(){ return cycle(true); };
   renderServers();
   cycle(false);
   return v;
@@ -1292,10 +1445,26 @@ function createSessionView(INFO){
   // assistant entry's time, paired on the result card to show how long the tool took.
   var lastUserTs = null, lastAsstTs = null, toolStart = {};
   var historyLoaded = false, pendingTranscript = [], pendingAsk = null;
-  // How many history entries we have already taken. /ws/ has no resume cursor —
-  // it tails from end-of-file — so anything written while the socket was down is
-  // never sent. The JSONL only ever grows, so the count is a valid resume point.
-  var histCount = 0;
+  // A long session is megabytes of transcript, nearly all of it scrolled past. The view
+  // opens on a WINDOW: the first few entries (what the session was asked to do) and the
+  // last screenful (what it is doing now), with a gap marker between that fills itself in
+  // as you scroll up. histCount is the server's entry count, not what we rendered — /ws/
+  // tails from end-of-file with no resume cursor, so after a dropped socket we re-ask for
+  // everything from histCount on, and get only what was appended.
+  var HIST_HEAD = 5, HIST_TAIL = 25, HIST_CHUNK = 25;
+  var histCount = 0;          // total entries the server has
+  var gapEl = null;           // the "N earlier messages" marker, while a gap exists
+  var gapFrom = 0;            // index of the oldest entry rendered below the gap
+  var gapTo = 0;              // index just past the newest entry rendered above it
+  var gapLoading = false;
+  // Older entries are inserted where the gap is, not appended at the bottom. Every
+  // transcript insertion goes through here so one flag redirects them all; the scroll
+  // MutationObserver already compensates for content growing above the reading anchor.
+  var insertAnchor = null;
+  function tAppend(node){
+    if (insertAnchor && insertAnchor.parentNode === transcript) transcript.insertBefore(node, insertAnchor);
+    else transcript.appendChild(node);
+  }
   var permEls = {};    // fp -> element
   var askCards = {};   // tool_use id -> card element
   var statEls = {}, statTurnNo = {}, statTurns = 0, statSeenFirst = false;
@@ -1399,11 +1568,21 @@ function createSessionView(INFO){
   // Every session-scoped call goes through here, so the API prefix (local or peer)
   // is applied in exactly one place.
   function qfetch(url, opts){ queryStart(); return fetch(API+url, opts).finally(queryEnd); }
-  function pollLive() {
-    qfetch('/api/session/'+INFO.sessionId+'/live').then(function(r){return r.json();})
-      .then(function(d){ setStatus(d); }).catch(function(){});
+  // Liveness arrives on the socket now (the server watches the registry), so nothing here
+  // polls for it. What is left is the stats line, which only moves when the transcript
+  // does — so it is fetched on open and then debounced behind incoming entries.
+  var lastStatus = null, statsTimer = null;
+  function setStatusFromWs(msg) {
+    lastStatus = { live: msg.live, status: msg.status, statusUpdatedAt: msg.statusAt };
+    setStatus(lastStatus);
+  }
+  function fetchStats() {
     qfetch('/api/session/'+INFO.sessionId+'/stats').then(function(r){return r.json();})
       .then(function(d){ if(d) renderStats(d); }).catch(function(){});
+  }
+  function statsSoon() {
+    if (statsTimer) return;
+    statsTimer = setTimeout(function(){ statsTimer = null; fetchStats(); }, 3000);
   }
 
   // — per-response usage line —
@@ -1438,7 +1617,7 @@ function createSessionView(INFO){
       lineEl = document.createElement('div');
       lineEl.className = 'result-line'+(hist?' hist':'');
       if (msg.id) statEls[msg.id] = lineEl;
-      transcript.appendChild(lineEl);
+      tAppend(lineEl);
     }
     lineEl.innerHTML = line;
     scrollBottom();
@@ -1486,7 +1665,7 @@ function createSessionView(INFO){
         mEl.className = 'msg'+(hist?' hist':'');
         mEl.innerHTML = '<div class="msg-label">Claude</div><div class="msg-body"></div>';
         msgEls[msgId] = mEl;
-        transcript.appendChild(mEl);
+        tAppend(mEl);
       }
       mEl.querySelector('.msg-body').innerHTML = hasText ? marked.parse(joined) : '';
     }
@@ -1499,7 +1678,7 @@ function createSessionView(INFO){
       card = document.createElement('div');
       card.id = id; card.className = 'think-card'+(hist?' hist':'');
       card.innerHTML = '<div class="think-hdr" onclick="toggleTool(this)"><span class="think-label">&#10024; Thinking</span><span class="tool-toggle">&#9654;</span></div><div class="tool-body"><div class="think-body"></div></div>';
-      transcript.appendChild(card);
+      tAppend(card);
     }
     card.querySelector('.think-body').textContent = text;
   }
@@ -1518,7 +1697,7 @@ function createSessionView(INFO){
       '<div class="tool-body open" id="tb-'+id+'"><div class="tool-input"><pre>'+esc(inputStr)+'</pre></div>'+
         '<div class="tool-output" id="to-'+id+'"></div></div>';
     toolEls[id] = card;
-    transcript.appendChild(card);
+    tAppend(card);
     scrollBottom();
   }
   function renderToolResults(msg, resultTs, subagent) {
@@ -1712,7 +1891,7 @@ function createSessionView(INFO){
     if (submitBtn) submitBtn.addEventListener('click', doSubmit);
 
     toolEls[id] = card; askCards[id] = card;
-    transcript.appendChild(card);
+    tAppend(card);
     scrollBottom();
   }
   function settleAsk(id) {
@@ -1765,7 +1944,7 @@ function createSessionView(INFO){
     mk.className = 'compact-marker'+(hist?' hist':'');
     mk.innerHTML = '<div class="compact-line"><span class="compact-label">&#10719; Context compacted</span></div>'+
       '<details class="compact-details"><summary>View summary</summary><div class="compact-summary">'+esc(summary)+'</div></details>';
-    transcript.appendChild(mk);
+    tAppend(mk);
     scrollBottom();
   }
   function renderUserMessage(msg, hist, gap) {
@@ -1776,7 +1955,7 @@ function createSessionView(INFO){
     var yt = fmtDur(gap);
     mEl.innerHTML = '<div class="msg-label">You'+(yt?' <span class="msg-time">'+yt+'</span>':'')+'</div><div class="msg-body">'+esc(text)+'</div>';
     histAdd(text);   // the transcript IS the prompt history; ↑ reaches back past this page
-    transcript.appendChild(mEl);
+    tAppend(mEl);
     scrollBottom();
     return true;
   }
@@ -1866,8 +2045,12 @@ function createSessionView(INFO){
   }
   function handleWsMsg(msg) {
     if (msg.type==='transcript') {
+      histCount++;   // keep the resume cursor in step with the file we are being tailed from
       if (!historyLoaded) pendingTranscript.push(msg.entry);
       else { processEntry(msg.entry, false); noteUpdate(); }
+      statsSoon();
+    } else if (msg.type==='live') {
+      setStatusFromWs(msg);
     } else if (msg.type==='permission') {
       showPermission(msg); noteUpdate();
     } else if (msg.type==='permission_clear') {
@@ -1902,7 +2085,7 @@ function createSessionView(INFO){
       });
     });
     permEls[msg.fp] = card;
-    transcript.appendChild(card);
+    tAppend(card);
     scrollBottom();
   }
   function clearPermission(fp) {
@@ -1917,21 +2100,90 @@ function createSessionView(INFO){
   }
 
   // — history —
+  // Opening: ask for the two ends only. Resuming after a dropped socket: ask for what was
+  // appended since, which on a session that has been running for hours is a handful of
+  // entries instead of its whole transcript.
   async function loadHistory(resume) {
+    var q = resume ? 'from=' + histCount : 'head=' + HIST_HEAD + '&tail=' + HIST_TAIL;
     var r, d;
-    try { r = await qfetch('/api/session/'+INFO.sessionId+'/history'); d = await r.json(); }
+    try { r = await qfetch('/api/session/'+INFO.sessionId+'/history?'+q); d = await r.json(); }
     catch(e) { historyLoaded = true; flushPending(); return; }
-    var entries = (d&&d.history)||[];
-    // On a resume, replay only what is new. processEntry also dedups by uuid,
-    // but not every entry carries one, and the index is exact.
-    var from = resume ? Math.min(histCount, entries.length) : 0;
-    for (var i=from;i<entries.length;i++) processEntry(entries[i], true);
-    histCount = entries.length;
+    var added = 0;
+    if (d && d.entries) {                       // one contiguous run: a resume, or a short session
+      for (var i=0;i<d.entries.length;i++) processEntry(d.entries[i], true);
+      added = d.entries.length;
+      if (!resume) { gapFrom = 0; gapTo = 0; }
+    } else if (d && (d.head || d.tail)) {
+      var head = d.head || [], tail = d.tail || [];
+      for (var h=0;h<head.length;h++) processEntry(head[h], true);
+      gapTo = head.length;
+      gapFrom = d.tailFrom != null ? d.tailFrom : (d.total - tail.length);
+      showGap();
+      for (var t=0;t<tail.length;t++) processEntry(tail[t], true);
+      added = head.length + tail.length;
+    }
+    // Entries the socket delivered while this fetch was in flight already counted, so the
+    // cursor is whichever is further along.
+    if (d && d.total != null) histCount = Math.max(histCount, d.total);
     historyLoaded = true;
     flushPending();
     // Don't yank the view back if the reader has scrolled up to read something.
     if (!resume) scrollBottom(true);
-    else if (i > from) { if (following) scrollBottom(true); noteUpdate(); }
+    else if (added) { if (following) scrollBottom(true); noteUpdate(); }
+  }
+  // The gap marker doubles as the loader: it fetches the previous chunk when it scrolls
+  // into view, so reading upward just keeps working, and offers the whole rest in one go
+  // for anyone who would rather search the page.
+  function showGap(){
+    var missing = gapFrom - gapTo;
+    if (missing <= 0) { hideGap(); return; }
+    if (!gapEl) {
+      gapEl = document.createElement('div');
+      gapEl.className = 'hist-gap';
+      gapEl.addEventListener('click', function(e){
+        var b = e.target.closest('button');
+        if (!b) return;
+        loadOlder(b.dataset.all ? Infinity : HIST_CHUNK);
+      });
+      if (gapObserver) gapObserver.observe(gapEl);
+    }
+    gapEl.innerHTML = '<span class="hist-gap-n">'+missing+' earlier '+(missing===1?'message':'messages')+'</span>'+
+      '<button data-n="'+HIST_CHUNK+'">Show '+Math.min(HIST_CHUNK, missing)+' more</button>'+
+      '<button data-all="1">Show all</button>';
+    // Placed once, between head and tail; re-rendering its label must not move it.
+    if (gapEl.parentNode !== transcript) tAppend(gapEl);
+  }
+  function hideGap(){
+    if (!gapEl) return;
+    if (gapObserver) { try { gapObserver.unobserve(gapEl); } catch(e){} }
+    gapEl.remove(); gapEl = null;
+  }
+  async function loadOlder(n){
+    if (gapLoading || !gapEl) return;
+    var to = gapFrom, from = n === Infinity ? gapTo : Math.max(gapTo, gapFrom - n);
+    if (to <= from) { hideGap(); return; }
+    gapLoading = true;
+    gapEl.classList.add('loading');
+    var r, d;
+    try {
+      r = await qfetch('/api/session/'+INFO.sessionId+'/history?from='+from+'&to='+to);
+      d = await r.json();
+    } catch(e) { gapLoading = false; gapEl && gapEl.classList.remove('loading'); return; }
+    // Insert directly below the marker, in order, so the transcript stays chronological.
+    // The scroll observer holds the reading position while the page grows above it.
+    insertAnchor = gapEl.nextSibling;
+    try { ((d && d.entries) || []).forEach(function(e){ processEntry(e, true); }); }
+    finally { insertAnchor = null; }
+    gapFrom = from;
+    gapLoading = false;
+    if (gapEl) gapEl.classList.remove('loading');
+    if (gapFrom <= gapTo) hideGap(); else showGap();
+  }
+  var gapObserver = null;
+  if (window.IntersectionObserver) {
+    gapObserver = new IntersectionObserver(function(ents){
+      for (var i=0;i<ents.length;i++) if (ents[i].isIntersecting) loadOlder(HIST_CHUNK);
+    }, { root: transcript, rootMargin: '200px 0px 0px 0px' });
   }
   function flushPending() {
     for (var i=0;i<pendingTranscript.length;i++) { processEntry(pendingTranscript[i], false); }
@@ -2128,20 +2380,25 @@ function createSessionView(INFO){
     msgEls = {}; toolEls = {}; seenUuids = {}; askCards = {}; lastUserTs = null; lastAsstTs = null; toolStart = {};
     statEls = {}; statTurnNo = {}; statTurns = 0; statSeenFirst = false;
     historyLoaded = false; pendingTranscript = []; pendingAsk = null; histCount = 0;
+    gapEl = null; gapFrom = 0; gapTo = 0; gapLoading = false; insertAnchor = null;
     following = true; anchorEl = null;
     // The transcript is about to be replayed, and every user message re-seeds the input
     // history — so clear it first, or a refresh would double every prompt. // commands
     // are lost with it, which is what "only for this page" means.
     inputHist = []; histPos = -1; histSync();
     loadHistory();
-    pollLive();
+    fetchStats();
   };
-  var livePollTimer = setInterval(pollLive, 4000);
-  var drivePollTimer = setInterval(refreshDrivable, 5000);
+  // The idle line counts up ("waiting 4m"), so it is re-rendered from the status we were
+  // last pushed — no request involved. Drivability is a tmux fact, which changes only when
+  // a session is attached or killed; 15s is plenty.
+  var statusTimer = setInterval(function(){ if (lastStatus) setStatus(lastStatus); }, 10000);
+  var drivePollTimer = setInterval(refreshDrivable, 15000);
   v.destroy = function(){
     destroyed = true;
-    clearInterval(livePollTimer); clearInterval(drivePollTimer);
-    clearTimeout(reconnectTimer);
+    clearInterval(statusTimer); clearInterval(drivePollTimer);
+    clearTimeout(reconnectTimer); clearTimeout(statsTimer);
+    if (gapObserver) { try { gapObserver.disconnect(); } catch(e) {} }
     if (scrollObserver) { try { scrollObserver.disconnect(); } catch(e) {} }
     if (ws) { try { ws.close(); } catch(e) {} }
   };
@@ -2660,6 +2917,111 @@ function stopWatching(sessionId) {
   if (w && --w.refs <= 0) webWatchers.delete(sessionId);
   stopTail(sessionId);
 }
+
+// ── Session-list sockets: snapshot once, then deltas ─────────────────────────
+// The list used to poll every server every 10s for a table that changes a few times an
+// hour. Instead each browser holds one socket per server: the first message is the whole
+// list, and afterwards only the rows that actually changed are sent, driven by the
+// filesystem watcher rather than a timer. A busy session's row moves a few hundred bytes;
+// an idle machine sends nothing at all.
+//
+// Scope (all-time vs one month) is per socket and can be changed in place — the snapshot
+// is re-sent, no reconnect. Each socket remembers the JSON it last sent per row, which is
+// what makes the diff exact without the client acknowledging anything.
+const listClients = new Set();   // { ws, month, rows: Map<sessionId, json>, totals }
+const clients = new Map();       // sessionId → Set<ws>, the open session views
+let listUnwatch = null;
+
+function listSnapshot(month) {
+  return getSessions(month ? { period: 'month', key: month } : null);
+}
+
+function sendList(c, snap) {
+  const rows = new Map();
+  for (const row of snap.sessions) rows.set(row.sessionId, JSON.stringify(row));
+  c.rows = rows;
+  c.totals = JSON.stringify(snap.totals);
+  wsJson(c.ws, { type: 'list', sessions: snap.sessions, totals: snap.totals, month: c.month || null });
+}
+
+function wsJson(ws, obj) {
+  if (ws.readyState !== 1) return;
+  try { ws.send(JSON.stringify(obj)); } catch {}
+}
+
+// One pass over the watcher's event: compute each distinct scope at most once, then send
+// each client only its own difference.
+function pushListDeltas() {
+  if (!listClients.size) return;
+  const snaps = new Map();
+  for (const c of listClients) {
+    const key = c.month || '';
+    if (!snaps.has(key)) { try { snaps.set(key, listSnapshot(c.month)); } catch { snaps.set(key, null); } }
+    const snap = snaps.get(key);
+    if (!snap) continue;
+    const upd = [], next = new Map();
+    for (const row of snap.sessions) {
+      const j = JSON.stringify(row);
+      next.set(row.sessionId, j);
+      if (c.rows.get(row.sessionId) !== j) upd.push(row);
+    }
+    const del = [];
+    for (const id of c.rows.keys()) if (!next.has(id)) del.push(id);
+    const totals = JSON.stringify(snap.totals);
+    c.rows = next;
+    if (!upd.length && !del.length && totals === c.totals) continue;
+    c.totals = totals;
+    wsJson(c.ws, { type: 'delta', upd, del, totals: snap.totals });
+  }
+}
+
+// Liveness for the open session views. The registry is watched anyway, so a session going
+// busy → idle → gone reaches the page as a push instead of a per-view poll.
+const liveSent = new Map();   // sessionId → last JSON sent
+function liveMsg(sessionId) {
+  const l = sessionLiveness(sessionId);
+  return JSON.stringify({ type: 'live', live: !!l.live, status: l.status || null, statusAt: l.statusUpdatedAt || null });
+}
+function pushLiveStatus() {
+  for (const sessionId of clients.keys()) {
+    const msg = liveMsg(sessionId);
+    if (liveSent.get(sessionId) === msg) continue;
+    liveSent.set(sessionId, msg);
+    const set = clients.get(sessionId);
+    for (const ws of set) if (ws.readyState === 1) { try { ws.send(msg); } catch {} }
+  }
+  for (const id of Array.from(liveSent.keys())) if (!clients.has(id)) liveSent.delete(id);
+}
+
+// Watch-driven list deltas are OFF by default: the list updates when you ask it to
+// (the refresh button re-requests a snapshot over the same socket). Set
+// CCBB_LIST_WATCH=1 to have the filesystem watcher push row changes as they happen.
+const LIST_WATCH = process.env.CCBB_LIST_WATCH === '1';
+
+function onSessionSetChanged() {
+  if (LIST_WATCH) pushListDeltas();
+  pushLiveStatus();
+}
+
+// Liveness for open session views does not ride on the watcher alone. Reading the session
+// registry is a directory of small files on local disk, so a 5s sweep costs nothing, and
+// pushLiveStatus only sends when a session's status actually changed — an idle machine
+// still puts no bytes on the wire.
+const LIVE_SWEEP_MS = 5000;
+let liveTimer = null;
+function ensureSessionWatch() {
+  // With list pushes off, the watcher has no consumer the sweep doesn't already cover, so
+  // it isn't started at all.
+  if (LIST_WATCH && !listUnwatch) listUnwatch = watchSessionChanges(onSessionSetChanged);
+  if (!liveTimer) { liveTimer = setInterval(pushLiveStatus, LIVE_SWEEP_MS); if (liveTimer.unref) liveTimer.unref(); }
+}
+function releaseSessionWatch() {
+  if (listClients.size || clients.size) return;
+  if (listUnwatch) { listUnwatch(); listUnwatch = null; }
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+}
+function addListClient(c) { listClients.add(c); ensureSessionWatch(); }
+function removeListClient(c) { listClients.delete(c); releaseSessionWatch(); }
 
 // ── Claude Code hooks: peek at prompts (structured, replaces the pane scrape) ────
 // When the hook installer has wired settings.json, Claude Code POSTs each interactive
@@ -3712,6 +4074,10 @@ function runWeb(args) {
       return send(res, 200, getSessions(filter));
     }
     if (method === 'GET' && pathname === '/api/cost-summary') return send(res, 200, getCostSummary());
+    // Just the month keys, for a scope selector that has no use for the summary's numbers —
+    // the phone would otherwise pull a full cost breakdown to fill one dropdown.
+    if (method === 'GET' && pathname === '/api/months')
+      return send(res, 200, { months: Object.keys(getCostSummary().months).sort().reverse() });
     if (method === 'GET' && (m = pathname.match(/^\/session\/([^/]+)$/)))
       return sendHtml(res, appPageHtml(m[1]));   // deep link: app with this session opened
     // ── host terminals ──
@@ -3733,8 +4099,16 @@ function runWeb(args) {
     }
     if (method === 'GET' && (m = pathname.match(/^\/api\/session-info\/([^/]+)$/)))
       return send(res, 200, getSessionInfo(m[1]));
-    if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/history$/)))
-      return send(res, 200, { history: getSessionHistory(m[1]) });
+    // History, whole or windowed. `head`/`tail` open a session without shipping its middle;
+    // `from`/`to` fill the gap in, or fetch only what was appended since `total`. Plain
+    // /history (no params) still returns everything, which is what the bots want.
+    if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/history$/))) {
+      const num = k => (query.get(k) == null ? null : Math.max(0, parseInt(query.get(k), 10) || 0));
+      const head = num('head'), tail = num('tail'), from = num('from'), to = num('to');
+      if (head == null && tail == null && from == null && to == null)
+        return send(res, 200, { history: getSessionHistory(m[1]) });
+      return send(res, 200, getSessionHistoryWindow(m[1], { head, tail, from, to }));
+    }
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/subagent\/([^/]+)$/)))
       return send(res, 200, { history: getSubagentHistory(m[1], m[2]) });
     // Claude Code prompt-capture hooks POST here (permission dialogs, AskUserQuestion).
@@ -3847,7 +4221,6 @@ function runWeb(args) {
 
   if (WS) {
     const wss = new WS.Server({ noServer: true });
-    const clients = new Map(); // sessionId -> Set<ws>
     const sendTo = (sessionId, obj) => {
       const set = clients.get(sessionId);
       if (!set) return;
@@ -3892,12 +4265,42 @@ function runWeb(args) {
         const from = new URLSearchParams(url.split('?')[1] || '').get('from');
         return wss.handleUpgrade(req, socket, head, ws => attachTerm(t, ws, from));
       }
+      // The session list. One per browser per server (peers arrive as /peer/<name>/ws/list,
+      // spliced by the block above), carrying its own scope.
+      if (/^\/ws\/list(\?|$)/.test(url)) {
+        const q = new URLSearchParams(url.split('?')[1] || '');
+        const mk = q.get('month');
+        return wss.handleUpgrade(req, socket, head, ws => {
+          const c = { ws, month: mk && /^\d{4}-\d{2}$/.test(mk) ? mk : null, rows: new Map(), totals: '' };
+          addListClient(c);
+          try { sendList(c, listSnapshot(c.month)); } catch (e) { wsJson(ws, { type: 'error', error: e.message }); }
+          ws.on('message', raw => {
+            let d; try { d = JSON.parse(raw); } catch { return; }
+            if (!d) return;
+            // Scope changes in place, and the refresh button asks for a new snapshot —
+            // both answered on this socket, neither needing a reconnect.
+            if (d.type === 'scope' || d.type === 'refresh') {
+              if (d.type === 'scope')
+                c.month = typeof d.month === 'string' && /^\d{4}-\d{2}$/.test(d.month) ? d.month : null;
+              try { sendList(c, listSnapshot(c.month)); } catch {}
+            }
+          });
+          const bye = () => removeListClient(c);
+          ws.on('close', bye); ws.on('error', bye);
+        });
+      }
       const m = url.match(/^\/ws\/([^/?]+)/);
       if (!m) return socket.destroy();
       wss.handleUpgrade(req, socket, head, ws => {
         const sessionId = m[1];
         if (!clients.has(sessionId)) clients.set(sessionId, new Set());
         clients.get(sessionId).add(ws);
+        // Liveness rides this socket, pushed by the same watcher the list uses — the view
+        // no longer polls /api/session-info to find out the session went idle.
+        ensureSessionWatch();
+        const l0 = liveMsg(sessionId);
+        liveSent.set(sessionId, l0);   // primed, so the next watch tick isn't a repeat
+        try { ws.send(l0); } catch {}
         startWatching(sessionId, e => sendTo(sessionId, { type: 'transcript', entry: e }));
         const loc = paneForSession(sessionId);
         if (loc) startPaneWatch(sessionId, loc.pane);
@@ -3920,6 +4323,7 @@ function runWeb(args) {
           const set = clients.get(sessionId);
           if (set) { set.delete(ws); if (!set.size) { clients.delete(sessionId); stopPaneWatch(sessionId); } }
           stopWatching(sessionId);
+          releaseSessionWatch();
         });
       });
     });

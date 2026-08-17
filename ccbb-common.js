@@ -650,14 +650,24 @@ function loadStatsCache() {
   if (!_statsCache) _statsCache = { version: 9, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
-function saveStatsCache() {
+// The cache is a few hundred KB, and a watched server rebuilds its list every time a
+// transcript grows — which during an active turn is a few times a second. So the write is
+// throttled: the in-memory cache is always current, the file catches up at most every 10s,
+// and an exit hook flushes whatever the throttle was holding.
+const SAVE_MIN_MS = 10000;
+let _lastSave = 0;
+function saveStatsCache(force) {
   if (!_cacheDirty) return;
+  const now = Date.now();
+  if (!force && now - _lastSave < SAVE_MIN_MS) return;
   const c = loadStatsCache();
   const tmp = CACHE_FILE + '.tmp.' + process.pid;
   try { fs.writeFileSync(tmp, JSON.stringify(c)); fs.renameSync(tmp, CACHE_FILE); }
   catch { /* cache is best-effort */ }
   _cacheDirty = false;
+  _lastSave = now;
 }
+process.on('exit', () => { try { saveStatsCache(true); } catch {} });
 function sessionSig(usagePaths) {
   const parts = [];
   for (const p of usagePaths) {
@@ -707,43 +717,69 @@ function pruneStatsCache(seenIds) {
   }
 }
 
-// ── Live-session liveness (from ~/.claude/sessions/<pid>.json sidecars) ────────
-function pidAlive(pid) {
+// ── Live-session registry (from ~/.claude/sessions/<pid>.json sidecars) ───────
+// Claude Code writes one sidecar per running process, well before the session has a
+// transcript on disk. It is therefore both the liveness signal AND the only way to see a
+// session that hasn't written its first message yet — session discovery reads it too.
+function pidAlive(pid, procStart) {
   if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  let alive;
+  try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+  if (!alive || !procStart) return alive;
+  // Guard against PID reuse: the sidecar records the process start time, so compare it
+  // with the live process's. Unreadable /proc (non-Linux) leaves the plain answer.
+  const s = procStartTime(pid);
+  return s === null ? alive : s === String(procStart);
 }
 
-function sessionLiveness(sessionId) {
-  const sessionsDir = path.join(CLAUDE_DIR, 'sessions');
-  if (!fs.existsSync(sessionsDir)) return { live: false };
-  let files;
-  try { files = fs.readdirSync(sessionsDir); } catch { return { live: false }; }
-  for (const f of files) {
-    if (!f.endsWith('.json')) continue;
-    let d;
-    try { d = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8')); } catch { continue; }
-    if (d.sessionId !== sessionId) continue;
-    if (!pidAlive(d.pid)) continue;
-    return { live: true, pid: d.pid, status: d.status || 'unknown',
-      statusUpdatedAt: d.statusUpdatedAt || null, cwd: d.cwd || '' };
-  }
-  return { live: false };
+// Field 22 of /proc/<pid>/stat (start time in clock ticks). comm may contain spaces and
+// parens, so parse from the last ')'.
+function procStartTime(pid) {
+  let text;
+  try { text = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return null; }
+  const rest = text.slice(text.lastIndexOf(')') + 2).split(' ');
+  return rest[19] || null;
 }
 
-function liveSessionIds() {
+// One directory read → sessionId → sidecar record for every live session. When a session
+// has several live pids (a resume racing the old process), the most recently updated one
+// wins. Records are the raw sidecar plus a normalized `status`.
+function liveSessionRecords() {
   const sessionsDir = path.join(CLAUDE_DIR, 'sessions');
-  const out = new Set();
+  const out = new Map();
   let files;
   try { files = fs.readdirSync(sessionsDir); } catch { return out; }
   for (const f of files) {
     if (!f.endsWith('.json')) continue;
     let d;
     try { d = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8')); } catch { continue; }
-    if (d && d.sessionId && pidAlive(d.pid)) out.add(d.sessionId);
+    if (!d || !d.sessionId || !pidAlive(d.pid, d.procStart)) continue;
+    const rec = {
+      sessionId: d.sessionId, pid: Number(d.pid), cwd: d.cwd || '',
+      name: d.name || '', status: d.status || 'unknown',
+      statusUpdatedAt: d.statusUpdatedAt || null, updatedAt: d.updatedAt || 0,
+      startedAt: d.startedAt || null, tmux: d.tmux || null,
+      version: d.version || '', kind: d.kind || '',
+    };
+    const prev = out.get(rec.sessionId);
+    if (!prev || (rec.updatedAt || 0) >= (prev.updatedAt || 0)) out.set(rec.sessionId, rec);
   }
   return out;
 }
 
+function sessionLiveness(sessionId) {
+  const rec = liveSessionRecords().get(sessionId);
+  if (!rec) return { live: false };
+  return { live: true, pid: rec.pid, status: rec.status,
+    statusUpdatedAt: rec.statusUpdatedAt, cwd: rec.cwd };
+}
+
+function liveSessionIds() {
+  return new Set(liveSessionRecords().keys());
+}
+
+// Every live pid for a session — a resumed session can briefly have more than one, and
+// all of them are legitimate injection targets.
 function livePidsForSession(sessionId) {
   const dir = path.join(CLAUDE_DIR, 'sessions');
   const out = new Set();
@@ -752,7 +788,7 @@ function livePidsForSession(sessionId) {
   for (const f of files) {
     if (!f.endsWith('.json')) continue;
     let d; try { d = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { continue; }
-    if (d && d.sessionId === sessionId && d.pid && pidAlive(d.pid)) out.add(Number(d.pid));
+    if (d && d.sessionId === sessionId && d.pid && pidAlive(d.pid, d.procStart)) out.add(Number(d.pid));
   }
   return out;
 }
@@ -882,6 +918,32 @@ function getSessionHistory(sessionId) {
   return entries;
 }
 
+// A window onto the transcript, so a front-end need not download a session's whole life to
+// show the end of it. Indices are positions in the SAME array getSessionHistory returns, so
+// a client can page around with them and resume from `total` after a dropped socket.
+//
+//   { head, tail }   the opening and the latest entries, with the gap between them
+//   { from, to }     an explicit slice, [from, to)
+//
+// The file is still read and normalized in full — an entry's index isn't knowable without
+// normalizing it, since transcriptEntry drops some lines. The saving is the response body,
+// which on a long session is where the megabytes are.
+function getSessionHistoryWindow(sessionId, opts = {}) {
+  const all = getSessionHistory(sessionId);
+  const total = all.length;
+  const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+  if (opts.from != null || opts.to != null) {
+    const from = clamp(Number(opts.from) || 0, 0, total);
+    const to = clamp(opts.to == null ? total : Number(opts.to), from, total);
+    return { total, from, entries: all.slice(from, to) };
+  }
+  const head = clamp(Number(opts.head) || 0, 0, total);
+  const tail = clamp(Number(opts.tail) || 0, 0, total);
+  // Overlapping window means the whole thing fits: send it as one run, no gap.
+  if (head + tail >= total) return { total, from: 0, entries: all };
+  return { total, head: all.slice(0, head), tailFrom: total - tail, tail: all.slice(total - tail) };
+}
+
 // Full transcript for one subagent (Agent/Task) run, to nest under its parent tool card.
 // The file lives at <sessionDir>/<sessionId>/subagents/agent-<agentId>.jsonl. agentId is
 // stripped to alphanumerics so it can't escape that directory. Sidechain entries are the
@@ -908,19 +970,99 @@ function getSubagentHistory(sessionId, agentId) {
 function getSessionInfo(sessionId) {
   const filePath = findSessionJsonl(sessionId);
   const slug = filePath ? path.basename(path.dirname(filePath)) : '';
-  const projectPath = getSessionCwd(sessionId) || slug.replace(/^-+/, '').replace(/-/g, '/');
-  const live = sessionLiveness(sessionId);
+  const rec = liveSessionRecords().get(sessionId) || null;
+  const projectPath = (rec && rec.cwd) || getSessionCwd(sessionId) || slug.replace(/^-+/, '').replace(/-/g, '/');
+  const live = rec
+    ? { live: true, status: rec.status, statusUpdatedAt: rec.statusUpdatedAt }
+    : { live: false };
   const stats = getSessionStats(sessionId, { mainPath: filePath });
+  // Before its first message a session has no transcript, hence no title or start time of
+  // its own — the registry has both.
   return {
     sessionId,
-    title: stats.title || '',
+    title: stats.title || (rec ? rec.name : '') || '',
     projectPath,
-    startedAt: stats.startedAt || null,
+    startedAt: stats.startedAt || (rec && rec.startedAt ? new Date(rec.startedAt).toISOString() : null),
     live: live.live,
     liveStatus: live.status || null,
     liveStatusAt: live.statusUpdatedAt || null,
     stats,
   };
+}
+
+// ── Session-set watcher: "something in the session list changed" ──────────────
+// Push, not poll: the list front-ends subscribe once and are told when a session appears,
+// exits, changes status, or grows its transcript. Two sources, one debounced callback:
+//   • ~/.claude/sessions      — the live registry (new/exited sessions, idle↔busy)
+//   • ~/.claude/projects/*    — transcript appends (cost/tokens/context move)
+// fs.watch is not recursive on Linux, so each project slug directory gets its own watcher
+// and the parent watch adds them as new slugs appear. inotify can also drop events on
+// some filesystems, so a slow re-check fires the same callback — it is a safety net, not
+// a poll: subscribers diff before sending anything.
+const RECHECK_MS = 30000;
+let _watch = null;   // { subs, watchers, slugs, timer, recheck }
+
+function watchSessionChanges(cb) {
+  if (!_watch) {
+    _watch = { subs: new Set(), watchers: new Map(), timer: null, recheck: null };
+    _watchBegin(_watch);
+  }
+  _watch.subs.add(cb);
+  return () => {
+    if (!_watch) return;
+    _watch.subs.delete(cb);
+    if (_watch.subs.size) return;
+    _watchEnd(_watch);
+    _watch = null;
+  };
+}
+
+function _watchFire(w) {
+  if (w.timer) return;                       // already coalescing this burst
+  w.timer = setTimeout(() => {
+    w.timer = null;
+    _watchSyncProjectDirs(w);
+    for (const cb of Array.from(w.subs)) { try { cb(); } catch {} }
+  }, 400);
+  if (w.timer.unref) w.timer.unref();
+}
+
+// Watch a directory, tolerating its absence (a machine with no sessions yet) and swallowing
+// the EPERM/ENOSPC that a watcher-starved system throws.
+function _watchDir(w, dir) {
+  if (w.watchers.has(dir)) return;
+  let wa;
+  try { wa = fs.watch(dir, () => _watchFire(w)); } catch { return; }
+  wa.on('error', () => { try { wa.close(); } catch {} w.watchers.delete(dir); });
+  w.watchers.set(dir, wa);
+}
+
+// Re-assert every watch: new project slugs, and the two base directories if they did not
+// exist when we started (a machine whose first session is only now being created).
+function _watchSyncProjectDirs(w) {
+  _watchDir(w, path.join(CLAUDE_DIR, 'sessions'));
+  _watchDir(w, path.join(CLAUDE_DIR, 'projects'));
+  const projectsDir = path.join(CLAUDE_DIR, 'projects');
+  let slugs = [];
+  try { slugs = fs.readdirSync(projectsDir); } catch { return; }
+  for (const slug of slugs) {
+    const dir = path.join(projectsDir, slug);
+    try { if (!fs.statSync(dir).isDirectory()) continue; } catch { continue; }
+    _watchDir(w, dir);
+  }
+}
+
+function _watchBegin(w) {
+  _watchSyncProjectDirs(w);
+  w.recheck = setInterval(() => _watchFire(w), RECHECK_MS);
+  if (w.recheck.unref) w.recheck.unref();
+}
+
+function _watchEnd(w) {
+  if (w.timer) clearTimeout(w.timer);
+  if (w.recheck) clearInterval(w.recheck);
+  for (const wa of w.watchers.values()) { try { wa.close(); } catch {} }
+  w.watchers.clear();
 }
 
 // ── Transcript tailer: JSONL → per-line callback (push, 400ms poll) ────────────
@@ -1164,13 +1306,49 @@ function periodView(st, kind, key) {
   };
 }
 
-// One row per top-level session file. Skips sessions with no billable usage in scope
-// (all-time, or the selected period) unless includeEmpty is set.
+// One list row from a session's stats, plus its live-registry record when it has one.
+function sessionRow(sessionId, projectPath, stats, rec) {
+  const cat = stats.categories;
+  return {
+    sessionId,
+    title: stats.title || (rec ? rec.name : '') || '',
+    live: !!rec,
+    liveStatus: rec ? rec.status : null,
+    liveStatusAt: rec ? rec.statusUpdatedAt : null,
+    projectPath,
+    startedAt: stats.startedAt || (rec && rec.startedAt ? new Date(rec.startedAt).toISOString() : null),
+    lastActivity: stats.lastActivity || null,
+    totalCost: stats.cost,
+    totalTokens: stats.totalTokens,
+    turns: stats.turns,
+    subTurns: stats.subTurns,
+    context: stats.context,
+    contextMax: stats.contextMax,
+    inputTokens: cat.input.tokens,
+    cacheReadTokens: cat.cacheRead.tokens,
+    cacheCreationTokens: cat.cacheWrite.tokens,
+    cacheMissTokens: cat.cacheMiss.tokens,
+    outputTokens: cat.output.tokens,
+    inputCost: cat.input.cost,
+    cacheReadCost: cat.cacheRead.cost,
+    cacheCreationCost: cat.cacheWrite.cost,
+    outputCost: cat.output.cost,
+    modelBreakdowns: stats.models
+      .filter(m => m.tokens > 0)
+      .map(m => ({ modelName: m.model, cost: m.cost, tokens: m.tokens })),
+  };
+}
+
+// One row per top-level session file, plus every live session the registry knows about —
+// a session that has only just started has no transcript yet, so the files alone would
+// miss it. Skips sessions with no billable usage in scope (all-time, or the selected
+// period) unless includeEmpty is set; a live session is never skipped, since a zero-cost
+// row is exactly what a session you're about to talk to looks like.
 // periodFilter (optional) scopes each session's cost/tokens to one day/week/month.
 function getSessions(periodFilter, includeEmpty) {
   maybeRefreshPricing();
   sessionPathIndex(true);
-  const live = liveSessionIds();
+  const liveRecs = liveSessionRecords();
   const sessions = [];
   const seen = new Set();
   let totalCost = 0, totalTokens = 0;
@@ -1178,64 +1356,63 @@ function getSessions(periodFilter, includeEmpty) {
     const sessionId = path.basename(filePath, '.jsonl');
     const slug = path.basename(path.dirname(filePath));
     seen.add(sessionId);
+    const rec = liveRecs.get(sessionId) || null;
     const stats = periodFilter
       ? periodView(getSessionStats(sessionId, { mainPath: filePath }), periodFilter.period, periodFilter.key)
       : getSessionStats(sessionId, { mainPath: filePath });
-    if (!stats.totalTokens && !includeEmpty) continue;
-    const cat = stats.categories;
-    const modelBreakdowns = stats.models
-      .filter(m => m.tokens > 0)
-      .map(m => ({ modelName: m.model, cost: m.cost, tokens: m.tokens }));
+    if (!stats.totalTokens && !includeEmpty && !rec) continue;
     totalCost += stats.cost;
     totalTokens += stats.totalTokens;
-    sessions.push({
-      sessionId,
-      title: stats.title || '',
-      live: live.has(sessionId),
-      projectPath: slug.replace(/^-+/, '').replace(/-/g, '/'),
-      startedAt: stats.startedAt || null,
-      lastActivity: stats.lastActivity || null,
-      totalCost: stats.cost,
-      totalTokens: stats.totalTokens,
-      turns: stats.turns,
-      subTurns: stats.subTurns,
-      context: stats.context,
-      contextMax: stats.contextMax,
-      inputTokens: cat.input.tokens,
-      cacheReadTokens: cat.cacheRead.tokens,
-      cacheCreationTokens: cat.cacheWrite.tokens,
-      cacheMissTokens: cat.cacheMiss.tokens,
-      outputTokens: cat.output.tokens,
-      inputCost: cat.input.cost,
-      cacheReadCost: cat.cacheRead.cost,
-      cacheCreationCost: cat.cacheWrite.cost,
-      outputCost: cat.output.cost,
-      modelBreakdowns,
-    });
+    sessions.push(sessionRow(sessionId, (rec && rec.cwd) || slug.replace(/^-+/, '').replace(/-/g, '/'), stats, rec));
+  }
+  // Live sessions with no transcript on disk yet: zero usage, everything else from the
+  // registry. They cost nothing, so the totals stay correct under any period filter.
+  for (const [sessionId, rec] of liveRecs) {
+    if (seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    const all = getSessionStats(sessionId, {});
+    const stats = periodFilter ? periodView(all, periodFilter.period, periodFilter.key) : all;
+    sessions.push(sessionRow(sessionId, rec.cwd, stats, rec));
   }
   pruneStatsCache(seen);
   saveStatsCache();
   return { sessions, totals: { totalCost, totalTokens } };
 }
 
-// One row per session that ever had usage, sorted by last activity (desc). The compact
-// listing shape used by the bots' /list picker.
+// One row per session that ever had usage — plus every live session, which may have no
+// usage yet — sorted by last activity (desc). The compact listing shape used by the bots'
+// /list picker.
 function listSessions() {
   maybeRefreshPricing();
   sessionPathIndex(true);
+  const liveRecs = liveSessionRecords();
   const rows = [];
   const seen = new Set();
   for (const filePath of sessionJsonlPaths()) {
     const sessionId = path.basename(filePath, '.jsonl');
     seen.add(sessionId);
+    const rec = liveRecs.get(sessionId) || null;
     const stats = getSessionStats(sessionId, { mainPath: filePath });
-    if (!stats.totalTokens) continue;
+    if (!stats.totalTokens && !rec) continue;
     rows.push({
       sessionId,
-      title: stats.title || '',
+      title: stats.title || (rec ? rec.name : '') || '',
+      live: !!rec,
       cost: stats.cost,
       totalTokens: stats.totalTokens,
       lastActivity: stats.lastActivity || stats.startedAt || null,
+    });
+  }
+  for (const [sessionId, rec] of liveRecs) {
+    if (seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    rows.push({
+      sessionId,
+      title: rec.name || '',
+      live: true,
+      cost: 0,
+      totalTokens: 0,
+      lastActivity: rec.startedAt ? new Date(rec.startedAt).toISOString() : null,
     });
   }
   pruneStatsCache(seen);
@@ -1386,11 +1563,12 @@ module.exports = {
   // listing + cost summary
   getSessions, listSessions, sessionContribution, getCostSummary,
   // liveness + mutation
-  pidAlive, sessionLiveness, liveSessionIds, livePidsForSession, renameSession,
+  pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
   tmux, paneForSession, injectToPane,
-  transcriptEntry, getSessionCwd, getSessionHistory, getSubagentHistory, getSessionInfo,
-  startTail, stopTail,
+  transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow,
+  getSubagentHistory, getSessionInfo,
+  startTail, stopTail, watchSessionChanges,
   // permission parsing
   PROMPT_RE, OPTION_RE, capturePane, parsePrompt, promptFingerprint,
   // AskUserQuestion
