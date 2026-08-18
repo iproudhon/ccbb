@@ -20,7 +20,7 @@ const common = require('./ccbb-common');
 // The phone front-end. Same server, same API, its own page — see ccbb-mobile.js.
 const { mobilePageHtml, isMobileUA, serveVendor } = require('./ccbb-mobile');
 const {
-  serverIdentity, peerList, peerByName, peerToken,
+  serverIdentity, peerList, peerByName, peerToken, readToken,
   CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionStats, watchSessionChanges,
   sessionLiveness, renameSession, paneForSession, injectToPane, transcriptEntry,
@@ -511,6 +511,17 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .send-btn{position:absolute;right:5px;bottom:5px;background:var(--accent);border:none;color:#fff;width:24px;height:24px;border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;padding:0}
 .send-btn:hover:not(:disabled){background:var(--accent-hover,#a84f34)}
 .send-btn:disabled{opacity:.4;cursor:default}
+/* ── read-only ──
+   One class on <html>, set before the first paint, removing every control that would
+   only earn a 403. The affordances are gone, not disabled: a viewer has no use for a
+   send button it can never press, and on a session view the composer is a third of the
+   screen. What stays is everything that tells you what the machine is doing.
+   A permission card is the exception — its options are the QUESTION, so they stay
+   readable and merely stop being buttons. */
+.ro .input-area,.ro .chip-term,.ro .term-open{display:none}
+.ro .perm-opt{pointer-events:none;opacity:.65}
+.ro .ask-custom,.ro .ask-foot{display:none}
+.ro .hdr-title{cursor:default}
 /* ── ssh terminal ──
    A terminal is deliberately NOT a view: you want it over whatever you are reading, at
    whatever size, and still there when you switch sessions. So it floats above #views with
@@ -589,6 +600,11 @@ __APP_JS__
 const APP_JS = `
 var PRICE_TABLE = __PRICING__;
 var SELF = __SELF__;             // this server's identity: {name, hostname}
+// Baked into the page rather than fetched, because the affordances it removes must never
+// exist — not appear and then vanish a round-trip later. The server refuses these routes
+// regardless; this only keeps the page from offering what it knows will be refused.
+var RO = __RO__;                 // this browser holds the read-only token
+if (RO) document.documentElement.classList.add('ro');
 var INIT_OPEN = __INIT_OPEN__;   // {sessionId, server} to open on load (deep link), or null
 
 // ── multi-server addressing ───────────────────────────────────────────────────
@@ -859,7 +875,7 @@ function makeViewBar(v, barMain, buttons){
   btns.className = 'bar-btns';
   btns.innerHTML = '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
     '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
-    (buttons && buttons.term ? '<button class="vb-btn term-open" data-act="term" title="Terminal on the server this session runs on">&gt;_</button>' : '')+
+    (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal on the server this session runs on">&gt;_</button>' : '')+
     (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
     (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
   bar.appendChild(btns);
@@ -1001,7 +1017,7 @@ function createListView(){
       return '<span class="chip'+(on?' on':'')+'" data-srv="'+esc(s.name)+'" title="'+esc(tip)+'">'
         + '<span class="sdot '+esc(s.status||'unknown')+'"></span>'
         + '<span class="cname">'+esc(s.name)+'</span>'
-        + '<span class="chip-term" data-term="'+esc(s.name)+'" title="Open a terminal on '+esc(s.name)+'">&gt;_</span>'
+        + (RO ? '' : '<span class="chip-term" data-term="'+esc(s.name)+'" title="Open a terminal on '+esc(s.name)+'">&gt;_</span>')
         + '</span>';
     }).join('');
   }
@@ -1644,10 +1660,11 @@ function createSessionView(INFO){
   function renderTitle() {
     titleEl.textContent = INFO.title || '(untitled — ' + INFO.sessionId.slice(0,8) + ')';
     titleEl.className = 'hdr-title' + (INFO.title ? '' : ' empty');
-    titleEl.title = 'Click to rename';
+    titleEl.title = RO ? (INFO.title || '') : 'Click to rename';
   }
   titleEl.addEventListener('click', function(e){
     if (el.classList.contains('collapsed')) return;   // bar handler expands instead
+    if (RO) return;
     e.stopPropagation();
     editSessionTitle();
   });
@@ -2034,7 +2051,9 @@ function createSessionView(INFO){
       if (!ms) html += '<div class="ask-custom"><input class="ask-text" data-qi="'+qi+'" placeholder="Type something…"></div>';
     });
     html += '<div class="perm-acts ask-foot"><button class="ask-submit"'+(showSubmit?'':' style="display:none"')+' disabled>Submit</button></div>';
-    html += '<div class="perm-note" id="an-'+id+'">'+(showSubmit?'Choose your answer'+(qs.length>1?'s':'')+', then Submit.':'Tap an option, or type a custom answer.')+' Also answerable at the terminal.</div>';
+    html += '<div class="perm-note" id="an-'+id+'">'+
+      (RO ? 'Waiting for an answer at the terminal.'
+          : (showSubmit?'Choose your answer'+(qs.length>1?'s':'')+', then Submit.':'Tap an option, or type a custom answer.')+' Also answerable at the terminal.')+'</div>';
     html += '<div class="tool-output" id="to-'+id+'"></div>';
     card.innerHTML = html;
 
@@ -2270,7 +2289,8 @@ function createSessionView(INFO){
       '<div class="perm-hdr">&#128274; Permission needed</div>' +
       '<div class="perm-body">'+esc(msg.title)+'</div>' +
       '<div class="perm-acts">'+opts+'</div>' +
-      '<div class="perm-note">Tap an option or type the number below. Also answerable at the terminal.</div>';
+      '<div class="perm-note">'+(RO ? 'Waiting for an answer at the terminal.'
+        : 'Tap an option or type the number below. Also answerable at the terminal.')+'</div>';
     card.querySelectorAll('.perm-opt').forEach(function(b){
       b.addEventListener('click', function(){
         clearPermission(msg.fp);   // dismiss immediately, don't wait for the pane scrape
@@ -3078,12 +3098,13 @@ if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
 `;
 
 // ── Page HTML assembly ─────────────────────────────────────────────────────────
-function appPageHtml(initOpenSessionId, initOpenServer) {
+function appPageHtml(initOpenSessionId, initOpenServer, ro) {
   const open = initOpenSessionId ? { sessionId: initOpenSessionId, server: initOpenServer || null } : null;
   return APP_HTML.replace('__APP_JS__',
     () => APP_JS
       .replace('__PRICING__', () => JSON.stringify(priceTable))
       .replace('__SELF__', () => JSON.stringify(serverIdentity()))
+      .replace('__RO__', () => JSON.stringify(!!ro))
       .replace('__INIT_OPEN__', () => JSON.stringify(open)));
 }
 
@@ -3853,11 +3874,25 @@ function cookieToken(req) {
 // Auth, when config sets peerToken. The token can arrive as a header (peer proxies and
 // the hook curl), a cookie (the browser, after one ?token=… visit), or a query param.
 // Unset peerToken = no auth at all, which is the pre-existing single-host behavior.
-function authOk(req, query) {
-  const want = peerToken();
-  if (!want) return true;
+//
+// Two tokens, two answers: 'full' drives, 'read' only looks. Null is no answer at all.
+// The level is decided once, at the top of the request, and carried on the request object
+// — so a route that forgets to consult it fails closed only if we make it, which is why
+// every mutating route below asks `ro` explicitly rather than trusting a shared middleware
+// that a new route could be written without.
+function authLevel(req, query) {
+  const want = peerToken(), ro = readToken();
+  if (!want) return 'full';
   const got = req.headers[TOKEN_HEADER] || (query && query.get('token')) || cookieToken(req);
-  return !!got && safeEq(got, want);
+  if (!got) return null;
+  if (safeEq(got, want)) return 'full';
+  // Checked second and only if it is set, so a server without readToken behaves exactly
+  // as before — same comparisons, same failures.
+  if (ro && safeEq(got, ro)) return 'read';
+  return null;
+}
+function sendForbidden(res, what) {
+  send(res, 403, { error: `read-only token cannot ${what}` });
 }
 function sendUnauthorized(res, wantsHtml, cookieName) {
   if (wantsHtml) {
@@ -3932,9 +3967,14 @@ function probePeer(peer) {
 function pollPeers() { for (const p of peerList()) probePeer(p); }
 // Merged view of the mesh: this server first, then every configured peer with its last
 // known health. `hostname` is what the PEER reported about itself, not what we guessed.
-function serversPayload() {
+// `ro` — a read-only caller is told about this machine and no other. Not a filter the
+// UI applies for cosmetics: the list is also what the front-end opens sockets against,
+// so leaving peers in it and hiding the chips would have the page reaching for hops the
+// server is about to refuse.
+function serversPayload(ro) {
   const self = serverIdentity();
   const list = [{ name: self.name, hostname: self.hostname, self: true, status: 'up' }];
+  if (ro) return { self, servers: list };
   for (const p of peerList()) {
     const h = peerHealth.get(p.name) || { status: 'unknown' };
     list.push({
@@ -4230,7 +4270,11 @@ function runWeb(args) {
     // Both UIs' pages: what the ?token=… hand-off and the HTML 401 apply to. A /m page
     // left out here would take the JSON-401 branch and could never bank the token.
     const isPage = isDesktopPage || isMobilePage;
-    if (!authOk(req, query)) return sendUnauthorized(res, isPage, tokenCookieName(req));
+    const level = authLevel(req, query);
+    if (!level) return sendUnauthorized(res, isPage, tokenCookieName(req));
+    // Whoever came in with the read token. Every route that changes something — a session's
+    // input, a terminal, a peer hop — consults this; everything that only reads ignores it.
+    const ro = level === 'read';
     // A page opened as ?token=… banks the token in a cookie and reloads clean, so the
     // secret stops riding in the URL bar (and in every link copied out of it).
     if (isPage && peerToken() && query.get('token')) {
@@ -4274,11 +4318,15 @@ function runWeb(args) {
     if (isMobilePage) {
       const self = serverIdentity();
       if (pathname === '/m' || pathname === '/m/' || pathname === '/m/index.html')
-        return sendHtml(res, mobilePageHtml(null, null, self, priceTable));
+        return sendHtml(res, mobilePageHtml(null, null, self, priceTable, ro));
       if ((m = pathname.match(/^\/m\/session\/([^/]+)$/)))
-        return sendHtml(res, mobilePageHtml(m[1], null, self, priceTable));
-      if ((m = pathname.match(/^\/m\/peer\/([^/]+)\/session\/([^/]+)$/)))
-        return sendHtml(res, mobilePageHtml(m[2], decodeURIComponent(m[1]), self, priceTable));
+        return sendHtml(res, mobilePageHtml(m[1], null, self, priceTable, ro));
+      // A read-only browser has no peers to deep-link into, and the page it would get
+      // could only sit there failing to load. Send it to its own list instead.
+      if ((m = pathname.match(/^\/m\/peer\/([^/]+)\/session\/([^/]+)$/))) {
+        if (ro) { res.writeHead(302, { Location: '/m' }); return res.end(); }
+        return sendHtml(res, mobilePageHtml(m[2], decodeURIComponent(m[1]), self, priceTable, ro));
+      }
     }
 
     // ── peer mesh ──
@@ -4286,8 +4334,15 @@ function runWeb(args) {
       const self = serverIdentity();
       return send(res, 200, { name: self.name, hostname: self.hostname, port, version: VERSION });
     }
-    if (method === 'GET' && pathname === '/api/servers') return send(res, 200, serversPayload());
+    if (method === 'GET' && pathname === '/api/servers') return send(res, 200, serversPayload(ro));
     if ((m = pathname.match(/^\/peer\/([^/]+)(\/.*)$/))) {
+      // A page navigation gets a redirect rather than a JSON 403 — a read-only browser
+      // following a deep link copied off a full-access one should land on its own list,
+      // not on a wall of error text. Everything else (the API, the sockets) is refused.
+      if (ro) {
+        if (isDesktopPage) { res.writeHead(302, { Location: '/' }); return res.end(); }
+        return sendForbidden(res, 'reach peers');
+      }
       const name = decodeURIComponent(m[1]);
       const peer = peerByName(name);
       const link = peer ? null : inboundLinks.get(name);   // configured URL wins; else call back down their link
@@ -4303,7 +4358,7 @@ function runWeb(args) {
       return peer ? proxyHttp(peer, full, req, res) : proxyHttpOverLink(link, full, req, res);
     }
 
-    if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) return sendHtml(res, appPageHtml(null));
+    if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) return sendHtml(res, appPageHtml(null, null, ro));
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');
       const filter = mk && /^\d{4}-\d{2}$/.test(mk) ? { period: 'month', key: mk } : null;
@@ -4320,9 +4375,10 @@ function runWeb(args) {
     if (method === 'GET' && pathname === '/api/months')
       return send(res, 200, { months: Object.keys(getCostSummary().months).sort().reverse() });
     if (method === 'GET' && (m = pathname.match(/^\/session\/([^/]+)$/)))
-      return sendHtml(res, appPageHtml(m[1]));   // deep link: app with this session opened
+      return sendHtml(res, appPageHtml(m[1], null, ro));   // deep link: app with this session opened
     // ── host terminals ──
     if (method === 'POST' && pathname === '/api/term/open') {
+      if (ro) return sendForbidden(res, 'open a terminal');
       readBody(req, body => {
         let b; try { b = JSON.parse(body || '{}'); } catch { b = {}; }
         const r = openTerm(b.cols, b.rows, b.sessionId);
@@ -4333,6 +4389,7 @@ function runWeb(args) {
     // Everything else about a terminal rides its WebSocket. This one route stays HTTP so
     // a closing tab can end the shell with sendBeacon, which cannot open a socket.
     if (method === 'POST' && (m = pathname.match(/^\/api\/term\/([^/]+)\/close$/))) {
+      if (ro) return sendForbidden(res, 'close a terminal');
       const t = terms.get(m[1]);
       if (!t) return send(res, 404, { error: 'no such terminal' });
       closeTerm(t);
@@ -4354,6 +4411,9 @@ function runWeb(args) {
       return send(res, 200, { history: getSubagentHistory(m[1], m[2]) });
     // Claude Code prompt-capture hooks POST here (permission dialogs, AskUserQuestion).
     if (method === 'POST' && pathname === '/api/hook') {
+      // The hooks run on this machine and carry the full token; a viewer forging one
+      // could open a permission card that was never asked for.
+      if (ro) return sendForbidden(res, 'post hook events');
       readBody(req, body => {
         let evt; try { evt = JSON.parse(body || '{}'); } catch { evt = null; }
         if (evt) { try { applyHookEvent(evt); } catch (e) { console.error('[hook]', e.message); } }
@@ -4370,6 +4430,7 @@ function runWeb(args) {
       return send(res, 200, { pane: loc ? loc.pane : null });
     }
     if (method === 'POST' && (m = pathname.match(/^\/api\/session\/([^/]+)\/input$/))) {
+      if (ro) return sendForbidden(res, 'message a session');
       readBody(req, body => {
         let text;
         try { text = String(JSON.parse(body || '{}').text || ''); } catch { text = ''; }
@@ -4385,6 +4446,7 @@ function runWeb(args) {
     // question rides in the tool_use; the dialog is open while that's the last entry),
     // so a stale button can't type digits into the session's composer.
     if (method === 'POST' && (m = pathname.match(/^\/api\/session\/([^/]+)\/ask$/))) {
+      if (ro) return sendForbidden(res, 'answer a question');
       readBody(req, body => {
         let b; try { b = JSON.parse(body || '{}'); } catch { b = {}; }
         // {answers:[…]} is the full per-question form; {choice}/{text} stay valid for one question.
@@ -4398,6 +4460,7 @@ function runWeb(args) {
       return;
     }
     if (method === 'POST' && (m = pathname.match(/^\/api\/session\/([^/]+)\/permission$/))) {
+      if (ro) return sendForbidden(res, 'answer a permission prompt');
       readBody(req, body => {
         let choice;
         try { choice = Number(JSON.parse(body || '{}').choice); } catch { choice = NaN; }
@@ -4407,7 +4470,9 @@ function runWeb(args) {
       });
       return;
     }
+    // //commands run a shell command on this host — the least read-only thing here.
     if (method === 'POST' && (m = pathname.match(/^\/api\/session\/([^/]+)\/command$/))) {
+      if (ro) return sendForbidden(res, 'run commands');
       readBody(req, body => {
         let name, args, cwd;
         try { const b = JSON.parse(body || '{}'); name = b.name; args = b.args || ''; cwd = b.cwd || ''; }
@@ -4418,6 +4483,7 @@ function runWeb(args) {
       return;
     }
     if (method === 'PATCH' && (m = pathname.match(/^\/api\/session\/([^/]+)$/))) {
+      if (ro) return sendForbidden(res, 'rename a session');
       let body = '';
       req.on('data', c => { body += c; });
       req.on('end', () => {
@@ -4439,6 +4505,10 @@ function runWeb(args) {
     const peers = peerList();
     if (peers.length) console.log(`ccbb peers: ${peers.map(p => p.name + ' → ' + p.url).join(', ')}`);
     if (peerToken()) console.log('ccbb: peerToken set — open the UI once as ?token=<token>');
+    if (readToken()) console.log('ccbb: readToken set — ' +
+      (!peerToken() ? 'IGNORED as a restriction: peerToken is unset, so everyone already has full access'
+       : readToken() === peerToken() ? 'IGNORED: it is the same string as peerToken, which wins'
+       : 'that token gives a view-only UI (no peers, no terminal, no input)'));
   });
   // Peer health runs on a timer so /api/servers never blocks on a dead tunnel.
   pollPeers();
@@ -4471,10 +4541,15 @@ function runWeb(args) {
     wsSend = sendTo;
     server.on('upgrade', (req, socket, head) => {
       const url = req.url || '';
-      if (!authOk(req, new URLSearchParams(url.split('?')[1] || ''))) return socket.destroy();
+      const level = authLevel(req, new URLSearchParams(url.split('?')[1] || ''));
+      if (!level) return socket.destroy();
+      // A socket has no status code to refuse with that a browser would show, so a
+      // read-only caller reaching for a peer, a peer link or a shell just gets nothing.
+      const ro = level === 'read';
       // A peer opening its reverse channel to us. It authenticated above like any other
       // request; from here on we can call back into it whenever the UI asks.
       if (/^\/peer-link(\?|$)/.test(url)) {
+        if (ro) return socket.destroy();   // a link is a peer dialling in — and outbound reach for us
         const name = new URLSearchParams(url.split('?')[1] || '').get('name');
         if (!name || name === serverIdentity().name) return socket.destroy();
         return wss.handleUpgrade(req, socket, head, ws => {
@@ -4489,6 +4564,7 @@ function runWeb(args) {
       }
       const pm = url.match(/^\/peer\/([^/]+)(\/.*)$/);
       if (pm) {
+        if (ro) return socket.destroy();
         const name = decodeURIComponent(pm[1]);
         if (req.headers[VIA_HEADER]) return socket.destroy();
         const peer = peerByName(name);
@@ -4501,6 +4577,7 @@ function runWeb(args) {
       // above splices — over the peer's URL, or back down the link it opened to us.
       const tm = url.match(/^\/ws-term\/([^/?]+)/);
       if (tm) {
+        if (ro) return socket.destroy();
         const t = terms.get(tm[1]);
         if (!t) return socket.destroy();
         const from = new URLSearchParams(url.split('?')[1] || '').get('from');

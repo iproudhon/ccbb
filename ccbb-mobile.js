@@ -378,6 +378,11 @@ body.has-max .panel:not(.max){display:none}
 .perm-opt.sel{border-color:var(--accent);background:var(--accent-soft);font-weight:600}
 .perm-opt:disabled{opacity:.5}
 .perm-note{padding:0 12px 10px;font-size:11px;color:var(--ink-faint)}
+/* Read-only: the controls go, the content stays. A permission card's options are the
+   question being asked, so they stay legible and stop being tappable. */
+.ro .composer,.ro .cterm,.ro .pbtn[data-k="term"]{display:none}
+.ro .perm-opt{pointer-events:none;opacity:.65}
+.ro .ask-text,.ro .ask-submit{display:none}
 .ask-opt-desc{display:block;font-size:11px;color:var(--ink-faint);margin-top:2px;white-space:normal}
 .ask-multi{color:var(--ink-faint);font-weight:400}
 .ask-text{width:100%;border:1px solid var(--line);border-radius:10px;padding:10px 12px;
@@ -532,6 +537,11 @@ __APP_JS__
 const MOBILE_JS = `
 var PRICE_TABLE = __PRICING__;
 var SELF = __SELF__;
+// Read-only, baked into the page — see the desktop's RO for why it is not fetched.
+// On a phone this matters more than on a laptop: the composer is a fifth of the screen,
+// so removing it gives the transcript back the space rather than leaving dead furniture.
+var RO = __RO__;
+if (RO) document.documentElement.classList.add('ro');
 var INIT_OPEN = __INIT_OPEN__;
 
 // ── addressing ────────────────────────────────────────────────────────────────
@@ -808,7 +818,7 @@ function createListPanel(){
       var on = sel.indexOf(s.name) !== -1;
       return '<span class="chip'+(on?' on':'')+(s.status==='down'?' down':'')+'" data-srv="'+esc(s.name)+'">'+
         esc(s.name)+(s.self?'':'')+
-        '<button class="cterm" data-term="'+esc(s.name)+'" title="Terminal on '+esc(s.name)+'">&gt;_</button></span>';
+        (RO ? '' : '<button class="cterm" data-term="'+esc(s.name)+'" title="Terminal on '+esc(s.name)+'">&gt;_</button>')+'</span>';
     }).join('');
   }
   srvEl.addEventListener('click', function(e){
@@ -1152,7 +1162,7 @@ function createSessionPanel(sid, server){
     { k:'max', html:ICON.max, title:'Maximize' },
     { k:'term', html:ICON.term, title:'Terminal' },
     { k:'close', html:ICON.close, title:'Close' },
-  ]));
+  ].filter(function(b){ return !(RO && b.k === 'term'); })));
   root.appendChild(head);
 
   var body = el('div','pbody',
@@ -1524,7 +1534,7 @@ function createSessionPanel(sid, server){
       '<div class="perm-acts">'+(msg.options||[]).map(function(o,i){
         return '<button class="perm-opt'+(i===0?' first':'')+'" data-n="'+o.n+'">'+o.n+'. '+esc(o.label)+'</button>';
       }).join('')+'</div>'+
-      '<div class="perm-note">Also answerable at the terminal.</div>';
+      '<div class="perm-note">'+(RO ? 'Waiting for an answer at the terminal.' : 'Also answerable at the terminal.')+'</div>';
     card.addEventListener('click', function(e){
       var b = e.target.closest('.perm-opt');
       if (!b) return;
@@ -1565,7 +1575,7 @@ function createSessionPanel(sid, server){
       if (!ms) html += '<div class="perm-acts"><input class="ask-text" data-qi="'+qi+'" placeholder="Type an answer…"></div>';
     });
     html += '<div class="perm-acts"><button class="ask-submit"'+(showSubmit?'':' style="display:none"')+' disabled>Submit</button></div>';
-    html += '<div class="perm-note" id="an-'+id+'">Also answerable at the terminal.</div>';
+    html += '<div class="perm-note" id="an-'+id+'">'+(RO ? 'Waiting for an answer at the terminal.' : 'Also answerable at the terminal.')+'</div>';
     html += '<div class="tool-output" id="to-'+id+'"></div>';
     card.innerHTML = html;
 
@@ -1947,7 +1957,7 @@ function createSessionPanel(sid, server){
     var b = e.target.closest('.pbtn');
     if (!b) {
       if (p.state === 'min') setState(p, 'exp');
-      else if (e.target === titleEl) renameTitle();
+      else if (e.target === titleEl && !RO) renameTitle();
       return;
     }
     var k = b.dataset.k;
@@ -2287,7 +2297,7 @@ if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
 
 // Same assembly as the desktop page: one substitution per value, each with a function
 // replacement so a "$&" or "$1" inside the JSON can never be read as a backreference.
-function mobilePageHtml(initOpenSessionId, initOpenServer, self, priceTable) {
+function mobilePageHtml(initOpenSessionId, initOpenServer, self, priceTable, ro) {
   const open = initOpenSessionId
     ? { sessionId: initOpenSessionId, server: initOpenServer || null }
     : null;
@@ -2295,6 +2305,7 @@ function mobilePageHtml(initOpenSessionId, initOpenServer, self, priceTable) {
     () => MOBILE_JS
       .replace('__PRICING__', () => JSON.stringify(priceTable))
       .replace('__SELF__', () => JSON.stringify(self))
+      .replace('__RO__', () => JSON.stringify(!!ro))
       .replace('__INIT_OPEN__', () => JSON.stringify(open)));
 }
 

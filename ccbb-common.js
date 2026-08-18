@@ -26,7 +26,7 @@ const CACHE_FILE = path.join(CLAUDE_DIR, 'ccbb-cache.json');
 //   { "token": "<webex bot token>", "allow": ["you@example.com"],
 //     "commands": { "name": { "run": "…", "kind": "console" } },
 //     "confluence": { "baseUrl": "…", "token": "…", "rootPageId": "…", "allow": […] },
-//     "server": { "name": "workbox" }, "peerToken": "…",
+//     "server": { "name": "workbox" }, "peerToken": "…", "readToken": "…",
 //     "peers": [ { "name": "laptop", "url": "http://127.0.0.1:8591", "token": "…" } ] }
 function readConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; }
@@ -67,6 +67,15 @@ function peerList() {
 function peerByName(name) { return peerList().find(p => p.name === name) || null; }
 // The token THIS server requires of its callers. Empty string = no auth (the default).
 function peerToken() { return String(readConfig().peerToken || ''); }
+// A second, weaker token: whoever holds it may LOOK at this server and nothing else —
+// no peers, no terminal, no writing to a session. It is what you hand someone who should
+// see what a machine is doing without being able to touch it, and what you paste into a
+// link you are about to share. Empty string = the feature is off.
+//
+// Deliberately not a list of tokens with roles attached: two secrets, one that can act
+// and one that cannot, is the whole distinction worth making here, and a role table would
+// invite the question of which of the twenty routes belongs to which role.
+function readToken() { return String(readConfig().readToken || ''); }
 
 // ── Pricing ────────────────────────────────────────────────────────────────
 // Model pricing sourced from LiteLLM's community price list (the same data ccusage
@@ -1707,7 +1716,7 @@ function getCostSummary(periodFilter) {
 module.exports = {
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
-  serverIdentity, peerList, peerByName, peerToken,
+  serverIdentity, peerList, peerByName, peerToken, readToken,
   // pricing
   PRICING, priceTable: PRICE_TABLE, priceForModel, contextMaxFor,
   loadTable, priceForModelIn, tableSig, normalizeId, convertLiteLLM,
