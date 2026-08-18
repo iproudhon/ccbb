@@ -28,10 +28,23 @@ const CACHE_FILE = path.join(CLAUDE_DIR, 'ccbb-cache.json');
 //     "confluence": { "baseUrl": "…", "token": "…", "rootPageId": "…", "allow": […] },
 //     "server": { "name": "workbox" }, "peerToken": "…", "readToken": "…",
 //     "peers": [ { "name": "laptop", "url": "http://127.0.0.1:8591", "token": "…" } ] }
+// A MISSING config and a BROKEN one are not the same answer, and the difference decides
+// whether this server has auth. Missing means "single host, no tokens", which is the
+// original behaviour and must keep working. Broken — a stray comma, or the instant an
+// editor has truncated the file but not yet written it — used to read as missing too,
+// which silently turned peerToken off and let anyone in with no token and no log line.
+// So the failure is recorded, and authLevel refuses rather than guesses. See there.
+let configBroken = false;
 function readConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; }
-  catch { return {}; }
+  let text;
+  try { text = fs.readFileSync(CONFIG_FILE, 'utf8'); }
+  catch { configBroken = false; return {}; }        // absent: nothing to get wrong
+  try { const j = JSON.parse(text) || {}; configBroken = false; return j; }
+  catch { configBroken = true; return {}; }
 }
+// True only while the file exists and does not parse. Callers that hand out ACCESS must
+// treat it as "unknown", never as "unset".
+function configUnreadable() { readConfig(); return configBroken; }
 
 // ── Multi-server identity ─────────────────────────────────────────────────────
 // A ccbb server has a NAME (config server.name, default the hostname) and a list of
@@ -1013,6 +1026,12 @@ function paneForSession(sessionId) {
   return null;
 }
 
+// The names ccbb gives its own per-page tmux sessions (see tmuxGroupName in ccbb-web).
+// Defined here because this file has to be able to tell them apart from the user's, and
+// two copies of the rule would be one copy too many.
+const CCBB_GROUP_RE = /^ccbb-[A-Za-z0-9]{8}$/;
+function isCcbbGroupSession(name) { return CCBB_GROUP_RE.test(String(name || '')); }
+
 // Every live session's pane in ONE sweep, as sessionId → { pane, session, rec }.
 // paneForSession answers for a single session and pays for a `ps` and a `tmux list-panes`
 // each time; asking "which tmux session holds the most Claude Codes" needs the answer for
@@ -1025,10 +1044,19 @@ function panesForLiveSessions() {
   let paneLines;
   try { paneLines = tmux(['list-panes', '-a', '-F', '#{pane_pid}\t#{pane_id}\t#{session_name}']); }
   catch { return out; }
+  // A pane in a session GROUP is listed once per session in that group, so a pane can
+  // arrive several times under different names. Last-write-wins picked whichever tmux
+  // listed last — alphabetically, which for the common session names ("0", "work") means
+  // one of ccbb's own ccbb-<id> bookkeeping sessions won. The caller then saw the user's
+  // Claude as living in a scratch session that comes and goes with a browser tab.
   const byPanePid = new Map();
   for (const l of paneLines.split('\n')) {
     const [pp, pane, sess] = l.split('\t');
-    if (pp && pane) byPanePid.set(Number(pp), { pane, session: sess || '' });
+    if (!pp || !pane) continue;
+    const key = Number(pp), name = sess || '';
+    const prev = byPanePid.get(key);
+    if (prev && isCcbbGroupSession(name) && !isCcbbGroupSession(prev.session)) continue;
+    byPanePid.set(key, { pane, session: name });
   }
   const parent = parentMap();
   for (const rec of recs.values()) {
@@ -1745,7 +1773,7 @@ function getCostSummary(periodFilter) {
 module.exports = {
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
-  serverIdentity, peerList, peerByName, peerToken, readToken,
+  serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable,
   // pricing
   PRICING, priceTable: PRICE_TABLE, priceForModel, contextMaxFor,
   loadTable, priceForModelIn, tableSig, normalizeId, convertLiteLLM,
@@ -1762,7 +1790,7 @@ module.exports = {
   // liveness + mutation
   pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
-  tmux, paneForSession, panesForLiveSessions, injectToPane,
+  tmux, paneForSession, panesForLiveSessions, isCcbbGroupSession, injectToPane,
   transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionInfo,
   startTail, stopTail, watchSessionChanges,

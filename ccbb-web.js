@@ -14,13 +14,14 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { spawnSync, spawn } = require('child_process');
 
 const common = require('./ccbb-common');
 // The phone front-end. Same server, same API, its own page — see ccbb-mobile.js.
 const { mobilePageHtml, isMobileUA, serveVendor } = require('./ccbb-mobile');
 const {
-  serverIdentity, peerList, peerByName, peerToken, readToken,
+  serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable, isCcbbGroupSession,
   CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionStats, watchSessionChanges,
   sessionLiveness, pidAlive, renameSession, paneForSession, panesForLiveSessions, injectToPane, transcriptEntry,
@@ -143,6 +144,116 @@ function commandsHelp(commands) {
 // Updates that land while a view is collapsed, hidden, or scrolled away light a
 // prominent indicator on its bar; it clears once the view is actually seen
 // (expanded and following the bottom).
+// ── the icon ──────────────────────────────────────────────────────────────────
+// The tab favicon is an inline SVG and every browser draws it crisply. Chrome's
+// "install this page as an app" is not a browser tab, though: the shortcut it writes and
+// the taskbar entry it creates come from its icon downloader, which wants a raster it can
+// resize — an SVG data: URI is not one, so an installed ccbb came out as a generic tile.
+//
+// Real PNGs, then. Which normally means a build step and binaries checked into the tree,
+// for a mark that is seven rounded rectangles and two circles — so it is drawn here
+// instead, at whatever size is asked for, and cached. Nothing to regenerate, nothing to
+// keep in sync with the SVG above it: this IS the SVG above it, in numbers.
+const ICON_FG = [0xff, 0x6b, 0x35], ICON_ON = [0xff, 0xff, 0xff];
+const ICON_SHAPES = [                                    // painter's order, all opaque
+  { x: 16, y: 12, w: 32, h: 28, r: 4, c: ICON_FG },      // head
+  { cx: 24, cy: 20, rad: 4, c: ICON_ON },                // eyes
+  { cx: 40, cy: 20, rad: 4, c: ICON_ON },
+  { x: 20, y: 28, w: 24, h: 2, r: 1, c: ICON_ON },       // mouth
+  { x: 18, y: 42, w: 28, h: 16, r: 2, c: ICON_FG },      // body
+  { x: 8, y: 46, w: 10, h: 8, r: 2, c: ICON_FG },        // arms
+  { x: 46, y: 46, w: 10, h: 8, r: 2, c: ICON_FG },
+];
+function iconHit(s, x, y) {
+  if (s.rad != null) { const dx = x - s.cx, dy = y - s.cy; return dx * dx + dy * dy <= s.rad * s.rad; }
+  if (x < s.x || y < s.y || x > s.x + s.w || y > s.y + s.h) return false;
+  if (!s.r) return true;
+  // Nearest point of the rectangle shrunk by the corner radius: zero inside, and the
+  // radius test then rounds exactly the four corners.
+  const cx = Math.min(Math.max(x, s.x + s.r), s.x + s.w - s.r);
+  const cy = Math.min(Math.max(y, s.y + s.r), s.y + s.h - s.r);
+  const dx = x - cx, dy = y - cy;
+  return dx * dx + dy * dy <= s.r * s.r;
+}
+// 4×4 supersampling, and colour averaged over the COVERED samples only while alpha is the
+// coverage — average them together and every edge picks up a dark fringe from the
+// transparent black it is being mixed with.
+function iconRgba(size, scale, bg) {
+  const SS = 4, out = Buffer.alloc(size * size * 4);
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      let r = 0, g = 0, b = 0, hits = 0;
+      for (let sy = 0; sy < SS; sy++) for (let sx = 0; sx < SS; sx++) {
+        const ux = (((px + (sx + 0.5) / SS) / size * 64) - 32) / scale + 32;
+        const uy = (((py + (sy + 0.5) / SS) / size * 64) - 32) / scale + 32;
+        let c = bg;
+        for (const s of ICON_SHAPES) if (iconHit(s, ux, uy)) c = s.c;
+        if (c) { r += c[0]; g += c[1]; b += c[2]; hits++; }
+      }
+      const i = (py * size + px) * 4;
+      if (!hits) continue;
+      out[i] = Math.round(r / hits); out[i + 1] = Math.round(g / hits); out[i + 2] = Math.round(b / hits);
+      out[i + 3] = Math.round(hits / (SS * SS) * 255);
+    }
+  }
+  return out;
+}
+const iconCrc32 = zlib.crc32 || (() => {
+  const T = new Int32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); T[n] = c; }
+  return (buf) => { let c = -1; for (let i = 0; i < buf.length; i++) c = T[(c ^ buf[i]) & 0xff] ^ (c >>> 8); return (c ^ -1) >>> 0; };
+})();
+function pngEncode(size, rgba) {
+  const stride = size * 4 + 1, raw = Buffer.alloc(stride * size);
+  for (let y = 0; y < size; y++) rgba.copy(raw, y * stride + 1, y * size * 4, (y + 1) * size * 4);
+  const chunk = (type, data) => {
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(data.length, 0); head.write(type, 4, 'ascii');
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(iconCrc32(Buffer.concat([Buffer.from(type, 'ascii'), data])) >>> 0, 0);
+    return Buffer.concat([head, data, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; ihdr[9] = 6;              // 8 bits per channel, truecolour with alpha
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+const ICON_SIZES = [32, 48, 64, 180, 192, 512];
+const iconCache = new Map();
+// A maskable icon is cropped to whatever shape the platform likes, so it fills the square
+// and keeps the mark inside the safe circle — the plain one stays transparent and edge
+// to edge, which is what a taskbar and a tab want.
+function iconPngFor(size, maskable) {
+  const key = size + (maskable ? 'm' : 'a');
+  let png = iconCache.get(key);
+  if (!png) {
+    png = pngEncode(size, maskable ? iconRgba(size, 0.62, [0xff, 0xff, 0xff]) : iconRgba(size, 1, null));
+    iconCache.set(key, png);
+  }
+  return png;
+}
+// Enough for Chrome to install it as an app under a name that says WHICH ccbb it is —
+// several of these end up on one taskbar. Fetched with the cookie (the link element says
+// use-credentials), so the name stays behind the token; the icons it points at do not
+// need to be, and are served without it.
+function webManifest(self) {
+  const name = 'ccbb' + (self && self.name ? ' — ' + self.name : '');
+  return {
+    name, short_name: (self && self.name) || 'ccbb', id: '/', start_url: '/', scope: '/',
+    display: 'standalone', background_color: '#ffffff', theme_color: '#f0eee6',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512-maskable.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+    ],
+  };
+}
+
 const APP_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -150,6 +261,12 @@ const APP_HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ccbb</title>
 <link rel="shortcut icon" href="data:image/svg+xml,%3Csvg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='16' y='12' width='32' height='28' rx='4' fill='%23FF6B35'/%3E%3Ccircle cx='24' cy='20' r='4' fill='%23fff'/%3E%3Ccircle cx='40' cy='20' r='4' fill='%23fff'/%3E%3Crect x='20' y='28' width='24' height='2' fill='%23fff' rx='1'/%3E%3Crect x='18' y='42' width='28' height='16' rx='2' fill='%23FF6B35'/%3E%3Crect x='8' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3Crect x='46' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3C/svg%3E" />
+<!-- The SVG is what a tab draws. Chrome's app installer wants a raster and a
+     manifest, and gets both here — see iconPngFor()/webManifest() in ccbb-web.js. -->
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
@@ -168,7 +285,7 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .view:last-child{border-bottom:none}
 .view.collapsed{flex:0 0 auto}
 .view.collapsed .view-body{display:none}
-.view-bar{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:6px 14px;background:var(--bg-alt);border-bottom:1px solid var(--line);min-height:38px}
+.view-bar{position:relative;flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:6px 14px;background:var(--bg-alt);border-bottom:1px solid var(--line);min-height:38px}
 .view.collapsed .view-bar{cursor:pointer;border-bottom:none}
 /* Stowed away: nothing but the chevron, so a folded list costs a sliver instead of a
    column. Clicking anywhere on the strip brings it back. */
@@ -180,6 +297,22 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .bar-btns{margin-left:auto;display:flex;gap:2px;flex-shrink:0}
 .vb-btn{background:none;border:none;color:var(--ink-soft);font-size:14px;cursor:pointer;line-height:1;padding:4px 8px;border-radius:6px;font-family:inherit}
 .vb-btn:hover{background:var(--line);color:var(--ink)}
+/* ── a view's actions, folded away ──
+   A session bar carried six buttons, and a two-line stats block sat above the transcript
+   for good, all of it on screen for the sake of the moment you want one of them. It is
+   one dots button now, and that button unfolds the rest: the buttons open in the bar
+   itself, to the left of the dots, and the header hangs down from the bar's lower edge.
+   Click again — or outside, or Escape — to fold it all away. */
+.vb-acts{display:none;gap:2px}
+.bar-btns.open .vb-acts{display:flex}
+/* Fixed and placed as it opens, because in horizontal mode the bar is a grid cell with
+   overflow:hidden and a block positioned against it would be clipped away. Placed at the
+   bar's own left edge and width, so it reads as the bar continuing downwards. */
+.vb-head{display:none;position:fixed;z-index:60;background:var(--bg);
+  border:1px solid var(--line);border-top:none;border-radius:0 0 10px 10px;
+  box-shadow:0 12px 24px rgba(0,0,0,.13);overflow:hidden}
+.vb-head.open{display:block}
+.view.folded .vb-head{display:none}
 .unseen-ind{display:none}
 .view.unseen .view-bar{background:#f9e3d5}
 .view.unseen .unseen-ind{display:inline-flex;align-items:center;background:var(--accent);color:#fff;border-radius:10px;padding:2px 10px;font-size:11px;font-weight:600;flex-shrink:0;animation:pulse 1.2s ease-in-out infinite}
@@ -292,8 +425,8 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .hdr-title.empty{color:var(--ink-faint);font-style:italic;font-weight:400}
 .hdr-title-input{font-weight:600;font-size:13px;font-family:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:2px 6px;flex:1;min-width:0;box-shadow:0 0 0 3px var(--accent-soft)}
 .hdr-title-input:focus{outline:none}
-.sv-stats{flex:0 0 auto;padding:4px 16px 5px;border-bottom:1px solid var(--line-soft);background:var(--bg)}
-.hdr-proj{font-size:11px;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums;display:block}
+.sv-stats{padding:8px 12px 9px;background:var(--bg);max-height:44vh;overflow:auto}
+.hdr-proj{font-size:11px;color:var(--ink-soft);overflow-wrap:anywhere;font-variant-numeric:tabular-nums;display:block;margin-bottom:2px}
 .hdr-proj b{font-weight:600;color:var(--ink)}
 .hdr-stats{font-size:11px;color:var(--ink-faint);line-height:1.55;font-variant-numeric:tabular-nums;display:block}
 .hdr-stats b{font-weight:600;color:var(--ink-soft)}
@@ -483,7 +616,7 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
    scrolled off, so the editor gets the full height instead of a share of it. The notch
    goes away here — the text starts at the top of a tall box while the button stays in the
    corner, so a last-line cutout would be nowhere near it; a reserved strip does the job. */
-.view-body.input-max>.sv-stats,.view-body.input-max>.tr-wrap,.view-body.input-max>.cmd-box{display:none}
+.view-body.input-max>.tr-wrap,.view-body.input-max>.cmd-box,.view-body.input-max>.sv-foot{display:none}
 .view-body.input-max>.input-area{flex:1 1 auto;min-height:0;border-top:none}
 .view-body.input-max .input-inner{max-width:none;height:100%;display:flex;flex-direction:column}
 .view-body.input-max .input-row{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
@@ -532,6 +665,7 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
    where a centred one would lose a column at each end and a row top and bottom. */
 .sv-term{display:none;flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:#fff}
 .sv-term.dark{background:#000}
+.sv-term.dead{opacity:.6}
 /* Padding lives on .xterm, not on the box, so clientWidth/clientHeight stay the honest
    measurement the font fit divides by. Kept in sync with TERM_PAD_X/Y in the script. */
 .term-host{position:absolute;inset:0}
@@ -548,6 +682,21 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
   font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--ink-faint);
   background:var(--bg);opacity:.55;padding:0 4px;border-radius:4px}
 .sv-term.dark .term-fit{background:#000;color:#8c959f}
+
+/* ── the status line, at the foot ──
+   The shape Claude Code's own status line uses (statusline-instructions.md): model,
+   session cost with the plan windows riding on it, turns, and context as
+   current/peak/resend. One dim line at the bottom, where a status line belongs — the
+   breakdown it summarises is in the header block the dots button opens. It stays up in
+   terminal mode too, which is the one view with nothing else to read the numbers from. */
+.sv-foot{flex:0 0 auto;display:flex;align-items:baseline;gap:12px;padding:4px 14px 5px;
+  border-top:1px solid var(--line);background:var(--bg-alt);
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--ink-soft);
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden}
+.sv-foot .sl{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.sv-foot b{font-weight:600;color:var(--ink)}
+.sv-foot .plan-win{color:var(--ink-soft);cursor:help}
+.sv-foot .sl-idle{margin-left:auto;flex-shrink:0;color:#8a6d1a}
 
 /* ── ssh terminal ──
    A terminal is deliberately NOT a view: you want it over whatever you are reading, at
@@ -889,7 +1038,23 @@ function setUnseen(v, on){
   v.unseen = on;
   v.el.classList.toggle('unseen', on);
 }
-// Build a view's title bar. buttons: {close:bool}. barMain is an element.
+// The buttons a view offers, wherever they are drawn: inline in the bar, or in the block
+// the dots button opens. Two terminals, deliberately distinct: $_ is this view's own
+// content area, #_ is the floating window — the same one per server the session list
+// opens, with the same remembered place, font and grid.
+function viewBtnsHtml(buttons){
+  var menu = !!(buttons && buttons.menu);
+  return '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
+    (menu ? '<button class="vb-btn" data-act="fold" title="Minimize">&#8211;</button>' : '')+
+    '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
+    (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal in this view">$_</button>' : '')+
+    (buttons && buttons.term && !RO ? '<button class="vb-btn" data-act="termwin" title="Floating terminal for this session">#_</button>' : '')+
+    (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
+    (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
+}
+// Build a view's title bar. buttons: {close, term, orient, menu, headEl}. barMain is an
+// element. With menu:true the bar shows one dots button and everything else — the button
+// row and headEl, the view's own header block — moves into the block it opens.
 function makeViewBar(v, barMain, buttons){
   var bar = document.createElement('div');
   bar.className = 'view-bar';
@@ -900,23 +1065,70 @@ function makeViewBar(v, barMain, buttons){
   bar.appendChild(barMain);
   var btns = document.createElement('div');
   btns.className = 'bar-btns';
-  btns.innerHTML = '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
-    '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
-    (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal for this session">&gt;_</button>' : '')+
-    (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
-    (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
+  var head = null, foldable = !!(buttons && buttons.menu);
+  if (foldable) {
+    btns.innerHTML = '<span class="vb-acts">' + viewBtnsHtml(buttons) + '</span>' +
+      '<button class="vb-btn vb-dots" data-act="menu" title="Actions and details">&#8942;</button>';
+    if (buttons.headEl) {
+      head = document.createElement('div');
+      head.className = 'vb-head';
+      head.appendChild(buttons.headEl);
+    }
+  } else {
+    btns.innerHTML = viewBtnsHtml(buttons);
+  }
   bar.appendChild(btns);
+  if (head) bar.appendChild(head);
+
+  function menuIsOpen(){ return btns.classList.contains('open'); }
+  function onDocDown(e){ if (!bar.contains(e.target)) closeMenu(); }
+  function onDocKey(e){ if (e.key === 'Escape') closeMenu(); }
+  function closeMenu(){
+    if (!menuIsOpen()) return;
+    btns.classList.remove('open');
+    if (head) head.classList.remove('open');
+    document.removeEventListener('mousedown', onDocDown, true);
+    document.removeEventListener('keydown', onDocKey, true);
+    window.removeEventListener('resize', closeMenu);
+  }
+  function openMenu(){
+    if (!foldable || menuIsOpen()) return;
+    // Maximize is the one button that reads differently depending on where the view
+    // already is, so it is written as it unfolds rather than left stale.
+    var mb = btns.querySelector('.vb-btn[data-act="max"]');
+    if (mb) { mb.innerHTML = v.maxed ? '&#10064;' : '&#9633;'; mb.title = v.maxed ? 'Normal size' : 'Maximize'; }
+    btns.classList.add('open');
+    if (head) {
+      // Measured after the buttons are in, since showing them can grow the bar.
+      var r = bar.getBoundingClientRect();
+      head.style.top = Math.round(r.bottom) + 'px';
+      head.style.left = Math.round(r.left) + 'px';
+      head.style.width = Math.round(r.width) + 'px';
+      head.classList.add('open');
+    }
+    document.addEventListener('mousedown', onDocDown, true);
+    document.addEventListener('keydown', onDocKey, true);
+    window.addEventListener('resize', closeMenu);
+  }
+  v.closeMenu = closeMenu;
+
   bar.addEventListener('click', function(e){
     var b = e.target.closest('.vb-btn');
     if (b) {
       e.stopPropagation();
+      if (b.dataset.act === 'menu') { if (menuIsOpen()) closeMenu(); else openMenu(); return; }
+      closeMenu();
       if (b.dataset.act === 'refresh') v.refresh();
       else if (b.dataset.act === 'term') { if (v.onTerm) v.onTerm(); }
+      else if (b.dataset.act === 'termwin') { if (v.onTermWin) v.onTermWin(); }
+      else if (b.dataset.act === 'fold') toggleFold(v);
       else if (b.dataset.act === 'max') toggleMax(v);
       else if (b.dataset.act === 'orient') toggleOrientation();
       else if (b.dataset.act === 'close') closeView(v);
       return;
     }
+    // Reading the header block, or selecting out of it, is not a click on the bar.
+    if (head && head.contains(e.target)) return;
     // Tapping a collapsed view's bar reveals it (and its unviewed updates). Collapsed
     // because something ELSE is maximized → take the maximize, as before. Collapsed
     // because it was folded → just unfold, back to an equal share.
@@ -1617,7 +1829,14 @@ function createSessionView(INFO){
   barMain.innerHTML = '<div class="status-dot"></div>'
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
     + '<div class="hdr-title">Loading…</div>';
-  el.appendChild(makeViewBar(v, barMain, { close:true, term:true }));
+  // The header block. It is built here — renderStats writes into these same elements
+  // wherever they end up — and handed to the bar, which keeps it in the block the dots
+  // button opens. Hidden by default: the numbers that are wanted at a glance are on the
+  // status line at the foot, and this is the detail behind them.
+  var headEl = document.createElement('div');
+  headEl.className = 'sv-stats';
+  headEl.innerHTML = '<span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status"></div>';
+  el.appendChild(makeViewBar(v, barMain, { close:true, term:true, menu:true, headEl:headEl }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
 
@@ -1625,7 +1844,6 @@ function createSessionView(INFO){
   var body = document.createElement('div');
   body.className = 'view-body';
   body.innerHTML =
-    '<div class="sv-stats"><span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status"></div></div>'+
     '<div class="tr-wrap">'+
       '<div class="transcript"></div>'+
       '<button class="jump-marker">&#8595; New updates</button>'+
@@ -1652,12 +1870,15 @@ function createSessionView(INFO){
         '<div class="input-box" data-ph="Message the session…  (// for commands)"></div>'+
         '<button class="send-btn" title="'+SEND_TIP+'">&#8593;</button>'+
       '</div>'+
-    '</div></div>';
+    '</div></div>'+
+    '<div class="sv-foot"><span class="sl"></span><span class="sl-idle"></span></div>';
   el.appendChild(body);
   v.bodyEl = body;
-  var projEl = body.querySelector('.hdr-proj');
-  var statsEl = body.querySelector('.hdr-stats');
-  var statusRow = body.querySelector('.hdr-status');
+  var projEl = headEl.querySelector('.hdr-proj');
+  var statsEl = headEl.querySelector('.hdr-stats');
+  var statusRow = headEl.querySelector('.hdr-status');
+  var footEl = body.querySelector('.sv-foot .sl');
+  var footIdleEl = body.querySelector('.sv-foot .sl-idle');
   var transcript = body.querySelector('.transcript');
   var jumpMarker = body.querySelector('.jump-marker');
   var queryEl = body.querySelector('.query-ind');
@@ -1738,17 +1959,17 @@ function createSessionView(INFO){
     if (!core || !core.term) return;
     if (core.pinned) return fitTermFont(++fitRun);
     try { core.fit.fit(); } catch(e) { return; }
-    if (core.term.cols !== core.cols || core.term.rows !== core.rows) {
-      core.cols = core.term.cols; core.rows = core.term.rows;
-      core.send({ type:'size', cols:core.cols, rows:core.rows });
-    }
+    if (core.term.cols !== core.cols || core.term.rows !== core.rows)
+      core.setSize(core.term.cols, core.term.rows);
     showTermGeom();
   }
   function setTermBtn(on){
+    var d = el.querySelector('.vb-btn.vb-dots');
+    if (d) d.classList.toggle('on', on);
     var b = el.querySelector('.vb-btn.term-open');
     if (!b) return;
     b.classList.toggle('on', on);
-    b.title = on ? 'Back to the transcript' : 'Terminal for this session';
+    b.title = on ? 'Back to the transcript' : 'Terminal in this view';
   }
   function openSessionTerm(){
     if (termRef) return;
@@ -1756,6 +1977,9 @@ function createSessionView(INFO){
     setTermBtn(true);
     var core = termCore(termHost, {
       server: INFO.server, title: SRV, sessionId: INFO.sessionId,
+      // The one terminal that must not resize tmux: you are looking at this session here,
+      // and reflowing the window you are working in to fit a browser pane is intolerable.
+      pin: true,
       fontSize: 12, theme: 'light',
       // A sensible hint for the case tmux does not overrule it — a login shell should
       // still come up at the size of the box it is about to be drawn in.
@@ -1788,6 +2012,11 @@ function createSessionView(INFO){
     if (following) scrollBottom(true);
   }
   v.onTerm = function(){ if (termRef) closeSessionTerm(); else openSessionTerm(); };
+  // The other mode: the floating window, which is the very one the session list opens per
+  // server — same window, same cookie, so its place, font size and grid are the ones you
+  // left it at. Opening it against a session re-targets that server's window at the
+  // session's tmux pane; there is still only ever one of them per server.
+  v.onTermWin = function(){ openTerminalWindow(INFO.server, { sessionId: INFO.sessionId }); };
 
   var ws, reconnectTimer, destroyed = false, connected = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
@@ -1884,7 +2113,7 @@ function createSessionView(INFO){
       }).catch(function(){});
   }
   function renderStats(st) {
-    if (!st) { statsEl.textContent = ''; return; }
+    if (!st) { statsEl.textContent = ''; footEl.innerHTML = ''; return; }
     lastStats = st;
     projEl.innerHTML = (INFO.projectPath?'<b>'+esc(INFO.projectPath)+'</b>':'') +
       '  &middot;  last '+esc(fmtStatDate(st.lastActivity))+'  &middot;  started '+esc(fmtStatDate(st.startedAt));
@@ -1907,6 +2136,35 @@ function createSessionView(INFO){
     statsEl.innerHTML = '<b>'+turns+'</b>'+subStr+' turn'+(turns===1?'':'s')+
       '  &middot;  <b>'+fmtCost(st.cost)+'</b>'+planWinHtml(st)+modelStr+
       '  &middot;  <b>'+fmtTokShort(st.totalTokens)+'</b>  '+tokStr+ctxStr;
+    renderFoot();
+  }
+  // The status line, in the shape statusline-instructions.md describes: model, session
+  // cost with the plan windows appended, turns, and context as current/peak/resend. No
+  // monthly estimate — that one is a whole-machine figure and this line is one session's.
+  // The model is whichever one the last turn ran on, not the one that cost the most:
+  // this reports what the session IS, and the header behind it lists the rest.
+  function renderFoot(){
+    var st = lastStats;
+    if (!st) { footEl.innerHTML = ''; return; }
+    var ctx = st.context, cmax = st.contextMax;
+    var mdl = ctx && ctx.model ? prettyModel(ctx.model) : '';
+    if (!mdl) {
+      var ms = (st.models||[]).slice().sort(function(a,b){ return (b.cost||0)-(a.cost||0); });
+      if (ms.length) mdl = prettyModel(ms[0].model);
+    }
+    var ctxStr = '';
+    if (ctx) {
+      var peak = (cmax && cmax.tokens > ctx.tokens) ? cmax.tokens : ctx.tokens;
+      ctxStr = 'ctx:'+(ctx.postCompact?'~':'')+'<b>'+fmtTokShort(ctx.tokens)+'</b>/'+
+        fmtTokShort(peak)+'/'+fmtCost(ctx.cost);
+    }
+    var turns = st.turns||0, subTurns = st.subTurns||0;
+    footEl.innerHTML = [
+      mdl ? '<b>'+esc(mdl)+'</b>' : '',
+      '<b>'+fmtCost(st.cost)+'</b>'+planWinHtml(st),
+      'turns:<b>'+turns+'</b>'+(subTurns?'+'+subTurns:''),
+      ctxStr,
+    ].filter(Boolean).join('&nbsp;&nbsp;');
   }
   // Session state from the live sidecar: busy = Claude is working, idle = it finished the
   // turn and is waiting for your input ("session end" in the turn sense), no sidecar = the
@@ -1931,9 +2189,15 @@ function createSessionView(INFO){
       statusRow.innerHTML = '⏸ finished responding' + (at ? ' at <b>'+esc(fd(at))+'</b>' : '') +
         ' · waiting for input' + (since ? ' <b>'+since+'</b>' : '');
       statusRow.classList.add('show');
+      // The header it normally lives in is hidden now, and "it stopped and is waiting for
+      // you" is the one piece of status you should not have to open a block to learn.
+      footIdleEl.textContent = '⏸ waiting' + (since ? ' ' + since : '');
+      footIdleEl.title = statusRow.textContent;
     } else {
       statusRow.classList.remove('show');
       statusRow.innerHTML = '';
+      footIdleEl.textContent = '';
+      footIdleEl.title = '';
     }
   }
   var queryCount = 0;
@@ -2900,7 +3164,9 @@ var termCores = [];
 // while a session's terminal is pinned to the grid tmux already has and fits its FONT to
 // the box instead. One question with two right answers stays with the caller.
 //
-// opts: { server, title, sessionId, fontSize, theme, onReady, onOpen(d), onState(s) }
+// opts: { server, title, sessionId, pin, fontSize, theme, onReady, onOpen(d), onState(s) }
+// pin defaults to true and only matters with a sessionId: it is the caller saying whether
+// tmux's grid rules this terminal, or this terminal's grid rules tmux.
 function termCore(bodyEl, opts){
   var srv = isLocal(opts.server) ? null : opts.server;
   var API = apiBase(srv);                  // '' locally, '/peer/<name>' for a peer
@@ -2910,6 +3176,15 @@ function termCore(bodyEl, opts){
   termCores.push(c);
   function fire(n, a){ if (opts[n]) opts[n](a); }
   c.send = function(o){ if (c.ws && c.ws.readyState === 1) { try { c.ws.send(JSON.stringify(o)); } catch(e) {} } };
+  // The ONLY way to change the grid. It records what was sent, which is what a reconnect
+  // replays on open — set the size any other way and a dropped socket comes back asking
+  // the server for the size the terminal had when it was first opened, silently resizing
+  // the pty out from under a window the user has since resized.
+  c.setSize = function(cols, rows){
+    if (c.pinned) return;                  // tmux owns this one; the server drops it anyway
+    c.cols = cols; c.rows = rows;
+    c.send({ type:'size', cols:cols, rows:rows });
+  };
   c.note = function(html){ bodyEl.innerHTML = '<div class="term-pick"><div class="term-note">' + html + '</div></div>'; };
 
   c.start = function(){
@@ -2938,7 +3213,8 @@ function termCore(bodyEl, opts){
         c.send({ type:'in', b: b64FromBytes(u) });
       });
       return fetch(API + '/api/term/open', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ cols:c.cols, rows:c.rows, sessionId: opts.sessionId || null }) })
+        body: JSON.stringify({ cols:c.cols, rows:c.rows, sessionId: opts.sessionId || null,
+                               pin: opts.pin !== false }) })
         .then(function(r){ return r.json(); })
         .then(function(d){
           if (c.destroyed) return;
@@ -3091,6 +3367,12 @@ function openTerminalWindow(server, opts){
   // that fills the screen, or one with no body, and hide where it really lives.
   var lastRect = { x: geom.x, y: geom.y, w: geom.w, h: geom.h };
   var lastGrid = { cols: Math.round(tnum(saved && saved.cols, 0)), rows: Math.round(tnum(saved && saved.rows, 0)) };
+  // The grid to open at, kept apart from the one being tracked. noteRect() overwrites
+  // lastGrid with whatever the terminal currently measures, and it runs — via onOpen —
+  // before the remembered grid is applied, so reading the wish out of lastGrid at that
+  // point read back the fit it was meant to correct, and the saved columns and rows were
+  // silently ignored on every open.
+  var openGrid = { cols: lastGrid.cols, rows: lastGrid.rows };
   var saveTimer = null;
   function transient(){ return el.classList.contains('max') || el.classList.contains('min'); }
   function noteRect(){
@@ -3220,14 +3502,13 @@ function openTerminalWindow(server, opts){
     }, 80);
   }
   function fitNow(){
-    // A pinned terminal has no say in its own size — see termCore — so the window keeps
-    // whatever grid tmux handed it and simply crops. The floating window is never opened
-    // against a session, so this is a guard rather than a case.
+    // The window opens unpinned even against a session (see the termCore call below), so
+    // this is a guard against a server that pinned it anyway rather than a case.
     if (!w.term || !w.fit || core.pinned || el.classList.contains('min')) return;
     try { w.fit.fit(); } catch(e) { return; }
     if (w.term.cols === w.cols && w.term.rows === w.rows) return;
     w.cols = w.term.cols; w.rows = w.term.rows;
-    core.send({ type:'size', cols:w.cols, rows:w.rows });
+    core.setSize(w.cols, w.rows);
     syncCfg();
     noteRect(); saveSoon();
   }
@@ -3252,6 +3533,10 @@ function openTerminalWindow(server, opts){
   // window before anything is opened at the wrong size.
   var core = termCore(bodyEl, {
     server: srv, title: name, sessionId: opts.sessionId || null,
+    // Explicitly not pinned. This window has a size you dragged it to and a grid
+    // remembered in a cookie; it is a tmux client like any other and resizes the session
+    // to fit itself. Only the in-view terminal leaves tmux's grid alone.
+    pin: false,
     fontSize: w.fontSize, theme: w.theme,
     onReady: function(){
       w.term = core.term; w.fit = core.fit;
@@ -3274,8 +3559,8 @@ function openTerminalWindow(server, opts){
       noteRect(); saveSoon();
       // A remembered grid is applied once the shell is up, so the window ends at the
       // size it had rather than at whatever the restored rect happened to fit.
-      if (!core.pinned && lastGrid.cols && lastGrid.rows)
-        setTimeout(function(){ applyGrid(lastGrid.cols, lastGrid.rows, 0); }, 60);
+      if (!core.pinned && openGrid.cols && openGrid.rows)
+        setTimeout(function(){ applyGrid(openGrid.cols, openGrid.rows, 0); }, 60);
     },
     onState: function(st){
       el.classList.toggle('live', st === 'live');
@@ -3703,16 +3988,38 @@ function tmuxStatusLines(sess) {
   return Number.isFinite(n) ? Math.max(0, Math.min(5, n)) : 1;
 }
 
-// The session a pane belongs to, and the exact pty size an attach to it needs.
+// Which real tmux session a pane belongs to. NOT display-message '#{session_name}':
+// grouped sessions share a window list, so a pane in a group belongs to several sessions
+// at once and tmux answers with whichever name sorts first — often one of OUR ccbb-*
+// sessions, i.e. this feature's own bookkeeping mistaken for the user's session.
+function baseSessionForPane(pane) {
+  let lines = '';
+  try { lines = tmux(['list-panes', '-a', '-F', '#{pane_id}\t#{session_name}']); } catch { return null; }
+  let fallback = null;
+  for (const l of lines.split('\n')) {
+    const [id, sess] = l.split('\t');
+    if (id !== pane || !sess) continue;
+    if (!isOurGroupName(sess)) return sess;   // a session of the user's — the answer
+    fallback = fallback || sess;
+  }
+  return fallback;                            // only ours left: the base was killed
+}
+
+// The pane's session, its window, and the window's own size. The STATUS LINES are not
+// added here on purpose: they belong to the session the client attaches to, which is the
+// grouped one, and session options do not cross into a grouped session — a `status off`
+// set on the user's session leaves the group inheriting the global `on`. Measuring the
+// wrong session is one row of error, and one row of error resizes the window, which is
+// the single thing this must never do. See termTargetFor for where they are added.
 function tmuxGeom(pane) {
   let out;
-  try { out = tmux(['display-message', '-p', '-t', pane,
-    '#{session_name}\t#{window_width}\t#{window_height}\t#{window_id}']); }
+  try { out = tmux(['display-message', '-p', '-t', pane, '#{window_width}\t#{window_height}\t#{window_id}']); }
   catch { return null; }
-  const [sess, w, h, win] = out.split('\n')[0].split('\t');
+  const [w, h, win] = out.split('\n')[0].split('\t');
+  const sess = baseSessionForPane(pane);
   const cols = Number(w), rows = Number(h);
   if (!sess || !Number.isFinite(cols) || !Number.isFinite(rows) || cols < 1 || rows < 1) return null;
-  return { session: sess, window: win || '', cols, rows: rows + tmuxStatusLines(sess) };
+  return { session: sess, window: win || '', cols, winRows: rows };
 }
 
 // ── one tmux client per session page ──────────────────────────────────────────
@@ -3728,7 +4035,26 @@ function tmuxGeom(pane) {
 //
 // What grouping does NOT isolate: a window's active pane belongs to the WINDOW, so
 // selecting Claude's pane still moves it for everyone. Only the window jump stops leaking.
-function tmuxGroupName(sessionId) { return 'ccbb-' + String(sessionId).replace(/[^A-Za-z0-9]/g, '').slice(0, 8); }
+// Fixed length, always: tmux target strings fall back to prefix and glob matching after
+// an exact miss, so a SHORT name is a wildcard for a longer one — `ccbb-1a2b` resolves to
+// `ccbb-1a2b3c4d` and a kill-session aimed at the first destroys the second. Names are
+// therefore all exactly 13 characters, which no other name of ours can be a prefix of,
+// and the id is validated at the route so a short one never reaches here.
+function tmuxGroupName(sessionId) {
+  const clean = String(sessionId).replace(/[^A-Za-z0-9]/g, '');
+  // Eight alphanumerics ALWAYS. Stripping before slicing means a punctuation-heavy id
+  // ("a_______") would otherwise yield "ccbb-a" — six characters, which isOurGroupName
+  // rejects and which prefix-matches every longer sibling on the calls that cannot use
+  // exact() (set-option refuses it). Then the sweep never reaps it and a defuse aimed at
+  // it disarms somebody else. A hash keeps the length rule true for any input while
+  // staying deterministic; a real session id takes the readable path.
+  if (clean.length >= 8) return 'ccbb-' + clean.slice(0, 8);
+  return 'ccbb-' + crypto.createHash('sha1').update(String(sessionId)).digest('hex').slice(0, 8);
+}
+function isOurGroupName(name) { return isCcbbGroupSession(name); }
+// `=` is tmux's exact-match prefix. Belt and braces over the length rule above, and used
+// on the two calls where being wrong is destructive rather than merely wrong.
+function exact(name) { return '=' + name; }
 
 // The session to actually attach to: a grouped one when we can make it, otherwise the base
 // session itself. Falling back rather than failing matters — attaching to the base is what
@@ -3739,11 +4065,11 @@ function tmuxAttachSession(sessionId, base) {
   const group = t => { try { return tmux(['display-message', '-p', '-t', t, '#{session_group}']).trim(); } catch { return null; } };
   try {
     let exists = true;
-    try { tmux(['has-session', '-t', name]); } catch { exists = false; }
+    try { tmux(['has-session', '-t', exact(name)]); } catch { exists = false; }
     // A Claude session can move between tmux sessions across a restart, and a grouped
     // session left pointing at the old one shares the wrong window list entirely.
     if (exists && group(name) !== (group(base) || base)) {
-      try { tmux(['kill-session', '-t', name]); } catch {}
+      try { tmux(['kill-session', '-t', exact(name)]); } catch {}
       exists = false;
     }
     if (!exists) tmux(['new-session', '-d', '-s', name, '-t', base]);
@@ -3759,6 +4085,23 @@ function tmuxAttachSession(sessionId, base) {
 // It is armed only once a client is actually attached. Set on a session that is still
 // detached, tmux destroys it inside a second and the attach that was a moment away finds
 // nothing left to attach to. That is not a theoretical race; it is what happens.
+// How many sessions still share this one's windows. 1 means it is the only thing holding
+// them: the user's session was killed out from under it, and the windows — a running
+// Claude among them — now live HERE. Destroying it then destroys them.
+function groupSize(name) {
+  try { return Number(tmux(['display-message', '-p', '-t', name, '#{session_group_size}'])) || 1; }
+  catch { return 0; }                      // gone already
+}
+// Take the charge out of a session that has become the sole holder of its windows.
+// destroy-unattached has no notion of "unless that would kill something", so the notion
+// has to be applied before the last client leaves rather than after.
+function defuseIfSoleHolder(name) {
+  // Exactly one. Zero means the session is already gone, and reporting that as "kept"
+  // would log about something that no longer exists.
+  if (groupSize(name) !== 1) return false;
+  try { tmux(['set-option', '-t', name, 'destroy-unattached', 'off']); } catch {}
+  return true;
+}
 function armDestroyUnattached(name, tries) {
   let clients = '';
   try { clients = tmux(['list-clients', '-t', name, '-F', '#{client_name}']).trim(); } catch {}
@@ -3777,7 +4120,10 @@ function armDestroyUnattached(name, tries) {
 function busiestTmuxSession() {
   const score = new Map();
   for (const hit of panesForLiveSessions().values()) {
-    if (!hit.session) continue;
+    // Our own grouped sessions are not somewhere to put a window: they come and go with a
+    // browser tab, and one of them being "busiest" would mean making the user's window
+    // inside another page's scratch session.
+    if (!hit.session || isOurGroupName(hit.session)) continue;
     const e = score.get(hit.session) || { n: 0, newest: 0 };
     e.n++; e.newest = Math.max(e.newest, hit.rec.updatedAt || 0);
     score.set(hit.session, e);
@@ -3790,7 +4136,8 @@ function busiestTmuxSession() {
   }
   // tmux is running but no Claude is: any session beats inventing one.
   try {
-    const names = tmux(['list-sessions', '-F', '#{session_name}']).split('\n').filter(Boolean).sort();
+    const names = tmux(['list-sessions', '-F', '#{session_name}'])
+      .split('\n').filter(n => n && !isOurGroupName(n)).sort();
     return names[0] || null;
   } catch { return null; }
 }
@@ -3804,11 +4151,23 @@ function findMadeWindow(sessionId) {
   const want = tmuxGroupName(sessionId);
   let lines = '';
   try { lines = tmux(['list-windows', '-a', '-F', '#{window_name}\t#{pane_id}']); } catch { return null; }
+  // list-windows -a repeats a window once per session in its group, so the same window
+  // arrives several times; the first hit is the answer either way.
   for (const l of lines.split('\n')) {
     const [name, pane] = l.split('\t');
     if (name === want && pane) return pane;
   }
   return null;
+}
+
+// A recorded cwd can name a directory that has since been deleted or unmounted. spawn()
+// answers that with 'error' and 'close' but NO 'exit', so the terminal would never report
+// its own death: the lamp stays green, no exit frame is sent, and the entry lingers until
+// the reaper. tmux is blunter — new-window just fails — which then falls back to a login
+// shell in the same missing directory. Check once, here.
+function usableCwd(dir) {
+  if (!dir) return null;
+  try { return fs.statSync(dir).isDirectory() ? dir : null; } catch { return null; }
 }
 
 // Where a session's terminal should land, in order of preference:
@@ -3825,23 +4184,26 @@ function termTargetFor(sessionId) {
   const withGroup = (t) => {
     t.attachTo = tmuxAttachSession(sessionId, t.session);
     t.grouped = t.attachTo !== t.session;
+    // Now, and not before: the status lines belong to whichever session the client
+    // attaches to, and that is only decided here. See tmuxGeom.
+    t.rows = t.winRows + tmuxStatusLines(t.attachTo);
     return t;
   };
   const loc = paneForSession(sessionId);
   if (loc) {
     const g = tmuxGeom(loc.pane);
     if (g) return withGroup({ pane: loc.pane, session: g.session, window: g.window,
-                              cols: g.cols, rows: g.rows, where: 'pane' });
+                              cols: g.cols, winRows: g.winRows, where: 'pane' });
   }
   const kept = findMadeWindow(sessionId);
   if (kept) {
     const g = tmuxGeom(kept);
     if (g) return withGroup({ pane: kept, session: g.session, window: g.window,
-                              cols: g.cols, rows: g.rows, where: 'window' });
+                              cols: g.cols, winRows: g.winRows, where: 'window' });
   }
   const host = busiestTmuxSession();
   if (!host) return null;
-  const cwd = getSessionCwd(sessionId) || os.homedir();
+  const cwd = usableCwd(getSessionCwd(sessionId)) || os.homedir();
   let pane;
   // -d: making the window must not yank whoever is attached to that tmux session onto it.
   // Our own attach selects it a moment later, on our grouped session only.
@@ -3853,7 +4215,7 @@ function termTargetFor(sessionId) {
   const g = tmuxGeom(pane);
   if (!g) return null;
   return withGroup({ pane, session: g.session, window: g.window,
-                     cols: g.cols, rows: g.rows, where: 'window' });
+                     cols: g.cols, winRows: g.winRows, where: 'window' });
 }
 
 // Select the window AND the pane before attaching, so the client lands on Claude's pane
@@ -3952,21 +4314,28 @@ function wrapScript(args) {
   return 'exec 3<&0; { cat <&3 & } | exec 3<&- ' + ['script'].concat(args).map(shQuote).join(' ');
 }
 
-function openTerm(cols, rows, sessionId) {
+// pin: whether this terminal takes tmux's grid instead of imposing its own. The
+// in-view terminal ($_) asks for it — you are looking at the session in the page beside
+// it, and a browser that reflowed the window you are working in would be intolerable.
+// The floating window (#_) does not: it is a window you sized, with a remembered grid,
+// and it behaves like every other tmux client — it resizes the session to fit itself.
+function openTerm(cols, rows, sessionId, pin) {
   cols = clampInt(cols, 20, 500, 80);
   rows = clampInt(rows, 5, 200, 24);
   const id = String(++termIds);
   const shell = process.env.SHELL || '/bin/bash';
   const target = sessionId ? termTargetFor(String(sessionId)) : null;
-  // The browser's cols/rows are a HINT, and tmux overrules it. Sizing the pty to the box
-  // the page happens to have would resize tmux on attach; sizing it to tmux instead
-  // leaves the far end untouched and hands the browser a grid to scale its font to.
+  const pinned = !!target && pin !== false;
+  // Pinned, the browser's cols/rows are a HINT and tmux overrules it: sizing the pty to
+  // the box the page happens to have would resize tmux on attach, while sizing it to
+  // tmux leaves the far end untouched and hands the browser a grid to scale its font to.
+  // Unpinned, the request is taken as asked and tmux resizes to match on attach.
   // `pinned` is that fact travelling to the front-end, and back into termResize below.
-  if (target) { cols = target.cols; rows = target.rows; }
+  if (pinned) { cols = target.cols; rows = target.rows; }
   const attach = target ? tmuxAttachCmd(target) : null;
   // A session's shell, when there is no tmux to put it in, still opens where the session
   // lives — the same courtesy the new tmux window gets.
-  const cwd = (sessionId && !target && getSessionCwd(String(sessionId))) || os.homedir();
+  const cwd = (sessionId && !target && usableCwd(getSessionCwd(String(sessionId)))) || os.homedir();
   // stty runs inside the pty before the shell starts, so the first prompt is drawn at
   // the right geometry instead of at 80x24 and then redrawn.
   // "columns", not "cols": GNU stty takes either, BSD stty only spells it out.
@@ -3997,7 +4366,8 @@ function openTerm(cols, rows, sessionId) {
   // ptsCols/ptsRows: the geometry the pty already has. The stty above runs inside it
   // before the shell starts, so at birth it matches what was asked for.
   const t = { id, child, ptsFile, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
-              pinned: !!target, ptsCols: cols, ptsRows: rows,
+              pinned, tmuxGroup: (target && target.grouped) ? target.attachTo : null,
+              ptsCols: cols, ptsRows: rows,
               pts: null, alive: true, exitCode: null, graceTimer: null, idleSince: Date.now() };
   terms.set(id, t);
   child.stdout.on('data', c => termPush(t, c));
@@ -4017,7 +4387,7 @@ function openTerm(cols, rows, sessionId) {
   // window made for it, or a plain login shell. Asking for a pane and silently getting a
   // shell would be a surprise, and the page says which in its title.
   return { id, cols, rows, shell, attached: !!(target && target.where === 'pane'),
-           where: target ? target.where : 'shell', pinned: !!target };
+           where: target ? target.where : 'shell', pinned };
 }
 
 function termBroadcast(t, obj) {
@@ -4194,6 +4564,11 @@ function killTermChild(t) {
   try { fs.unlinkSync(t.ptsFile); } catch {}
 }
 function closeTerm(t) {
+  // Before the pty dies, not after: killing it removes the last client, and
+  // destroy-unattached fires on that instant. If this grouped session is all that holds
+  // its windows, the reaping we asked tmux for would take a running Claude with it.
+  if (t.tmuxGroup && defuseIfSoleHolder(t.tmuxGroup))
+    console.log(`ccbb: keeping tmux session ${t.tmuxGroup} — it is the last holder of its windows`);
   terms.delete(t.id);
   if (t.graceTimer) { clearTimeout(t.graceTimer); t.graceTimer = null; }
   t.alive = false;
@@ -4220,16 +4595,11 @@ function closeTerm(t) {
 // which is the whole process tree. Then any ccbb-* session left unattached had its last
 // client taken away and is ours to remove.
 function sweepOrphanTerms() {
-  const clientSession = new Map();
-  try {
-    for (const l of tmux(['list-clients', '-F', '#{client_name}\t#{client_session}']).split('\n')) {
-      const [name, sess] = l.split('\t');
-      if (name) clientSession.set(name, sess || '');
-    }
-  } catch { return; }                      // no tmux server here: nothing to sweep
+  // The pts files first, and unconditionally. tmux may not be running at all here, and a
+  // sweep that gave up before this loop left these accumulating forever on such a host.
+  const stale = [];
   let files = [];
   try { files = fs.readdirSync(os.tmpdir()); } catch {}
-  let detached = 0;
   for (const f of files) {
     const m = /^ccbb-pts-(\d+)-(\d+)$/.exec(f);
     if (!m) continue;
@@ -4241,27 +4611,55 @@ function sweepOrphanTerms() {
     const file = path.join(os.tmpdir(), f);
     let dev = '';
     try { dev = fs.readFileSync(file, 'utf8').trim(); } catch {}
-    if (dev && /^ccbb-/.test(clientSession.get(dev) || '')) {
-      try { tmux(['detach-client', '-t', dev]); detached++; } catch {}
-    }
+    if (dev) stale.push(dev);
     try { fs.unlinkSync(file); } catch {}
   }
-  let killed = 0;
+
+  const clientSession = new Map();
+  try {
+    for (const l of tmux(['list-clients', '-F', '#{client_name}\t#{client_session}']).split('\n')) {
+      const [name, sess] = l.split('\t');
+      if (name) clientSession.set(name, sess || '');
+    }
+  } catch { return; }                      // no tmux server: the files above were the job
+
+  // Defuse before detaching, in that order. A ccbb-* session that is the sole holder of
+  // its windows still carries destroy-unattached from the run that was killed, so pulling
+  // its stranded client would destroy it — and the windows, and whatever runs in them.
+  // The guard further down would never get to speak: there would be nothing left to list.
+  const kept = [];
   let lines = '';
   try { lines = tmux(['list-sessions', '-F', '#{session_name}\t#{session_attached}\t#{session_group_size}']); }
   catch {}
   for (const l of lines.split('\n')) {
-    const [name, attached, size] = l.split('\t');
-    if (!name || !/^ccbb-/.test(name) || attached !== '0') continue;
-    // Sole survivor of its group means the base session was killed out from under it and
-    // the windows — a running Claude among them — live HERE now. Removing it would take
-    // them with it, so it is left alone and said out loud instead.
-    if (Number(size) <= 1) {
-      console.log(`ccbb: leaving tmux session ${name} — it is the last holder of its windows`);
-      continue;
-    }
-    try { tmux(['kill-session', '-t', name]); killed++; } catch {}
+    const [name, , size] = l.split('\t');
+    if (!name || !isOurGroupName(name) || Number(size) > 1) continue;
+    try { tmux(['set-option', '-t', name, 'destroy-unattached', 'off']); } catch {}
+    kept.push(name);
   }
+
+  let detached = 0;
+  for (const dev of stale) {
+    // A pts number is RECYCLED, so a stale file can name a tty that now belongs to a real
+    // terminal of yours — detaching that would be worse than the leak. So a tty is only
+    // ended if it is also, right now, a client of one of our own ccbb-* sessions.
+    if (!isOurGroupName(clientSession.get(dev) || '')) continue;
+    try { tmux(['detach-client', '-t', dev]); detached++; } catch {}
+  }
+
+  // Now what is left unattached is ours and has no client to serve. The defused ones are
+  // skipped by the same rule that defused them.
+  let killed = 0;
+  try { lines = tmux(['list-sessions', '-F', '#{session_name}\t#{session_attached}\t#{session_group_size}']); }
+  catch { lines = ''; }
+  for (const l of lines.split('\n')) {
+    const [name, attached, size] = l.split('\t');
+    if (!name || !isOurGroupName(name) || attached !== '0') continue;
+    if (Number(size) <= 1) continue;       // defused above; leaving it is the point
+    try { tmux(['kill-session', '-t', exact(name)]); killed++; } catch {}
+  }
+  for (const name of kept)
+    console.log(`ccbb: keeping tmux session ${name} — it is the last holder of its windows`);
   if (detached || killed)
     console.log(`ccbb: swept ${detached} orphaned terminal client(s) and ${killed} tmux session(s) from a previous run`);
 }
@@ -4271,6 +4669,11 @@ function sweepOrphanTerms() {
 // that was open. SIGKILL cannot be caught, so `kill -9` on the server still leaks — a
 // plain stop or Ctrl-C, which is how it is actually restarted, does not.
 function closeAllTerms() {
+  // Same reason closeTerm defuses, and this is the path a restart actually takes: killing
+  // the pty removes the last client of the grouped session, and destroy-unattached fires
+  // on that instant. If the base session died while the terminal was open, that reaping
+  // takes the windows — and a running Claude Code — with it. Ctrl-C must not do that.
+  for (const t of terms.values()) if (t.tmuxGroup) defuseIfSoleHolder(t.tmuxGroup);
   for (const t of Array.from(terms.values())) killTermChild(t);
   terms.clear();
 }
@@ -4283,6 +4686,12 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 // at all (opened, then the browser died before connecting) has no timer to fire.
 function termReap() {
   const now = Date.now();
+  // Defusing at close time cannot help when the client dies without ccbb deciding it —
+  // the user detaches from inside the browser terminal, or the tunnel drops. The moment
+  // that matters is when the grouped session BECOMES the last holder of its windows,
+  // which is when the base session went away, so notice that on a timer instead of only
+  // on the way out. A minute of exposure beats the alternative of not noticing at all.
+  for (const t of terms.values()) if (t.alive && t.tmuxGroup) defuseIfSoleHolder(t.tmuxGroup);
   for (const [id, t] of terms) {
     if (t.subs.size) { t.idleSince = now; continue; }
     // Dead already, so there is nothing to kill — but killTermChild is also what takes
@@ -4362,7 +4771,20 @@ function cookieToken(req) {
 // — so a route that forgets to consult it fails closed only if we make it, which is why
 // every mutating route below asks `ro` explicitly rather than trusting a shared middleware
 // that a new route could be written without.
+let warnedBrokenConfig = false;
 function authLevel(req, query) {
+  // A config file that exists but does not parse tells us nothing about what this server
+  // requires — and "nothing" must not be read as "requires nothing". peerToken() would
+  // come back '' from the same broken read and wave everyone through, silently, for as
+  // long as the typo lived. Refuse instead, and say why once.
+  if (configUnreadable()) {
+    if (!warnedBrokenConfig) {
+      warnedBrokenConfig = true;
+      console.error('ccbb: ccbb-config.json exists but does not parse - refusing every request until it does');
+    }
+    return null;
+  }
+  warnedBrokenConfig = false;
   const want = peerToken(), ro = readToken();
   if (!want) return 'full';
   const got = req.headers[TOKEN_HEADER] || (query && query.get('token')) || cookieToken(req);
@@ -4634,6 +5056,12 @@ function serveLinkRequest(link, f) {
 }
 function serveLinkWsOpen(link, f) {
   if (!WS) return linkSend(link, { t: 'wsclose', id: f.id });
+  // The same one-hop rule serveLinkRequest enforces, and for the same reason - this one
+  // was missing it. A link replays against our own port with loopbackHeaders(), which
+  // carry OUR token and no X-Ccbb-Via, so the upgrade handler's loop guard never fires:
+  // a peer that merely dialled in could ask for /peer/<someone-else>/ws/... and reach a
+  // server it has no relationship with, on our credentials. Refuse before dialling.
+  if (/^\/peer\//.test(String(f.path || ''))) return linkSend(link, { t: 'wsclose', id: f.id });
   let ws;
   try {
     ws = new WS('ws://127.0.0.1:' + serverPort + f.path, { headers: loopbackHeaders() });
@@ -4673,36 +5101,100 @@ function proxyUpgradeOverLink(link, subPath, req, socket, head) {
   });
 }
 
+// ── link liveness ──
+// A link that is merely open is not a link that works, and BOTH ways one dies leave the
+// socket looking perfectly healthy to Node:
+//
+//   • the handshake never finishes. An ssh forward whose far end is gone still ACCEPTS,
+//     so TCP connects and the upgrade response simply never arrives. ws emits no error and
+//     no close; readyState sits at CONNECTING forever. connectLink's "already connecting or
+//     open" check then skipped the redial on every single poll — which is why a link that
+//     failed this way was dialled once at startup and never again.
+//   • the socket is half-open. The tunnel died without a FIN, which is the ordinary way a
+//     tunnel dies. readyState stays OPEN and nothing ever errors. Pinging without checking
+//     that a pong came back — which is what this used to do — detects none of it.
+//
+// So a deadline for the first and an answered ping for the second, and both end by
+// destroying the socket. That matters more than the detection: the 15s poll is already
+// there and already correct, it was only ever being told the link was fine.
+const LINK_HANDSHAKE_MS = 10000;
+const LINK_PING_MS = 30000;
+// terminate(), not close(): close() waits for a reply from an end that has stopped
+// replying, which is precisely the state being diagnosed. One missed pong is enough —
+// the far end answers automatically and has a whole interval to do it in.
+function linkHeartbeat(ws) {
+  let alive = true;
+  ws.on('pong', () => { alive = true; });
+  // Any frame counts, not just a pong. This one socket also carries every proxied HTTP
+  // response and every proxied terminal and tail frame, so a peer streaming a large file
+  // down a narrow tunnel can leave its pong queued behind that backlog - and terminating
+  // then would kill the very transfer that caused the delay. Traffic IS liveness.
+  ws.on('message', () => { alive = true; });
+  const timer = setInterval(() => {
+    if (!alive) { try { ws.terminate(); } catch {} return; }   // 'close' fires; the poll redials
+    alive = false;
+    try { ws.ping(); } catch { try { ws.terminate(); } catch {} }
+  }, LINK_PING_MS);
+  if (timer.unref) timer.unref();
+  const stop = () => clearInterval(timer);
+  ws.on('close', stop);
+  ws.on('error', stop);
+  return stop;
+}
+
 // ── caller side: keep a link open to every configured peer ──
 function connectLink(peer) {
   if (!WS) return;
   const existing = outboundLinks.get(peer.name);
-  if (existing && existing.ws && existing.ws.readyState <= 1) return;   // connecting or open
+  if (existing && existing.ws) {
+    const st = existing.ws.readyState;
+    // Retargeting a tunnel to a new port, or rotating a peer's token, has to reach an
+    // already-open link: config is re-read every poll, but a healthy socket was dialled
+    // against the OLD values and would go on serving them indefinitely.
+    if (existing.url !== peer.url || existing.token !== (peer.token || '')) {
+      try { existing.ws.terminate(); } catch {}
+    }
+    else if (st === 1) return;                             // open, and answering pings
+    // Mid-handshake is fine, briefly. Bounding it here as well as with handshakeTimeout is
+    // deliberate: this is the check that used to make the failure permanent, so it is the
+    // one that must not be able to wait forever again.
+    if (st === 0 && Date.now() - existing.startedAt < LINK_HANDSHAKE_MS * 2) return;
+    try { existing.ws.terminate(); } catch {}
+  }
   const url = peer.url.replace(/^http/, 'ws') + '/peer-link?name=' + encodeURIComponent(serverIdentity().name);
   const headers = {};
   if (peer.token) headers[TOKEN_HEADER] = peer.token;
   let ws;
-  try { ws = new WS(url, { headers }); } catch { return; }
-  const rec = { ws, ping: null };
+  try { ws = new WS(url, { headers, handshakeTimeout: LINK_HANDSHAKE_MS }); } catch { return; }
+  const rec = { ws, startedAt: Date.now(), stopBeat: null, url: peer.url, token: peer.token || '' };
   outboundLinks.set(peer.name, rec);
   ws.on('open', () => {
     makeLink(ws, peer.name);
-    // A link can sit idle for hours; keep it warm so an idle tunnel can't drop it silently.
-    rec.ping = setInterval(() => { try { ws.ping(); } catch {} }, 30000);
-    if (rec.ping.unref) rec.ping.unref();
+    // A link can sit idle for hours; the heartbeat keeps it warm AND proves it is there.
+    rec.stopBeat = linkHeartbeat(ws);
   });
   // Forget this attempt ONLY if the map still holds it. A later attempt may already have
   // replaced it, and deleting that one would strand a healthy link and set off a redial
   // loop: poll dials again, the peer drops the socket it had as superseded, repeat.
-  // pollLinks provides the retry cadence, so there is no timer here to go stale.
+  // pollLinks provides the retry cadence, so there is no reconnect timer here to go stale.
   const gone = () => {
-    if (rec.ping) { clearInterval(rec.ping); rec.ping = null; }
+    if (rec.stopBeat) { rec.stopBeat(); rec.stopBeat = null; }
     if (outboundLinks.get(peer.name) === rec) outboundLinks.delete(peer.name);
   };
   ws.on('close', gone);
   ws.on('error', gone);
 }
-function pollLinks() { for (const p of peerList()) connectLink(p); }
+function pollLinks() {
+  const configured = new Set();
+  for (const p of peerList()) { configured.add(p.name); connectLink(p); }
+  // A peer removed from the config keeps no link open. The config is re-read per poll, so
+  // this is how "delete the peer and it goes away" stays true without a restart.
+  for (const [name, rec] of outboundLinks) {
+    if (configured.has(name)) continue;
+    try { rec.ws.terminate(); } catch {}
+    outboundLinks.delete(name);
+  }
+}
 
 // Interface addresses worth printing: the ones a phone on the same network can dial.
 function lanAddrs() {
@@ -4752,6 +5244,20 @@ function runWeb(args) {
     // Both UIs' pages: what the ?token=… hand-off and the HTML 401 apply to. A /m page
     // left out here would take the JSON-401 branch and could never bank the token.
     const isPage = isDesktopPage || isMobilePage;
+
+    // The app icons, ahead of the token check on purpose. They are seven rectangles and
+    // two circles — they say nothing about this machine or the sessions on it — and the
+    // fetch that matters most is the one we cannot put a cookie on: Chrome's icon
+    // downloader, running for an install, outside the page that holds the token.
+    if (method === 'GET' && (m = /^\/icon-(\d+)(-maskable)?\.png$/.exec(pathname))) {
+      const size = Number(m[1]);
+      if (!ICON_SIZES.includes(size)) return send(res, 404, { error: 'no such icon size' });
+      const png = iconPngFor(size, !!m[2]);
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length,
+                           'Cache-Control': 'public, max-age=604800' });
+      return res.end(png);
+    }
+
     const level = authLevel(req, query);
     if (!level) return sendUnauthorized(res, isPage, tokenCookieName(req));
     // Whoever came in with the read token. Every route that changes something — a session's
@@ -4840,6 +5346,15 @@ function runWeb(args) {
       return peer ? proxyHttp(peer, full, req, res) : proxyHttpOverLink(link, full, req, res);
     }
 
+    // Behind the token, unlike the icons: it carries this server's name, which is the
+    // whole point of it — several ccbb apps end up on one taskbar and they have to be
+    // told apart. The link element asks for it with credentials, so the cookie is sent.
+    if (method === 'GET' && pathname === '/manifest.webmanifest') {
+      const body = Buffer.from(JSON.stringify(webManifest(serverIdentity())));
+      res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8',
+                           'Content-Length': body.length, 'Cache-Control': 'no-cache' });
+      return res.end(body);
+    }
     if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) return sendHtml(res, appPageHtml(null, null, ro));
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');
@@ -4851,7 +5366,18 @@ function runWeb(args) {
     // subscription, so a Bedrock peer in a fan-out contributes nothing rather than an error.
     // Windows only, no spend: this is polled every minute and both front-ends already have
     // the dollars — the desktop from its cost summaries, the phone from the list totals.
-    if (method === 'GET' && pathname === '/api/subscription') return send(res, 200, getSubscription() || {});
+    if (method === 'GET' && pathname === '/api/subscription') {
+      const sub = getSubscription() || {};
+      // The quota windows are what the UI draws, and a read-only viewer is allowed those
+      // - but this payload also carries the account's uuid, display name, EMAIL, org and
+      // plan tier, none of which appears anywhere on the page. Hiding the subscriptions
+      // table in the front-end left all of that one curl away from anyone holding a link.
+      // `account` stays an object because the front-ends use its presence to mean "this
+      // machine is on a plan"; it simply stops saying who.
+      if (ro) return send(res, 200, { account: { readOnly: true }, plan: '',
+        windows: sub.windows || null, fetchedAt: sub.fetchedAt || 0, source: sub.source || '' });
+      return send(res, 200, sub);
+    }
     // Just the month keys, for a scope selector that has no use for the summary's numbers —
     // the phone would otherwise pull a full cost breakdown to fill one dropdown.
     if (method === 'GET' && pathname === '/api/months')
@@ -4863,7 +5389,12 @@ function runWeb(args) {
       if (ro) return sendForbidden(res, 'open a terminal');
       readBody(req, body => {
         let b; try { b = JSON.parse(body || '{}'); } catch { b = {}; }
-        const r = openTerm(b.cols, b.rows, b.sessionId);
+        // The id becomes a tmux session NAME, and tmux target strings prefix-match — so a
+        // short id would name, and could kill, another session's. Anything that is not a
+        // plausible session id is treated as no id at all: a plain login shell.
+        const sid = /^[A-Za-z0-9][A-Za-z0-9_-]{7,}$/.test(String(b.sessionId || '')) ? b.sessionId : null;
+        // Absent means pinned, which is what the phone and every older front-end mean.
+        const r = openTerm(b.cols, b.rows, sid, b.pin !== false);
         send(res, r.error ? 500 : 200, r);
       });
       return;
@@ -5039,10 +5570,19 @@ function runWeb(args) {
         if (!name || name === serverIdentity().name) return socket.destroy();
         return wss.handleUpgrade(req, socket, head, ws => {
           const prev = inboundLinks.get(name);
-          if (prev && prev.ws !== ws) { try { prev.ws.close(); } catch {} }
+          // terminate(), not close(): a replacement arrives precisely when the caller
+          // decided the old socket was half-open, so waiting for a close handshake from
+          // that end defers makeLink's drop - and every browser socket riding the old
+          // link - by ws's 30s close timeout.
+          if (prev && prev.ws !== ws) { try { prev.ws.terminate(); } catch {} }
           const link = makeLink(ws, name);
           inboundLinks.set(name, link);
           console.log(`ccbb: peer "${name}" linked in`);
+          // The callee pings too. Only the caller redials, but only the callee can notice
+          // that the caller is gone — and an inbound link is listed in /api/servers as an
+          // ordinary peer, so a dead one left in the map is a machine reported "up" that
+          // nobody can reach.
+          linkHeartbeat(ws);
           const bye = () => { if (inboundLinks.get(name) === link) inboundLinks.delete(name); };
           ws.on('close', bye); ws.on('error', bye);
         });

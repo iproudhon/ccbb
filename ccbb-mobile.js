@@ -157,6 +157,12 @@ const MOBILE_HTML = `<!DOCTYPE html>
 <meta name="theme-color" content="#1c1b19" media="(prefers-color-scheme: dark)">
 <title>ccbb</title>
 <link rel="shortcut icon" href="data:image/svg+xml,%3Csvg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='16' y='12' width='32' height='28' rx='4' fill='%23FF6B35'/%3E%3Ccircle cx='24' cy='20' r='4' fill='%23fff'/%3E%3Ccircle cx='40' cy='20' r='4' fill='%23fff'/%3E%3Crect x='20' y='28' width='24' height='2' fill='%23fff' rx='1'/%3E%3Crect x='18' y='42' width='28' height='16' rx='2' fill='%23FF6B35'/%3E%3Crect x='8' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3Crect x='46' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3C/svg%3E" />
+<!-- The SVG is what a tab draws. Chrome's app installer wants a raster and a
+     manifest, and gets both here — see iconPngFor()/webManifest() in ccbb-web.js. -->
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <!-- Through ccbb first (a phone on a tunnel often cannot reach a CDN), the CDN second. -->
 <script src="/vendor/marked.js" onerror="var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/marked@12/marked.min.js';document.head.appendChild(s)"></script>
 <style>
@@ -865,7 +871,11 @@ function createListPanel(){
     // word was the longest thing on the line that carried no information.
     var html = '<span class="fcnt">×'+sessions.length+'</span>'+
       '<span class="fsep">·</span><span class="fsub">'+fmtCost(cost)+'</span>';
-    subGroups().forEach(function(g){
+    // The plan groups are an account's name and its personal quota, which is the most
+    // personal thing on this screen and not what a shared read-only link is for. The
+    // count and the spend stay: they are the session list's own total, the same figure
+    // the desktop leaves in its footer.
+    if (!RO) subGroups().forEach(function(g){
       html += '<span class="fsep">·</span>' + subFootHtml(g);
     });
     totEl.innerHTML = html;
@@ -1040,6 +1050,9 @@ function createListPanel(){
   // drops out, so one dead tunnel can't take the other accounts' windows with it.
   var subs = {};
   function loadSubs(){
+    // Read-only draws none of it — see renderFoot — and a request per selected server for
+    // something about to be dropped on the floor is worth not making.
+    if (RO) return Promise.resolve();
     return Promise.all(selectedServers().map(function(n){
       return fetch(apiBase(n) + '/api/subscription').then(function(r){ return r.ok ? r.json() : null; })
         .then(function(d){ return (d && d.account) ? { name:n, data:d } : null; })
@@ -2130,11 +2143,15 @@ function openTerminal(server, sessionId){
   var fitRun = 0;
   function fitTermGrid(pass, done, bounds, run){
     if (run == null) run = ++fitRun;
-    if (!t.term || t.destroyed || run !== fitRun) return;
+    if (!t.term || t.destroyed) return;    // torn down: the open it gates is moot too
+    // Every OTHER exit has to settle the callback. The shell is opened from it, so a
+    // search that stands down for a newer one — a viewport resize landing mid-probe is
+    // enough, and on a phone the URL bar collapsing does exactly that — or one that finds
+    // nothing measurable yet would leave the panel on "Starting a shell…" forever, with
+    // no shell ever requested and nothing to show for it.
     var scr = wrap.querySelector('.xterm-screen');
-    if (!scr) return;
-    var r = scr.getBoundingClientRect();
-    if (!(r.width > 0 && t.term.cols > 0)) return;
+    var r = scr && scr.getBoundingClientRect();
+    if (!scr || run !== fitRun || !(r.width > 0 && t.term.cols > 0)) { if (done) done(); return; }
     var cellW = r.width / t.term.cols, cellH = r.height / t.term.rows;
     var availW = bodyEl.clientWidth - 6;   // .xterm padding, kept in sync with the CSS
     var availH = bodyEl.clientHeight;
