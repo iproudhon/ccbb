@@ -3884,24 +3884,50 @@ function peerRequest(peer, subPath, opts, cb) {
   headers[VIA_HEADER] = serverIdentity().name;
   return mod.request(target, { method: opts.method || 'GET', headers, timeout: opts.timeout || 0 }, cb);
 }
+// A peer reached over an ssh tunnel loses established connections in bursts: the link
+// goes through a short episode where sockets already open are torn down while brand new
+// ones connect fine. Measured on the `thelab` hop — two failures 16s apart, each on a
+// REUSED socket, each while a fresh socket answered 200 in the same instant. Node reports
+// it as ECONNRESET or "socket hang up".
+//
+// The peer never saw the request when this happens, so replaying it is safe rather than
+// merely convenient, and the replay lands on a fresh socket — the case that was observed
+// working. Both the health probe and the proxy retry once on this.
+const PEER_RETRY_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT',
+                                  'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
+function peerErrorIsTransient(e) {
+  return PEER_RETRY_CODES.has(e.code) || e.message === 'socket hang up';
+}
 function probePeer(peer) {
   const started = Date.now();
-  let done = false;
+  let done = false, tries = 0;
   const finish = rec => { if (done) return; done = true; peerHealth.set(peer.name, rec); };
-  const req = peerRequest(peer, '/api/identity', { timeout: 5000 }, res => {
-    let buf = '';
-    res.setEncoding('utf8');
-    res.on('data', c => { buf += c; });
-    res.on('end', () => {
-      let id = null; try { id = JSON.parse(buf); } catch {}
-      if (res.statusCode === 401) return finish({ status: 'down', error: 'unauthorized (token mismatch)', rttMs: Date.now() - started });
-      if (res.statusCode !== 200 || !id || !id.name) return finish({ status: 'down', error: 'HTTP ' + res.statusCode, rttMs: Date.now() - started });
-      finish({ status: 'up', hostname: id.hostname || '', remoteName: id.name, rttMs: Date.now() - started, lastSeen: new Date().toISOString() });
+  const attempt = () => {
+    tries++;
+    const req = peerRequest(peer, '/api/identity', { timeout: 5000 }, res => {
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', c => { buf += c; });
+      res.on('end', () => {
+        let id = null; try { id = JSON.parse(buf); } catch {}
+        if (res.statusCode === 401) return finish({ status: 'down', error: 'unauthorized (token mismatch)', rttMs: Date.now() - started });
+        if (res.statusCode !== 200 || !id || !id.name) return finish({ status: 'down', error: 'HTTP ' + res.statusCode, rttMs: Date.now() - started });
+        finish({ status: 'up', hostname: id.hostname || '', remoteName: id.name, rttMs: Date.now() - started, lastSeen: new Date().toISOString() });
+      });
     });
-  });
-  req.on('timeout', () => { req.destroy(new Error('timed out')); });
-  req.on('error', e => finish({ status: 'down', error: e.message, rttMs: Date.now() - started }));
-  req.end();
+    let timedOut = false;
+    req.on('timeout', () => { timedOut = true; req.destroy(new Error('timed out')); });
+    // A pooled socket killed mid-episode is not a peer that went away. Without the retry
+    // the server list flashes a healthy peer as down every time the link hiccups — and at
+    // a 15s poll that wrong answer is what the UI shows until the next round.
+    req.on('error', e => {
+      if (tries === 1 && !timedOut && peerErrorIsTransient(e)) return attempt();
+      finish({ status: 'down', error: e.message + (tries > 1 ? ' (retried once)' : ''),
+               rttMs: Date.now() - started });
+    });
+    req.end();
+  };
+  attempt();
 }
 function pollPeers() { for (const p of peerList()) probePeer(p); }
 // Merged view of the mesh: this server first, then every configured peer with its last
@@ -3932,18 +3958,32 @@ function serversPayload() {
 function proxyHttp(peer, subPath, req, res) {
   const headers = {};
   for (const k of ['content-type', 'accept']) if (req.headers[k]) headers[k] = req.headers[k];
-  const preq = peerRequest(peer, subPath, { method: req.method, headers, timeout: 30000 }, pres => {
-    const out = {};
-    for (const k of ['content-type', 'content-length', 'cache-control']) if (pres.headers[k]) out[k] = pres.headers[k];
-    res.writeHead(pres.statusCode || 502, out);
-    pres.pipe(res);
-  });
-  preq.on('timeout', () => preq.destroy(new Error('timed out')));
-  preq.on('error', e => {
-    if (!res.headersSent) send(res, 502, { error: `peer "${peer.name}" unreachable: ${e.message}` });
-    else res.destroy();
-  });
-  req.pipe(preq);
+  // Only a bodyless request can be replayed: by the time the error arrives the client's
+  // stream has been consumed and cannot be rewound. GET and HEAD are all the UI sends
+  // over a peer hop anyway, so nothing real loses the retry.
+  const replayable = req.method === 'GET' || req.method === 'HEAD';
+  let tries = 0;
+  const attempt = () => {
+    tries++;
+    const preq = peerRequest(peer, subPath, { method: req.method, headers, timeout: 30000 }, pres => {
+      const out = {};
+      for (const k of ['content-type', 'content-length', 'cache-control']) if (pres.headers[k]) out[k] = pres.headers[k];
+      res.writeHead(pres.statusCode || 502, out);
+      pres.pipe(res);
+    });
+    let timedOut = false;
+    preq.on('timeout', () => { timedOut = true; preq.destroy(new Error('timed out')); });
+    preq.on('error', e => {
+      if (res.headersSent) return res.destroy();   // too late — the client already has bytes
+      // Once only, and never after a timeout: a peer that is merely slow is still working
+      // on the first copy, and a second would add load to something already struggling.
+      if (replayable && tries === 1 && !timedOut && peerErrorIsTransient(e)) return attempt();
+      send(res, 502, { error: `peer "${peer.name}" unreachable: ${e.message}`
+        + (tries > 1 ? ' (retried once)' : '') });
+    });
+    if (replayable) preq.end(); else req.pipe(preq);
+  };
+  attempt();
 }
 // Proxy a WebSocket upgrade: dial the peer, replay the handshake, then splice the two
 // sockets. Keeps live transcript tailing and permission cards working for remote sessions.
