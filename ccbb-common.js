@@ -1013,6 +1013,35 @@ function paneForSession(sessionId) {
   return null;
 }
 
+// Every live session's pane in ONE sweep, as sessionId → { pane, session, rec }.
+// paneForSession answers for a single session and pays for a `ps` and a `tmux list-panes`
+// each time; asking "which tmux session holds the most Claude Codes" needs the answer for
+// all of them at once, and doing that N times over is the difference between a click and
+// a stall on a host with a dozen sessions.
+function panesForLiveSessions() {
+  const out = new Map();
+  const recs = liveSessionRecords();
+  if (!recs.size) return out;
+  let paneLines;
+  try { paneLines = tmux(['list-panes', '-a', '-F', '#{pane_pid}\t#{pane_id}\t#{session_name}']); }
+  catch { return out; }
+  const byPanePid = new Map();
+  for (const l of paneLines.split('\n')) {
+    const [pp, pane, sess] = l.split('\t');
+    if (pp && pane) byPanePid.set(Number(pp), { pane, session: sess || '' });
+  }
+  const parent = parentMap();
+  for (const rec of recs.values()) {
+    let cur = rec.pid, guard = 0;
+    while (cur && guard++ < 64) {
+      const hit = byPanePid.get(cur);
+      if (hit) { out.set(rec.sessionId, { pane: hit.pane, session: hit.session, rec }); break; }
+      cur = parent.get(cur);
+    }
+  }
+  return out;
+}
+
 // Paste text into the pane (bracketed paste keeps multi-line intact / no early submit),
 // then press Enter to submit it to the running agent. `buffer` names the tmux paste
 // buffer so concurrent front-ends don't clobber each other's paste.
@@ -1733,7 +1762,7 @@ module.exports = {
   // liveness + mutation
   pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
-  tmux, paneForSession, injectToPane,
+  tmux, paneForSession, panesForLiveSessions, injectToPane,
   transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionInfo,
   startTail, stopTail, watchSessionChanges,

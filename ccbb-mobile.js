@@ -2078,7 +2078,8 @@ function openTerminal(server, sessionId){
   var name = srv || SELF.name;
   var API = apiBase(srv);
   var wrap = document.getElementById('termwrap');
-  var t = { id:null, term:null, ws:null, lastSeq:null, dead:false, destroyed:false, rows:24,
+  var t = { id:null, term:null, ws:null, lastSeq:null, dead:false, destroyed:false,
+    cols:TERM_COLS, rows:24, pinned:false,
     theme:(localStorage.getItem('ccbb.m.termtheme') === 'dark' ? 'dark' : 'light'), ctrl:false, resyncing:false };
   termState = t;
 
@@ -2109,40 +2110,74 @@ function openTerminal(server, sessionId){
   function wsSendJ(o){ if (t.ws && t.ws.readyState === 1) { try { t.ws.send(JSON.stringify(o)); } catch(e){} } }
   function note(html){ bodyEl.innerHTML = '<div class="tnote">'+html+'</div>'; }
 
-  // 80 columns is the constant; the font size is what gives. Claude Code draws boxes and
-  // tables at a fixed width, so a narrower grid wraps every one of them — on a phone the
-  // legible trade is small type at the width the program expects. Measure the real cell
-  // (fonts round to device pixels, so the ratio is not exactly what you asked for), scale
-  // the size to fit, and correct once: two passes land within a pixel.
+  // The grid is fixed and the font size is what gives. Which grid depends on who owns it:
+  //   • a session's terminal is PINNED to what tmux already has, because a client of a
+  //     different size resizes the window — and with it the TUI in the user's own
+  //     terminal — for as long as the phone is looking at it.
+  //   • anything else takes 80 columns. Claude Code draws boxes and tables at a fixed
+  //     width, so a narrower grid wraps every one of them; on a phone the legible trade
+  //     is small type at the width the program expects.
+  // Measure the real cell (fonts round to device pixels, so the ratio is not exactly what
+  // you asked for), scale the size to fit, and correct: two or three passes land within a
+  // pixel. Pinned fits BOTH dimensions, since neither is ours to change; free fits the
+  // width and lets the rows follow.
+  //
   // The done callback fires once the grid has settled. The shell is opened from there, not
   // before: opening at a guessed 24 rows and correcting afterwards means the program on
-  // the other end starts at the wrong size, and with tmux the client attaches at that
-  // wrong size too.
-  function fitTo80(pass, done){
-    if (!t.term || t.destroyed) return;
+  // the other end starts at the wrong size.
+  // Two searches running at once — the open finishing while a refit is in flight —
+  // would interleave their probes and each conclude from the other's font size.
+  var fitRun = 0;
+  function fitTermGrid(pass, done, bounds, run){
+    if (run == null) run = ++fitRun;
+    if (!t.term || t.destroyed || run !== fitRun) return;
     var scr = wrap.querySelector('.xterm-screen');
     if (!scr) return;
     var r = scr.getBoundingClientRect();
     if (!(r.width > 0 && t.term.cols > 0)) return;
     var cellW = r.width / t.term.cols, cellH = r.height / t.term.rows;
-    var avail = bodyEl.clientWidth - 6;    // .xterm padding, kept in sync with the CSS
-    var want = t.term.options.fontSize * (avail / (TERM_COLS * cellW));
-    want = Math.max(4, Math.min(24, Math.floor(want * 2) / 2));
-    if (Math.abs(want - t.term.options.fontSize) >= 0.25 && (pass||0) < 3) {
-      t.term.options.fontSize = want;
-      return setTimeout(function(){ fitTo80((pass||0)+1, done); }, 30);
+    var availW = bodyEl.clientWidth - 6;   // .xterm padding, kept in sync with the CSS
+    var availH = bodyEl.clientHeight;
+    var cols = t.pinned ? t.cols : TERM_COLS;
+    var cur = t.term.options.fontSize;
+    if (t.pinned) {
+      // Both dimensions are fixed, and neither is ours to change — so the size has to be
+      // searched for rather than computed. A cell rounds to whole device pixels, which
+      // makes font→grid a staircase: scaling by how far off you are lands one step too
+      // big, then one step too small, forever. bounds[0] is the largest size seen to fit
+      // and bounds[1] the smallest seen not to; halving between them settles in six.
+      var b = bounds || [3, 24.5];
+      if (cols * cellW <= availW + 0.5 && t.rows * cellH <= availH + 0.5) { if (cur > b[0]) b[0] = cur; }
+      else if (cur < b[1]) b[1] = cur;
+      var next = Math.floor((b[0] + b[1]) / 2 * 2) / 2;
+      if (next > b[0] && next < b[1] && (pass||0) < 14) {
+        t.term.options.fontSize = next;
+        return setTimeout(function(){ fitTermGrid((pass||0)+1, done, b, run); }, 25);
+      }
+      // Land on the largest size that actually fitted, not on the last one probed.
+      if (cur !== b[0]) {
+        t.term.options.fontSize = b[0];
+        return setTimeout(function(){ fitTermGrid((pass||0)+1, done, b, run); }, 25);
+      }
+    } else {
+      var want = Math.max(3, Math.min(24, Math.floor(cur * (availW / (cols * cellW)) * 2) / 2));
+      if (want !== cur && (pass||0) < 6) {
+        t.term.options.fontSize = want;
+        return setTimeout(function(){ fitTermGrid((pass||0)+1, done, bounds, run); }, 25);
+      }
     }
-    var rows = Math.max(5, Math.floor(bodyEl.clientHeight / cellH));
-    if (t.term.cols !== TERM_COLS || t.term.rows !== rows) {
-      try { t.term.resize(TERM_COLS, rows); } catch(e){}
+    var rows = t.pinned ? t.rows : Math.max(5, Math.floor(availH / cellH));
+    if (t.term.cols !== cols || t.term.rows !== rows) {
+      try { t.term.resize(cols, rows); } catch(e){}
     }
-    t.rows = t.term.rows;
+    t.cols = t.term.cols; t.rows = t.term.rows;
     geomEl.textContent = t.term.cols + '×' + t.term.rows + ' · ' + t.term.options.fontSize + 'px';
-    wsSendJ({ type:'size', cols:TERM_COLS, rows:t.rows });
+    // Never for a pinned terminal: its size is tmux's, and the server drops the frame.
+    if (!t.pinned) wsSendJ({ type:'size', cols:t.cols, rows:t.rows });
     if (done) done();
   }
   var fitTimer = null;
-  function refit(){ clearTimeout(fitTimer); fitTimer = setTimeout(function(){ fitTo80(0); }, 80); }
+  function refit(){ clearTimeout(fitTimer); fitTimer = setTimeout(function(){ fitTermGrid(0); }, 80); }
   window.addEventListener('resize', refit);
   if (window.visualViewport) window.visualViewport.addEventListener('resize', refit);
 
@@ -2202,9 +2237,9 @@ function openTerminal(server, sessionId){
       for (var i=0;i<d.length;i++) u[i] = d.charCodeAt(i) & 0xff;
       wsSendJ({ type:'in', b: b64FromBytes(u) });
     });
-    return new Promise(function(ok){ fitTo80(0, ok); }).then(function(){
+    return new Promise(function(ok){ fitTermGrid(0, ok); }).then(function(){
       return fetch(API+'/api/term/open', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ cols:TERM_COLS, rows:t.rows, sessionId: sessionId || null }) })
+        body: JSON.stringify({ cols:t.cols, rows:t.rows, sessionId: sessionId || null }) })
         .then(function(r){ return r.json(); })
         .then(function(d){
           if (t.destroyed) return;
@@ -2214,9 +2249,15 @@ function openTerminal(server, sessionId){
             return;
           }
           t.id = d.id;
-          titleEl.textContent = name + (d.attached ? ' · session pane' : '');
+          // The grid the server came back with is tmux's own, not the one we asked for.
+          if (d.pinned && d.cols && d.rows) {
+            t.pinned = true; t.cols = d.cols; t.rows = d.rows;
+            try { t.term.resize(d.cols, d.rows); } catch(e){}
+          }
+          titleEl.textContent = name + (d.where === 'pane' ? ' · session pane'
+                                      : d.where === 'window' ? ' · new window' : '');
           connect();
-          setTimeout(function(){ fitTo80(0); t.term.focus(); }, 150);
+          setTimeout(function(){ fitTermGrid(0); t.term.focus(); }, 150);
         });
     });
   }).catch(function(e){
@@ -2234,7 +2275,7 @@ function openTerminal(server, sessionId){
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto+'//'+location.host+API+'/ws-term/'+t.id+(t.lastSeq!=null?'?from='+t.lastSeq:''));
     t.ws = ws;
-    ws.onopen = function(){ wsSendJ({ type:'size', cols:TERM_COLS, rows:t.rows }); };
+    ws.onopen = function(){ if (!t.pinned) wsSendJ({ type:'size', cols:t.cols, rows:t.rows }); };
     ws.onmessage = function(ev){
       var f; try { f = JSON.parse(ev.data); } catch(e){ return; }
       if (f.type === 'o') {

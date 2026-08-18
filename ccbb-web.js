@@ -23,7 +23,7 @@ const {
   serverIdentity, peerList, peerByName, peerToken, readToken,
   CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionStats, watchSessionChanges,
-  sessionLiveness, renameSession, paneForSession, injectToPane, transcriptEntry,
+  sessionLiveness, pidAlive, renameSession, paneForSession, panesForLiveSessions, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
   loadCommands, expandRun, truncTitle, looksLikeDiff, langForFile,
   awsIdText, awsLoginStream, tmux, capturePane, parsePrompt, promptFingerprint,
@@ -522,6 +522,33 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .ro .perm-opt{pointer-events:none;opacity:.65}
 .ro .ask-custom,.ro .ask-foot{display:none}
 .ro .hdr-title{cursor:default}
+/* ── a session's terminal, in the view itself ──
+   Not a window over the page: the session view IS the place you are already looking at
+   the session, so its content area is where its terminal belongs. It takes the whole of
+   that area — transcript, composer and //command box step aside rather than share it —
+   because the grid it must draw is tmux's, not one it may choose, and half the height
+   would only mean half the font.
+   Anchored top-left: a grid that cannot quite fit is then cropped on the far edge only,
+   where a centred one would lose a column at each end and a row top and bottom. */
+.sv-term{display:none;flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:#fff}
+.sv-term.dark{background:#000}
+/* Padding lives on .xterm, not on the box, so clientWidth/clientHeight stay the honest
+   measurement the font fit divides by. Kept in sync with TERM_PAD_X/Y in the script. */
+.term-host{position:absolute;inset:0}
+.sv-term .xterm{padding:3px 0 0 4px}
+/* The scrollbar would take columns out of a grid that is not ours to shrink, and there
+   is nothing behind it worth scrolling to: an attached tmux keeps its own scrollback,
+   and the wheel still reaches xterm's. */
+.sv-term .xterm-viewport{scrollbar-width:none}
+.sv-term .xterm-viewport::-webkit-scrollbar{display:none}
+.sv.terming .tr-wrap,.sv.terming .input-area,.sv.terming .cmd-box{display:none}
+.sv.terming .sv-term{display:block}
+.vb-btn.on{background:var(--accent-soft);color:var(--accent)}
+.term-fit{position:absolute;right:6px;bottom:4px;z-index:2;pointer-events:none;
+  font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--ink-faint);
+  background:var(--bg);opacity:.55;padding:0 4px;border-radius:4px}
+.sv-term.dark .term-fit{background:#000;color:#8c959f}
+
 /* ── ssh terminal ──
    A terminal is deliberately NOT a view: you want it over whatever you are reading, at
    whatever size, and still there when you switch sessions. So it floats above #views with
@@ -875,7 +902,7 @@ function makeViewBar(v, barMain, buttons){
   btns.className = 'bar-btns';
   btns.innerHTML = '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
     '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
-    (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal on the server this session runs on">&gt;_</button>' : '')+
+    (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal for this session">&gt;_</button>' : '')+
     (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
     (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
   bar.appendChild(btns);
@@ -1254,6 +1281,9 @@ function createListView(){
   // clock. A server that fails just drops out of the table — one unreachable peer must
   // not take the other accounts' rows with it.
   async function loadSubs() {
+    // Read-only draws none of it, and a request per selected server for something that is
+    // about to be dropped on the floor is worth not making.
+    if (RO) return;
     var results = await fanOut('/api/subscription');
     var next = {};
     results.forEach(function(r){ if (!r.error && r.data && r.data.account) next[r.name] = r.data; });
@@ -1348,13 +1378,21 @@ function createListView(){
       + respRateHtml(b)
       + '</tr>';
   }
+  // Bedrock alone for a read-only viewer. The subscription row is one login's personal
+  // spend against a personal quota, which is not what a shared link is for — and the Total
+  // goes with it, since Total minus Bedrock is the row that was just removed.
+  //
+  // This is presentation, not enforcement, and the difference is worth being honest about:
+  // the numbers are still in /api/cost-summary, which a read-only caller keeps because the
+  // session list is built from it. What the read token withholds is elsewhere (see
+  // authLevel); what this withholds is a figure nobody sharing a link means to share.
   function providerTableHtml(scope){
     var map = scope.byProvider || {};
-    var keys = Object.keys(map).filter(function(k){ return map[k].tokens > 0; });
-    if (!keys.length) return '<div style="color:#8c959f;font-size:11px">No usage.</div>';
+    var keys = Object.keys(map).filter(function(k){ return map[k].tokens > 0 && !(RO && k !== 'bedrock'); });
+    if (!keys.length) return '<div style="color:#8c959f;font-size:11px">No '+(RO?'Bedrock ':'')+'usage.</div>';
     keys.sort(function(a,b){ return map[b].cost - map[a].cost; });
     var tbody = keys.map(function(k){ return provRowHtml(PROV_LABEL[k]||k, map[k]); }).join('');
-    var tfoot = keys.length > 1 ? '<tfoot>'+provRowHtml('Total', scope.all)+'</tfoot>' : '';
+    var tfoot = (keys.length > 1 && !RO) ? '<tfoot>'+provRowHtml('Total', scope.all)+'</tfoot>' : '';
     var thead = '<thead><tr><th>&nbsp;</th><th>USD</th><th>Tokens</th><th>Turns</th>'
       + '<th>Cache Read</th><th>Cache Write</th><th>Cache Miss</th><th>Out</th><th>In</th><th>Time</th></tr></thead>';
     return '<table class="sum-table prov">'+thead+'<tbody>'+tbody+'</tbody>'+tfoot+'</table>';
@@ -1363,11 +1401,20 @@ function createListView(){
     if (!costSummary) return;
     var scope = currentScope();
     var costEl = body.querySelector('#sumScopeCost');
-    // "$1.23/5h:24%/w:41%" — but only with ONE plan in view. Two accounts have two sets
-    // of windows and no meaningful sum, so there the table alone speaks for them.
-    var groups = subGroups(), one = groups.length === 1 ? groups[0] : null;
-    costEl.innerHTML = esc(fc(scope.all.cost))
-      + (one && one.windows ? '<span class="scope-win" title="'+esc(subWinTitle(one))+'">'+esc(subWinStr(one.windows))+'</span>' : '');
+    // The headline has to agree with the table under it. Read-only shows Bedrock's own
+    // spend — printing the everything-total over a Bedrock-only table would hand back by
+    // subtraction exactly the number the table left out — and no window badge, which is
+    // quota on a personal plan.
+    if (RO) {
+      var bed = (scope.byProvider || {}).bedrock;
+      costEl.textContent = fc(bed ? bed.cost : 0);
+    } else {
+      // "$1.23/5h:24%/w:41%" — but only with ONE plan in view. Two accounts have two sets
+      // of windows and no meaningful sum, so there the table alone speaks for them.
+      var groups = subGroups(), one = groups.length === 1 ? groups[0] : null;
+      costEl.innerHTML = esc(fc(scope.all.cost))
+        + (one && one.windows ? '<span class="scope-win" title="'+esc(subWinTitle(one))+'">'+esc(subWinStr(one.windows))+'</span>' : '');
+    }
     body.querySelector('#sumProvider').innerHTML = providerTableHtml(scope);
   }
   // One row per ACCOUNT, not per server: the windows belong to a login, so two machines
@@ -1415,10 +1462,11 @@ function createListView(){
       + '</tr>';
   }
   function renderSubs() {
-    var groups = subGroups();
+    var groups = RO ? [] : subGroups();
     var wrap = body.querySelector('#subs');
     // Nothing to say on a Bedrock-only or API-key install — an empty table would just be
-    // a heading over a blank row.
+    // a heading over a blank row. Read-only lands here too: the table is an account's
+    // name, email, org, plan and quota, which is the most personal thing on the page.
     if (!groups.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
     var thead = '<thead><tr><th>Account</th><th>USD ('+esc(scopeLabel())+')</th>'
@@ -1570,9 +1618,6 @@ function createSessionView(INFO){
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
     + '<div class="hdr-title">Loading…</div>';
   el.appendChild(makeViewBar(v, barMain, { close:true, term:true }));
-  // The session's own server, and its pane if it has one: the terminal lands inside the
-  // running Claude Code rather than in a fresh shell next to it.
-  v.onTerm = function(){ openTerminalWindow(INFO.server, { sessionId: INFO.sessionId }); };
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
 
@@ -1586,6 +1631,7 @@ function createSessionView(INFO){
       '<button class="jump-marker">&#8595; New updates</button>'+
       '<div class="query-ind" title="Querying…"></div>'+
     '</div>'+
+    '<div class="sv-term"><div class="term-host"></div><div class="term-fit"></div></div>'+
     '<div class="cmd-box">'+
       '<div class="cmd-head"><span class="cmd-title"></span>'+
         '<div class="cmd-btns">'+
@@ -1624,6 +1670,124 @@ function createSessionView(INFO){
   var inputTools = body.querySelector('.input-tools');
   var histPrevBtn = body.querySelector('.hist-btn[data-h="prev"]');
   var histNextBtn = body.querySelector('.hist-btn[data-h="next"]');
+
+  // — this session's terminal, in this view's content area —
+  // The bar's >_ toggles it. Created on first use and destroyed when closed, deliberately:
+  // an attached tmux client that lingered would keep tmux sizing that window for a browser
+  // nobody is looking at, which is the very thing the pinned grid exists to avoid.
+  var termEl = body.querySelector('.sv-term');
+  var termHost = termEl.querySelector('.term-host');
+  var termFitEl = termEl.querySelector('.term-fit');
+  var termRef = null, termObs = null, termFitTimer = null;
+  var TERM_PAD_X = 4, TERM_PAD_Y = 3;    // .sv-term .xterm padding, kept in sync with the CSS
+
+  // The grid is tmux's and does not move, so what gives is the font.
+  //
+  // This cannot be solved for. xterm rounds a cell to whole device pixels, so the map
+  // from font size to grid size is a STAIRCASE: 5.5pt and 5.75pt can draw the identical
+  // screen, and a quarter-point more can cost a whole pixel per row. The obvious loop —
+  // measure, scale by how far off you are, repeat — therefore oscillates between two
+  // neighbouring steps and never settles, which is exactly what it did.
+  //
+  // So: binary search on the quarter-point grid, between the largest size known to fit
+  // and the smallest known not to. Seven measurements cover 3pt to 28pt — a tenth of a
+  // second, and then it is still. It lands on the largest size that actually fitted, not
+  // on the last one probed, so the terminal is never left one pixel over the edge.
+  // A search is a sequence of measurements over several frames, so two of them running
+  // at once — the open finishing while the ResizeObserver's first callback is in flight —
+  // interleave their probes and each concludes from the other's font. One counter, and
+  // the older search stands down.
+  var TERM_FONT_MIN = 3, TERM_FONT_MAX = 28, fitRun = 0;
+  function fitTermFont(run, lo, hi, pass){
+    var core = termRef;
+    if (!core || !core.term || core.destroyed || run !== fitRun) return;
+    var scr = termHost.querySelector('.xterm-screen');
+    if (!scr) return;
+    var r = scr.getBoundingClientRect();
+    var availW = termHost.clientWidth - TERM_PAD_X, availH = termHost.clientHeight - TERM_PAD_Y;
+    if (!(r.width > 0 && r.height > 0 && availW > 0 && availH > 0)) return;
+    if (lo == null) { lo = TERM_FONT_MIN; hi = TERM_FONT_MAX + 0.25; }
+    var cur = core.term.options.fontSize;
+    // Half a pixel of slack: these are subpixel measurements of a grid drawn to whole
+    // device pixels, and an exact comparison rejects a size that visibly fits.
+    if (r.width <= availW + 0.5 && r.height <= availH + 0.5) { if (cur > lo) lo = cur; }
+    else if (cur < hi) hi = cur;
+    var next = Math.floor((lo + hi) / 2 * 4) / 4;
+    if (next > lo && next < hi && (pass || 0) < 14) {
+      core.term.options.fontSize = next;
+      return setTimeout(function(){ fitTermFont(run, lo, hi, (pass || 0) + 1); }, 20);
+    }
+    if (cur !== lo) {
+      core.term.options.fontSize = lo;
+      return setTimeout(function(){ if (run === fitRun) showTermGeom(); }, 20);
+    }
+    showTermGeom();
+  }
+  function showTermGeom(){
+    var core = termRef;
+    if (!core || !core.term) return;
+    termFitEl.textContent = core.term.cols + '×' + core.term.rows + ' · ' +
+      core.term.options.fontSize + 'px' +
+      (core.where === 'pane' ? ' · session pane' : core.where === 'window' ? ' · new window' : '');
+  }
+  // Two sizings, one entry point. A pinned terminal keeps its grid and moves its font; a
+  // login shell (no tmux on that host) has no grid to respect, so it behaves like every
+  // other terminal and fits the grid to the box.
+  function syncTermSize(){
+    var core = termRef;
+    if (!core || !core.term) return;
+    if (core.pinned) return fitTermFont(++fitRun);
+    try { core.fit.fit(); } catch(e) { return; }
+    if (core.term.cols !== core.cols || core.term.rows !== core.rows) {
+      core.cols = core.term.cols; core.rows = core.term.rows;
+      core.send({ type:'size', cols:core.cols, rows:core.rows });
+    }
+    showTermGeom();
+  }
+  function setTermBtn(on){
+    var b = el.querySelector('.vb-btn.term-open');
+    if (!b) return;
+    b.classList.toggle('on', on);
+    b.title = on ? 'Back to the transcript' : 'Terminal for this session';
+  }
+  function openSessionTerm(){
+    if (termRef) return;
+    el.classList.add('terming');
+    setTermBtn(true);
+    var core = termCore(termHost, {
+      server: INFO.server, title: SRV, sessionId: INFO.sessionId,
+      fontSize: 12, theme: 'light',
+      // A sensible hint for the case tmux does not overrule it — a login shell should
+      // still come up at the size of the box it is about to be drawn in.
+      onReady: function(){ try { core.fit.fit(); } catch(e) {} },
+      onOpen: function(){
+        if (core.pinned) { try { core.term.resize(core.cols, core.rows); } catch(e) {} }
+        setTimeout(function(){ syncTermSize(); core.term.focus(); }, 30);
+      },
+      onState: function(st){ termEl.classList.toggle('dead', st === 'dead'); },
+    });
+    termRef = core;
+    core.start();
+    if (window.ResizeObserver) {
+      termObs = new ResizeObserver(function(){
+        clearTimeout(termFitTimer);
+        termFitTimer = setTimeout(syncTermSize, 80);
+      });
+      termObs.observe(termHost);
+    }
+  }
+  function closeSessionTerm(){
+    if (termObs) { try { termObs.disconnect(); } catch(e) {} termObs = null; }
+    clearTimeout(termFitTimer);
+    if (termRef) { termRef.destroy(); termRef = null; }
+    el.classList.remove('terming');
+    termEl.classList.remove('dead');
+    setTermBtn(false);
+    // The transcript grew while it was hidden, where every scroll measurement is zero.
+    // Put it back where it was reading rather than at whatever the browser left behind.
+    if (following) scrollBottom(true);
+  }
+  v.onTerm = function(){ if (termRef) closeSessionTerm(); else openSessionTerm(); };
 
   var ws, reconnectTimer, destroyed = false, connected = false;
   var msgEls = {}, toolEls = {}, seenUuids = {};
@@ -2611,6 +2775,7 @@ function createSessionView(INFO){
   var subTimer = setInterval(fetchSub, 60000);
   v.destroy = function(){
     destroyed = true;
+    closeSessionTerm();
     clearInterval(statusTimer); clearInterval(drivePollTimer); clearInterval(subTimer);
     clearTimeout(reconnectTimer); clearTimeout(statsTimer);
     if (gapObserver) { try { gapObserver.disconnect(); } catch(e) {} }
@@ -2726,6 +2891,141 @@ function bytesFromB64(s){
   return u;
 }
 
+// Every terminal on this page, so closing the tab can end the shells it opened.
+var termCores = [];
+
+// The half of a terminal that is the same wherever it is drawn: xterm, the pty behind it,
+// and the socket between. Geometry is deliberately NOT here, because the two callers want
+// opposite things from it — a floating window fits its GRID to the box you dragged it to,
+// while a session's terminal is pinned to the grid tmux already has and fits its FONT to
+// the box instead. One question with two right answers stays with the caller.
+//
+// opts: { server, title, sessionId, fontSize, theme, onReady, onOpen(d), onState(s) }
+function termCore(bodyEl, opts){
+  var srv = isLocal(opts.server) ? null : opts.server;
+  var API = apiBase(srv);                  // '' locally, '/peer/<name>' for a peer
+  var c = { term:null, fit:null, ws:null, id:null, lastSeq:null, resyncing:false,
+            dead:false, destroyed:false, cols:0, rows:0,
+            attached:false, pinned:false, where:'shell', api:API, server:srv || SELF.name };
+  termCores.push(c);
+  function fire(n, a){ if (opts[n]) opts[n](a); }
+  c.send = function(o){ if (c.ws && c.ws.readyState === 1) { try { c.ws.send(JSON.stringify(o)); } catch(e) {} } };
+  c.note = function(html){ bodyEl.innerHTML = '<div class="term-pick"><div class="term-note">' + html + '</div></div>'; };
+
+  c.start = function(){
+    c.note('Starting a shell on <code>' + esc(opts.title || c.server) + '</code>&hellip;');
+    return loadXterm().then(function(){
+      if (c.destroyed) return;
+      bodyEl.innerHTML = '';
+      c.term = new Terminal({
+        fontSize: opts.fontSize || 13,
+        fontFamily: 'ui-monospace, Menlo, Consolas, "Cascadia Code", monospace',
+        cursorBlink: true, scrollback: 5000,
+        theme: TERM_THEMES[opts.theme === 'dark' ? 'dark' : 'light'],
+      });
+      c.fit = new FitAddon.FitAddon();
+      c.term.loadAddon(c.fit);
+      c.term.open(bodyEl);
+      fire('onReady');                     // the caller's one chance to size the grid first
+      c.cols = c.term.cols; c.rows = c.term.rows;
+      // One socket is one ordered stream, so keystrokes need no sequencing of their own.
+      c.term.onData(function(d){ c.send({ type:'in', b: b64FromBytes(new TextEncoder().encode(d)) }); });
+      // onBinary hands over raw bytes as latin-1 chars — encoding them as UTF-8 would
+      // corrupt anything above 0x7f, so they go across as they are.
+      c.term.onBinary(function(d){
+        var u = new Uint8Array(d.length);
+        for (var i = 0; i < d.length; i++) u[i] = d.charCodeAt(i) & 0xff;
+        c.send({ type:'in', b: b64FromBytes(u) });
+      });
+      return fetch(API + '/api/term/open', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ cols:c.cols, rows:c.rows, sessionId: opts.sessionId || null }) })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (c.destroyed) return;
+          if (!d || d.error) {
+            c.term.write('\\r\\n\\x1b[31m' + ((d && d.error) || 'could not start a shell') + '\\x1b[0m\\r\\n');
+            c.dead = true; fire('onState', 'dead');
+            return;
+          }
+          c.id = d.id;
+          c.attached = !!d.attached;
+          c.pinned = !!d.pinned;
+          c.where = d.where || (d.attached ? 'pane' : 'shell');
+          // A pinned terminal's grid is tmux's, not ours — the server sized the pty to
+          // what tmux already had, and this is the browser being told what it must draw.
+          if (c.pinned && d.cols && d.rows) { c.cols = d.cols; c.rows = d.rows; }
+          fire('onOpen', d);
+          connect();
+        });
+    }).catch(function(e){
+      if (!c.destroyed) c.note('Could not load xterm.js from the CDN (' + esc(String(e.message || e)) + '). ' +
+        'The terminal needs it; the rest of ccbb does not.');
+    });
+  };
+
+  // — the socket —
+  var reconnectTimer = null, resyncQuiet = null;
+  // A replayed backlog arrives in bulk, and xterm only sticks to the bottom while the
+  // viewport is already there — so after a reset the screen would be rebuilt correctly
+  // and then left scrolled to the middle of it. Follow the tail until replay goes quiet.
+  function afterResyncWrite(){
+    c.term.scrollToBottom();
+    clearTimeout(resyncQuiet);
+    resyncQuiet = setTimeout(function(){ c.resyncing = false; }, 400);
+  }
+  function connect(){
+    if (c.destroyed || c.dead || !c.id) return;
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(proto + '//' + location.host + API + '/ws-term/' + c.id +
+      (c.lastSeq != null ? '?from=' + c.lastSeq : ''));
+    c.ws = ws;
+    ws.onopen = function(){
+      fire('onState', 'live');
+      // Never for a pinned terminal: its size is tmux's, and the server drops the frame
+      // anyway. Saying it at all would be the page claiming an authority it gave up.
+      if (!c.pinned) c.send({ type:'size', cols:c.cols, rows:c.rows });
+    };
+    ws.onmessage = function(ev){
+      var f; try { f = JSON.parse(ev.data); } catch(e) { return; }
+      if (f.type === 'o') {
+        // Ordered by construction. A hole means loss, not reordering — so drop the
+        // socket and let the reconnect replay, rather than piecing the screen together.
+        if (c.lastSeq != null && f.seq !== c.lastSeq + 1) { c.lastSeq = null; try { ws.close(); } catch(e) {} return; }
+        c.lastSeq = f.seq;
+        c.term.write(bytesFromB64(f.b), c.resyncing ? afterResyncWrite : undefined);
+      } else if (f.type === 'reset') {
+        c.term.reset(); c.lastSeq = null; c.resyncing = true;
+      } else if (f.type === 'exit') {
+        c.dead = true;
+        fire('onState', 'dead');
+        c.term.write('\\r\\n\\x1b[90m[shell exited' + (f.code != null ? ' (' + f.code + ')' : '') + ']\\x1b[0m\\r\\n');
+        try { ws.close(); } catch(e) {}
+      }
+    };
+    ws.onclose = function(){
+      if (c.destroyed || c.dead) return;
+      fire('onState', '');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 1000);
+    };
+  }
+
+  c.destroy = function(){
+    if (c.destroyed) return;
+    c.destroyed = true;
+    clearTimeout(reconnectTimer); clearTimeout(resyncQuiet);
+    if (c.id && !c.dead) {
+      if (c.ws && c.ws.readyState === 1) c.send({ type:'close' });
+      else fetch(API + '/api/term/' + c.id + '/close', { method:'POST' }).catch(function(){});
+    }
+    if (c.ws) { try { c.ws.close(); } catch(e) {} }
+    if (c.term) { try { c.term.dispose(); } catch(e) {} }
+    var i = termCores.indexOf(c);
+    if (i >= 0) termCores.splice(i, 1);
+  };
+  return c;
+}
+
 function openTerminalWindow(server, opts){
   opts = opts || {};
   var srv = isLocal(server) ? null : server;
@@ -2740,8 +3040,7 @@ function openTerminalWindow(server, opts){
   var raw = cookieGet(termCookieName(name));
   if (raw) { try { saved = JSON.parse(raw); } catch(e) { saved = null; } }
 
-  var w = { id:null, term:null, fit:null, ws:null, lastSeq:null, dead:false, destroyed:false,
-            cols:0, rows:0, server:name,
+  var w = { term:null, fit:null, destroyed:false, cols:0, rows:0, server:name,
             fontSize: Math.max(8, Math.min(28, Math.round(tnum(saved && saved.fontSize, 13)))),
             theme: (saved && saved.theme === 'dark') ? 'dark' : 'light' };
   // Cascade only a window we have never placed; a remembered one goes back where it was.
@@ -2921,18 +3220,21 @@ function openTerminalWindow(server, opts){
     }, 80);
   }
   function fitNow(){
-    if (!w.term || !w.fit || el.classList.contains('min')) return;
+    // A pinned terminal has no say in its own size — see termCore — so the window keeps
+    // whatever grid tmux handed it and simply crops. The floating window is never opened
+    // against a session, so this is a guard rather than a case.
+    if (!w.term || !w.fit || core.pinned || el.classList.contains('min')) return;
     try { w.fit.fit(); } catch(e) { return; }
     if (w.term.cols === w.cols && w.term.rows === w.rows) return;
     w.cols = w.term.cols; w.rows = w.term.rows;
-    wsSendJ({ type:'size', cols:w.cols, rows:w.rows });
+    core.send({ type:'size', cols:w.cols, rows:w.rows });
     syncCfg();
     noteRect(); saveSoon();
   }
   var refitTimer = null;
   function refit(){ clearTimeout(refitTimer); refitTimer = setTimeout(fitNow, 60); }
-  var ro = null;
-  if (window.ResizeObserver) { ro = new ResizeObserver(refit); ro.observe(bodyEl); }
+  var obs = null;
+  if (window.ResizeObserver) { obs = new ResizeObserver(refit); obs.observe(bodyEl); }
   // A browser window that shrank can leave a remembered rect hanging off the edge.
   function onViewportResize(){
     if (!transient()) {
@@ -2945,126 +3247,49 @@ function openTerminalWindow(server, opts){
   }
   window.addEventListener('resize', onViewportResize);
 
-  function note(html){ bodyEl.innerHTML = '<div class="term-pick"><div class="term-note">' + html + '</div></div>'; }
-  function wsSendJ(obj){
-    if (w.ws && w.ws.readyState === 1) { try { w.ws.send(JSON.stringify(obj)); } catch(e) {} }
-  }
-
-  // — open the shell, then attach —
-  note('Starting a shell on <code>' + esc(name) + '</code>…');
-  loadXterm().then(function(){
-    if (w.destroyed) return;
-    bodyEl.innerHTML = '';
-    w.term = new Terminal({
-      fontSize: w.fontSize,
-      fontFamily: 'ui-monospace, Menlo, Consolas, "Cascadia Code", monospace',
-      cursorBlink: true, scrollback: 5000,
-      theme: TERM_THEMES[w.theme],
-    });
-    w.fit = new FitAddon.FitAddon();
-    w.term.loadAddon(w.fit);
-    w.term.open(bodyEl);
-    try { w.fit.fit(); } catch(e) {}
-    w.cols = w.term.cols; w.rows = w.term.rows;
-    // One socket is one ordered stream, so keystrokes need no sequencing of their own.
-    w.term.onData(function(d){ wsSendJ({ type:'in', b: b64FromBytes(new TextEncoder().encode(d)) }); });
-    // onBinary hands over raw bytes as latin-1 chars — encoding them as UTF-8 would
-    // corrupt anything above 0x7f, so they go across as they are.
-    w.term.onBinary(function(d){
-      var u = new Uint8Array(d.length);
-      for (var i = 0; i < d.length; i++) u[i] = d.charCodeAt(i) & 0xff;
-      wsSendJ({ type:'in', b: b64FromBytes(u) });
-    });
-    w.term.focus();
-    syncCfg();
-    return fetch(API + '/api/term/open', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ cols:w.cols, rows:w.rows, sessionId: opts.sessionId || null }) })
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        if (w.destroyed) return;
-        if (!d || d.error) {
-          w.term.write('\\r\\n\\x1b[31m' + ((d && d.error) || 'could not start a shell') + '\\x1b[0m\\r\\n');
-          el.classList.add('dead');
-          return;
-        }
-        w.id = d.id;
-        // The title is the server, nothing else — it is the one thing you need to read at
-        // a glance. Whether this is the session's pane or a shell beside it still matters
-        // (asking for a pane and silently getting a shell would be a surprise), so it goes
-        // in the tooltip rather than into the name.
-        titleEl.textContent = name;
-        titleEl.title = name + (d.attached ? ' — attached to the session pane' : ' — login shell');
-        connect();
-        // Write the state once up front. Otherwise a window that is opened and never
-        // touched — the common case — would leave nothing behind to restore, since
-        // every other save hangs off an actual change.
-        noteRect(); saveSoon();
-        // A remembered grid is applied once the shell is up, so the window ends at the
-        // size it had rather than at whatever the restored rect happened to fit.
-        if (lastGrid.cols && lastGrid.rows) setTimeout(function(){ applyGrid(lastGrid.cols, lastGrid.rows, 0); }, 60);
-      });
-  }).catch(function(e){
-    if (!w.destroyed) note('Could not load xterm.js from the CDN (' + esc(String(e.message || e)) + '). ' +
-      'The terminal needs it; the rest of ccbb does not.');
+  // The chrome above is this function's; the terminal itself is not. onReady runs with a
+  // live xterm and no pty yet, which is the one moment the grid can be fitted to the
+  // window before anything is opened at the wrong size.
+  var core = termCore(bodyEl, {
+    server: srv, title: name, sessionId: opts.sessionId || null,
+    fontSize: w.fontSize, theme: w.theme,
+    onReady: function(){
+      w.term = core.term; w.fit = core.fit;
+      try { core.fit.fit(); } catch(e) {}
+      w.cols = core.term.cols; w.rows = core.term.rows;
+      core.term.focus();
+      syncCfg();
+    },
+    onOpen: function(d){
+      // The title is the server, nothing else — it is the one thing you need to read at
+      // a glance. Which of the three shells you got still matters (asking for a pane and
+      // silently getting a login shell would be a surprise), so it goes in the tooltip.
+      titleEl.textContent = name;
+      titleEl.title = name + (d.where === 'pane' ? ' — attached to the session pane'
+                            : d.where === 'window' ? ' — a window opened for this session'
+                            : ' — login shell');
+      // Write the state once up front. Otherwise a window that is opened and never
+      // touched — the common case — would leave nothing behind to restore, since
+      // every other save hangs off an actual change.
+      noteRect(); saveSoon();
+      // A remembered grid is applied once the shell is up, so the window ends at the
+      // size it had rather than at whatever the restored rect happened to fit.
+      if (!core.pinned && lastGrid.cols && lastGrid.rows)
+        setTimeout(function(){ applyGrid(lastGrid.cols, lastGrid.rows, 0); }, 60);
+    },
+    onState: function(st){
+      el.classList.toggle('live', st === 'live');
+      el.classList.toggle('dead', st === 'dead');
+    },
   });
-
-  // — the socket —
-  var reconnectTimer = null;
-  var resyncQuiet = null;
-  // A replayed backlog arrives in bulk, and xterm only sticks to the bottom while the
-  // viewport is already there — so after a reset the screen would be rebuilt correctly
-  // and then left scrolled to the middle of it. Follow the tail until replay goes quiet.
-  function afterResyncWrite(){
-    w.term.scrollToBottom();
-    clearTimeout(resyncQuiet);
-    resyncQuiet = setTimeout(function(){ w.resyncing = false; }, 400);
-  }
-  function connect(){
-    if (w.destroyed || w.dead || !w.id) return;
-    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var ws = new WebSocket(proto + '//' + location.host + API + '/ws-term/' + w.id +
-      (w.lastSeq != null ? '?from=' + w.lastSeq : ''));
-    w.ws = ws;
-    ws.onopen = function(){
-      el.classList.add('live'); el.classList.remove('dead');
-      wsSendJ({ type:'size', cols:w.cols, rows:w.rows });
-    };
-    ws.onmessage = function(ev){
-      var f; try { f = JSON.parse(ev.data); } catch(e) { return; }
-      if (f.type === 'o') {
-        // Ordered by construction. A hole means loss, not reordering — so drop the
-        // socket and let the reconnect replay, rather than piecing the screen together.
-        if (w.lastSeq != null && f.seq !== w.lastSeq + 1) { w.lastSeq = null; try { ws.close(); } catch(e) {} return; }
-        w.lastSeq = f.seq;
-        w.term.write(bytesFromB64(f.b), w.resyncing ? afterResyncWrite : undefined);
-      } else if (f.type === 'reset') {
-        w.term.reset(); w.lastSeq = null; w.resyncing = true;
-      } else if (f.type === 'exit') {
-        w.dead = true;
-        el.classList.remove('live'); el.classList.add('dead');
-        w.term.write('\\r\\n\\x1b[90m[shell exited' + (f.code != null ? ' (' + f.code + ')' : '') + ']\\x1b[0m\\r\\n');
-        try { ws.close(); } catch(e) {}
-      }
-    };
-    ws.onclose = function(){
-      if (w.destroyed || w.dead) return;
-      el.classList.remove('live');
-      clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(connect, 1000);
-    };
-  }
+  core.start();
 
   function destroy(){
     w.destroyed = true;
-    clearTimeout(reconnectTimer); clearTimeout(refitTimer);
+    clearTimeout(refitTimer);
     w.saveNow();   // the debounce would be cancelled by the teardown below
-    if (w.id && !w.dead) {
-      if (w.ws && w.ws.readyState === 1) wsSendJ({ type:'close' });
-      else fetch(API + '/api/term/' + w.id + '/close', { method:'POST' }).catch(function(){});
-    }
-    if (w.ws) { try { w.ws.close(); } catch(e) {} }
-    if (w.term) { try { w.term.dispose(); } catch(e) {} }
-    if (ro) { try { ro.disconnect(); } catch(e) {} }
+    core.destroy();
+    if (obs) { try { obs.disconnect(); } catch(e) {} }
     window.removeEventListener('resize', onViewportResize);
     el.remove();
     var i = termWins.indexOf(w);
@@ -3076,10 +3301,9 @@ function openTerminalWindow(server, opts){
 // Closing the tab ends the shells it opened. sendBeacon is the only thing that survives
 // unload, which is why one HTTP close route exists alongside the socket.
 window.addEventListener('pagehide', function(){
-  termWins.forEach(function(w){
-    if (w.saveNow) w.saveNow();
-    if (w.id && !w.dead && navigator.sendBeacon)
-      navigator.sendBeacon(apiBase(w.server === SELF.name ? null : w.server) + '/api/term/' + w.id + '/close');
+  termWins.forEach(function(w){ if (w.saveNow) w.saveNow(); });
+  termCores.forEach(function(c){
+    if (c.id && !c.dead && navigator.sendBeacon) navigator.sendBeacon(c.api + '/api/term/' + c.id + '/close');
   });
 });
 
@@ -3456,20 +3680,193 @@ function clampInt(v, lo, hi, dflt) {
 }
 
 function shQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
-// The tmux session holding a live Claude Code session's pane, if it has one. Attaching
-// there shows the actual TUI rather than a fresh shell beside it.
-function tmuxAttachFor(sessionId) {
-  const loc = paneForSession(sessionId);
-  if (!loc) return null;
-  let sess;
-  try { sess = tmux(['display-message', '-p', '-t', loc.pane, '#{session_name}']).split('\n')[0].trim(); }
+
+// ── where a session's terminal lands ──────────────────────────────────────────
+// The rule this whole block exists to keep: attaching must not resize tmux. A browser
+// terminal is a tmux CLIENT, and tmux sizes a session to its clients — so a pty even one
+// row off from what tmux already has reflows the TUI in the user's own terminal, and
+// leaves it reflowed until the browser closes. The pty is therefore built to tmux's
+// measurements rather than the window's, and the browser scales its FONT to that grid.
+
+// A client carries the status line(s); the window does not. window_height is the window,
+// so a client of exactly window_height rows is one (or two, or none) short of what tmux
+// expects and tmux shrinks the window to match. Ask what the status costs and add it.
+function tmuxStatusLines(sess) {
+  const read = args => { try { return tmux(args).trim(); } catch { return ''; } };
+  // Unset on the session means "inherit the global"; show-options prints nothing rather
+  // than the inherited value, so an empty answer is a question, not an answer.
+  const v = (sess && read(['show-options', '-v', '-t', sess, 'status'])) ||
+            read(['show-options', '-g', '-v', 'status']);
+  if (v === 'off') return 0;
+  if (v === 'on' || v === '') return 1;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(5, n)) : 1;
+}
+
+// The session a pane belongs to, and the exact pty size an attach to it needs.
+function tmuxGeom(pane) {
+  let out;
+  try { out = tmux(['display-message', '-p', '-t', pane,
+    '#{session_name}\t#{window_width}\t#{window_height}\t#{window_id}']); }
   catch { return null; }
-  if (!sess) return null;
-  // Select the window AND the pane first, so the client lands on the session's pane
-  // rather than wherever the tmux session was last left.
-  return 'tmux select-window -t ' + shQuote(loc.pane) + ' 2>/dev/null; ' +
-         'tmux select-pane -t ' + shQuote(loc.pane) + ' 2>/dev/null; ' +
-         'exec tmux attach -t ' + shQuote(sess);
+  const [sess, w, h, win] = out.split('\n')[0].split('\t');
+  const cols = Number(w), rows = Number(h);
+  if (!sess || !Number.isFinite(cols) || !Number.isFinite(rows) || cols < 1 || rows < 1) return null;
+  return { session: sess, window: win || '', cols, rows: rows + tmuxStatusLines(sess) };
+}
+
+// ── one tmux client per session page ──────────────────────────────────────────
+// Every browser terminal is already its own tmux CLIENT, but they all used to attach to
+// the same tmux SESSION — and a session has one current window, shared by every client on
+// it. So opening session B's terminal dragged session A's terminal, and your own terminal,
+// onto B's window.
+//
+// Sessions in a GROUP share the window list but each keeps its own current window, which
+// is exactly the seam this needs: one grouped session per Claude session. It is named so
+// that it is obvious in `tmux ls` whose it is, and so the orphan sweep below can recognise
+// its own work without guessing.
+//
+// What grouping does NOT isolate: a window's active pane belongs to the WINDOW, so
+// selecting Claude's pane still moves it for everyone. Only the window jump stops leaking.
+function tmuxGroupName(sessionId) { return 'ccbb-' + String(sessionId).replace(/[^A-Za-z0-9]/g, '').slice(0, 8); }
+
+// The session to actually attach to: a grouped one when we can make it, otherwise the base
+// session itself. Falling back rather than failing matters — attaching to the base is what
+// ccbb always did, so an old tmux or a name we cannot claim costs you the isolation and
+// nothing else.
+function tmuxAttachSession(sessionId, base) {
+  const name = tmuxGroupName(sessionId);
+  const group = t => { try { return tmux(['display-message', '-p', '-t', t, '#{session_group}']).trim(); } catch { return null; } };
+  try {
+    let exists = true;
+    try { tmux(['has-session', '-t', name]); } catch { exists = false; }
+    // A Claude session can move between tmux sessions across a restart, and a grouped
+    // session left pointing at the old one shares the wrong window list entirely.
+    if (exists && group(name) !== (group(base) || base)) {
+      try { tmux(['kill-session', '-t', name]); } catch {}
+      exists = false;
+    }
+    if (!exists) tmux(['new-session', '-d', '-s', name, '-t', base]);
+    return name;
+  } catch { return base; }
+}
+
+// destroy-unattached is what lets tmux reap the grouped session with no help from ccbb —
+// including after a kill -9 that ccbb cannot catch, and including the case of two browser
+// terminals sharing one session, where "is anyone else still here" is not a question ccbb
+// should be trying to answer.
+//
+// It is armed only once a client is actually attached. Set on a session that is still
+// detached, tmux destroys it inside a second and the attach that was a moment away finds
+// nothing left to attach to. That is not a theoretical race; it is what happens.
+function armDestroyUnattached(name, tries) {
+  let clients = '';
+  try { clients = tmux(['list-clients', '-t', name, '-F', '#{client_name}']).trim(); } catch {}
+  if (clients) { try { tmux(['set-option', '-t', name, 'destroy-unattached', 'on']); } catch {} return; }
+  if ((tries || 0) < 25) {                 // 5s, then give up and let the sweep have it
+    const h = setTimeout(() => armDestroyUnattached(name, (tries || 0) + 1), 200);
+    if (h.unref) h.unref();
+  }
+}
+
+// The tmux session that already holds the most Claude Codes. A session that isn't running
+// gets a window made for it, and it belongs beside its siblings rather than in whichever
+// tmux session happens to be listed first. Ties break on the most recently updated Claude
+// session in each, then on the name — so the answer is stable across calls instead of
+// depending on directory read order.
+function busiestTmuxSession() {
+  const score = new Map();
+  for (const hit of panesForLiveSessions().values()) {
+    if (!hit.session) continue;
+    const e = score.get(hit.session) || { n: 0, newest: 0 };
+    e.n++; e.newest = Math.max(e.newest, hit.rec.updatedAt || 0);
+    score.set(hit.session, e);
+  }
+  if (score.size) {
+    return Array.from(score.keys()).sort((a, b) =>
+      (score.get(b).n - score.get(a).n) ||
+      (score.get(b).newest - score.get(a).newest) ||
+      a.localeCompare(b))[0];
+  }
+  // tmux is running but no Claude is: any session beats inventing one.
+  try {
+    const names = tmux(['list-sessions', '-F', '#{session_name}']).split('\n').filter(Boolean).sort();
+    return names[0] || null;
+  } catch { return null; }
+}
+
+// The window this server made for a session that was not running, found by NAME rather
+// than remembered in a Map. Memory does not survive a restart, and a second open after one
+// would make a second window for the same session — which is the littering this exists to
+// prevent. The name is also what tells you in tmux whose window it is, and it is the same
+// slug as the grouped session so the two read as a pair.
+function findMadeWindow(sessionId) {
+  const want = tmuxGroupName(sessionId);
+  let lines = '';
+  try { lines = tmux(['list-windows', '-a', '-F', '#{window_name}\t#{pane_id}']); } catch { return null; }
+  for (const l of lines.split('\n')) {
+    const [name, pane] = l.split('\t');
+    if (name === want && pane) return pane;
+  }
+  return null;
+}
+
+// Where a session's terminal should land, in order of preference:
+//   • the session is live in a pane       → attach there
+//   • it is not, but tmux is running here → a window of its own in the busiest tmux
+//                                           session, cd'd to the session's directory.
+//                                           No claude is started: resuming a session is
+//                                           the user's decision, not a side effect of
+//                                           opening a terminal.
+//   • no tmux at all                      → null; openTerm falls back to a login shell
+function termTargetFor(sessionId) {
+  // The grouped session is resolved once, at the end, from whichever pane won — it hangs
+  // off the Claude session, not off how the pane was found.
+  const withGroup = (t) => {
+    t.attachTo = tmuxAttachSession(sessionId, t.session);
+    t.grouped = t.attachTo !== t.session;
+    return t;
+  };
+  const loc = paneForSession(sessionId);
+  if (loc) {
+    const g = tmuxGeom(loc.pane);
+    if (g) return withGroup({ pane: loc.pane, session: g.session, window: g.window,
+                              cols: g.cols, rows: g.rows, where: 'pane' });
+  }
+  const kept = findMadeWindow(sessionId);
+  if (kept) {
+    const g = tmuxGeom(kept);
+    if (g) return withGroup({ pane: kept, session: g.session, window: g.window,
+                              cols: g.cols, rows: g.rows, where: 'window' });
+  }
+  const host = busiestTmuxSession();
+  if (!host) return null;
+  const cwd = getSessionCwd(sessionId) || os.homedir();
+  let pane;
+  // -d: making the window must not yank whoever is attached to that tmux session onto it.
+  // Our own attach selects it a moment later, on our grouped session only.
+  // -n also turns automatic-rename off, which is what makes the name stay findable.
+  try { pane = tmux(['new-window', '-d', '-t', host + ':', '-c', cwd,
+                     '-n', tmuxGroupName(sessionId), '-P', '-F', '#{pane_id}']).split('\n')[0].trim(); }
+  catch { return null; }
+  if (!pane) return null;
+  const g = tmuxGeom(pane);
+  if (!g) return null;
+  return withGroup({ pane, session: g.session, window: g.window,
+                     cols: g.cols, rows: g.rows, where: 'window' });
+}
+
+// Select the window AND the pane before attaching, so the client lands on Claude's pane
+// rather than wherever the tmux session was last left — including the case where another
+// pane in the same window has the focus.
+function tmuxAttachCmd(target) {
+  // The window is selected on the session being ATTACHED to — the grouped one — so the
+  // jump is this page's alone. The pane is selected by id, which is window-scoped and
+  // therefore shared however this is targeted.
+  const win = target.window ? target.attachTo + ':' + target.window : target.pane;
+  return 'tmux select-window -t ' + shQuote(win) + ' 2>/dev/null; ' +
+         'tmux select-pane -t ' + shQuote(target.pane) + ' 2>/dev/null; ' +
+         'exec tmux attach -t ' + shQuote(target.attachTo);
 }
 
 // script(1) is two different programs wearing one name. util-linux takes the command
@@ -3560,7 +3957,16 @@ function openTerm(cols, rows, sessionId) {
   rows = clampInt(rows, 5, 200, 24);
   const id = String(++termIds);
   const shell = process.env.SHELL || '/bin/bash';
-  const attach = sessionId ? tmuxAttachFor(String(sessionId)) : null;
+  const target = sessionId ? termTargetFor(String(sessionId)) : null;
+  // The browser's cols/rows are a HINT, and tmux overrules it. Sizing the pty to the box
+  // the page happens to have would resize tmux on attach; sizing it to tmux instead
+  // leaves the far end untouched and hands the browser a grid to scale its font to.
+  // `pinned` is that fact travelling to the front-end, and back into termResize below.
+  if (target) { cols = target.cols; rows = target.rows; }
+  const attach = target ? tmuxAttachCmd(target) : null;
+  // A session's shell, when there is no tmux to put it in, still opens where the session
+  // lives — the same courtesy the new tmux window gets.
+  const cwd = (sessionId && !target && getSessionCwd(String(sessionId))) || os.homedir();
   // stty runs inside the pty before the shell starts, so the first prompt is drawn at
   // the right geometry instead of at 80x24 and then redrawn.
   // "columns", not "cols": GNU stty takes either, BSD stty only spells it out.
@@ -3580,7 +3986,7 @@ function openTerm(cols, rows, sessionId) {
     const shape = resolveTermSpawn();
     const args = SCRIPT_STYLES[shape.style](cmd);
     const opts = {
-      cwd: os.homedir(),
+      cwd,
       env: Object.assign({}, process.env, { TERM: 'xterm-256color' }),
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
@@ -3591,7 +3997,7 @@ function openTerm(cols, rows, sessionId) {
   // ptsCols/ptsRows: the geometry the pty already has. The stty above runs inside it
   // before the shell starts, so at birth it matches what was asked for.
   const t = { id, child, ptsFile, seq: 0, buf: [], bytes: 0, subs: new Set(), cols, rows, attached: !!attach,
-              ptsCols: cols, ptsRows: rows,
+              pinned: !!target, ptsCols: cols, ptsRows: rows,
               pts: null, alive: true, exitCode: null, graceTimer: null, idleSince: Date.now() };
   terms.set(id, t);
   child.stdout.on('data', c => termPush(t, c));
@@ -3603,7 +4009,15 @@ function openTerm(cols, rows, sessionId) {
     termBroadcast(t, { type: 'exit', code });
     t.idleSince = Date.now();
   });
-  return { id, cols, rows, shell, attached: !!attach };
+  // Nothing here ends the grouped session — tmux does, once the last client leaves. That
+  // is the whole point of arming it: closeTerm stays a matter of killing one pty, and two
+  // browser terminals on one session need no bookkeeping to share it.
+  if (target && target.grouped) armDestroyUnattached(target.attachTo);
+  // `where` says which of the three cases the caller got: the session's own pane, a
+  // window made for it, or a plain login shell. Asking for a pane and silently getting a
+  // shell would be a surprise, and the page says which in its title.
+  return { id, cols, rows, shell, attached: !!(target && target.where === 'pane'),
+           where: target ? target.where : 'shell', pinned: !!target };
 }
 
 function termBroadcast(t, obj) {
@@ -3739,6 +4153,10 @@ function sttySize(dev, rows, cols) {
 // device to set. Recording it as done there left the shell at 80x24 forever, with the
 // browser drawing a grid the program on the other end had never heard of.
 function termResize(t, cols, rows, tries) {
+  // A tmux terminal's size is tmux's. Honouring a resize here would reach straight
+  // through the attach and reflow the window in the user's own terminal — so a stray
+  // size frame from an older front-end is dropped rather than obeyed.
+  if (t.pinned) return { ok: true, resized: false, cols: t.cols, rows: t.rows };
   const c = clampInt(cols, 20, 500, t.cols), r = clampInt(rows, 5, 200, t.rows);
   t.cols = c; t.rows = r;
   if (t.ptsCols === c && t.ptsRows === r) return { ok: true, resized: false, cols: c, rows: r };
@@ -3784,6 +4202,70 @@ function closeTerm(t) {
   t.subs.clear();
   killTermChild(t);
 }
+// ── orphans from a kill -9 ────────────────────────────────────────────────────
+// SIGKILL cannot be caught, so closeAllTerms never runs: the ptys are reparented to init
+// and keep running. A pty running `tmux attach` is a tmux CLIENT, and it holds its session
+// ATTACHED — which means destroy-unattached will not fire for it either. Nothing tmux or
+// the OS does clears it. The only moment left to clean up is the next start.
+//
+// Two handles survive, and both have to agree before anything is ended:
+//   • the pts file. Every terminal writes its pty device to $TMPDIR/ccbb-pts-<pid>-<id>
+//     and unlinks it only on a CLEAN close, so the files whose <pid> is dead name exactly
+//     the ttys that were left behind.
+//   • the client list. A pts number is RECYCLED, so a stale file can name a tty that now
+//     belongs to a real terminal of yours — detaching that would be worse than the leak.
+//     So a tty is only ended if it is also, right now, a client of one of our own ccbb-*
+//     sessions.
+// Detaching the client ends its `tmux attach`, which ends the script(1) holding the pty,
+// which is the whole process tree. Then any ccbb-* session left unattached had its last
+// client taken away and is ours to remove.
+function sweepOrphanTerms() {
+  const clientSession = new Map();
+  try {
+    for (const l of tmux(['list-clients', '-F', '#{client_name}\t#{client_session}']).split('\n')) {
+      const [name, sess] = l.split('\t');
+      if (name) clientSession.set(name, sess || '');
+    }
+  } catch { return; }                      // no tmux server here: nothing to sweep
+  let files = [];
+  try { files = fs.readdirSync(os.tmpdir()); } catch {}
+  let detached = 0;
+  for (const f of files) {
+    const m = /^ccbb-pts-(\d+)-(\d+)$/.exec(f);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    // A live pid is a live ccbb — or an unrelated process that inherited the number.
+    // Either way those terminals are not ours to end, and skipping leaves a leak rather
+    // than taking a risk.
+    if (pid === process.pid || pidAlive(pid)) continue;
+    const file = path.join(os.tmpdir(), f);
+    let dev = '';
+    try { dev = fs.readFileSync(file, 'utf8').trim(); } catch {}
+    if (dev && /^ccbb-/.test(clientSession.get(dev) || '')) {
+      try { tmux(['detach-client', '-t', dev]); detached++; } catch {}
+    }
+    try { fs.unlinkSync(file); } catch {}
+  }
+  let killed = 0;
+  let lines = '';
+  try { lines = tmux(['list-sessions', '-F', '#{session_name}\t#{session_attached}\t#{session_group_size}']); }
+  catch {}
+  for (const l of lines.split('\n')) {
+    const [name, attached, size] = l.split('\t');
+    if (!name || !/^ccbb-/.test(name) || attached !== '0') continue;
+    // Sole survivor of its group means the base session was killed out from under it and
+    // the windows — a running Claude among them — live HERE now. Removing it would take
+    // them with it, so it is left alone and said out loud instead.
+    if (Number(size) <= 1) {
+      console.log(`ccbb: leaving tmux session ${name} — it is the last holder of its windows`);
+      continue;
+    }
+    try { tmux(['kill-session', '-t', name]); killed++; } catch {}
+  }
+  if (detached || killed)
+    console.log(`ccbb: swept ${detached} orphaned terminal client(s) and ${killed} tmux session(s) from a previous run`);
+}
+
 // A pty is a child process, not a resource the OS reclaims with us: nothing kills these
 // shells when ccbb goes away, so every restart would otherwise strand one per terminal
 // that was open. SIGKILL cannot be caught, so `kill -9` on the server still leaks — a
@@ -4510,6 +4992,9 @@ function runWeb(args) {
        : readToken() === peerToken() ? 'IGNORED: it is the same string as peerToken, which wins'
        : 'that token gives a view-only UI (no peers, no terminal, no input)'));
   });
+  // Before anything can open a terminal: whatever a kill -9 on the last run left attached
+  // to tmux is still attached, and this is the only moment it can be recognised as ours.
+  sweepOrphanTerms();
   // Peer health runs on a timer so /api/servers never blocks on a dead tunnel.
   pollPeers();
   pollLinks();
