@@ -275,6 +275,7 @@ const APP_HTML = `<!DOCTYPE html>
   --bg:#fff; --bg-alt:#f0eee6; --surface:#fff; --ink:#3d3d3a; --ink-soft:#6e6d66;
   --ink-faint:#9b998f; --line:#e6e3da; --line-soft:#efece4; --accent:#c96442;
   --accent-soft:#f5e9e3; --code-bg:#f5f3ec;
+  --ok:#2da44e; --warn:#bf5b12; --err:#cf222e;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;background:var(--bg);color:var(--ink);height:100vh;display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased}
@@ -684,19 +685,40 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .sv-term.dark .term-fit{background:#000;color:#8c959f}
 
 /* ── the status line, at the foot ──
-   The shape Claude Code's own status line uses (statusline-instructions.md): model,
-   session cost with the plan windows riding on it, turns, and context as
-   current/peak/resend. One dim line at the bottom, where a status line belongs — the
-   breakdown it summarises is in the header block the dots button opens. It stays up in
-   terminal mode too, which is the one view with nothing else to read the numbers from. */
-.sv-foot{flex:0 0 auto;display:flex;align-items:baseline;gap:12px;padding:4px 14px 5px;
+   The shape Claude Code's own status line uses (statusline-instructions.md), less the
+   fields the rest of the window already answers: the model, which the header block the
+   dots button opens names in full, and the turn count, which the transcript is. What is
+   left is the money — session cost, the plan windows it is drawn from, and context as
+   current/peak/resend. Nor does the session's own state appear here any more; the dot in
+   the bar has said "working" or "waiting" all along, and a second copy at the other end
+   of the view was one more thing changing under your eyes. One dim line at the bottom,
+   where a status line belongs. It stays up in terminal mode too, which is the one view
+   with nothing else to read the numbers from. */
+.sv-foot{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:4px 14px 5px;
   border-top:1px solid var(--line);background:var(--bg-alt);
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--ink-soft);
   font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden}
-.sv-foot .sl{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.sv-foot .sl{display:flex;align-items:center;gap:10px;overflow:hidden;min-width:0}
 .sv-foot b{font-weight:600;color:var(--ink)}
-.sv-foot .plan-win{color:var(--ink-soft);cursor:help}
-.sv-foot .sl-idle{margin-left:auto;flex-shrink:0;color:#8a6d1a}
+/* ctx is what gives when the column is narrow: a percentage half-drawn is a lie, where a
+   truncated token count is visibly truncated. Measured: everything fits down to 380px,
+   ctx starts ellipsizing under that, and the pills survive intact to about 230 — narrower
+   than any column the horizontal grid produces before the bar itself gives out. */
+.sv-foot .sl-ctx{overflow:hidden;text-overflow:ellipsis;min-width:0}
+/* The plan windows as filled pills, the same object the phone's footers draw: a bar reads
+   at a glance where "/5h:28%" has to be parsed. Percentage is the pill's own fill, so a
+   window costs one element's width instead of three. */
+/* Turns without the word, and the sub-agent count in miniature beside it — the same
+   shape the phone's footer uses. */
+.sv-foot .sl-sub{font-size:10.5px;color:var(--ink-soft)}
+.sv-foot .fwins{display:flex;gap:5px;flex:0 0 auto;cursor:help}
+.sv-foot .fwin{position:relative;display:inline-flex;align-items:baseline;gap:4px;
+  padding:1px 6px;border-radius:5px;background:var(--line);overflow:hidden}
+.sv-foot .fwin i{position:absolute;left:0;top:0;bottom:0;background:var(--ok);opacity:.42}
+.sv-foot .fwin.warm i{background:var(--warn)}
+.sv-foot .fwin.hot i{background:var(--err)}
+.sv-foot .fwin b{position:relative}
+.sv-foot .fwin em{position:relative;font-style:normal;font-size:10.5px;color:var(--ink-soft)}
 
 /* ── ssh terminal ──
    A terminal is deliberately NOT a view: you want it over whatever you are reading, at
@@ -815,6 +837,20 @@ function fmtStatDate(iso){ return fd(iso); }
 // to every dollar figure: "$1.23/5h:24%/w:41%", the same shape the status line uses.
 // A window that the account doesn't report is dropped rather than shown as 0%.
 function subPct(w){ return w ? Math.round(w.pct)+'%' : '—'; }
+// One window as a filled pill: the bar IS the pill's background, with the label and the
+// numbers riding on top, so a window costs one element's width instead of three. Amber
+// past 70%, red past 90%. The phone's footers draw the same thing — see ccbb-mobile.js —
+// and the two are meant to stay the same object; they are apart only because the files are.
+function footWin(label, w){
+  if (!w) return '';
+  var pc = Math.max(0, Math.min(100, w.pct));
+  var cls = pc >= 90 ? ' hot' : pc >= 70 ? ' warm' : '';
+  // A few percent of a short pill is a sub-pixel sliver that renders as nothing, which
+  // reads as an untouched window. Any nonzero usage gets at least a visible edge.
+  var fill = 'width:'+pc.toFixed(1)+'%' + (pc > 0 ? ';min-width:3px' : '');
+  return '<span class="fwin'+cls+'"><i style="'+fill+'"></i>'+
+    '<b>'+label+'</b><em>'+subPct(w)+' '+esc(fmtUntil(w.resetsAt))+'</em></span>';
+}
 // How long until a window resets. Whole-ish units — this is read at a glance, and the
 // seconds on a 4-hour countdown are noise.
 function fmtUntil(iso){
@@ -1871,14 +1907,13 @@ function createSessionView(INFO){
         '<button class="send-btn" title="'+SEND_TIP+'">&#8593;</button>'+
       '</div>'+
     '</div></div>'+
-    '<div class="sv-foot"><span class="sl"></span><span class="sl-idle"></span></div>';
+    '<div class="sv-foot"><span class="sl"></span></div>';
   el.appendChild(body);
   v.bodyEl = body;
   var projEl = headEl.querySelector('.hdr-proj');
   var statsEl = headEl.querySelector('.hdr-stats');
   var statusRow = headEl.querySelector('.hdr-status');
   var footEl = body.querySelector('.sv-foot .sl');
-  var footIdleEl = body.querySelector('.sv-foot .sl-idle');
   var transcript = body.querySelector('.transcript');
   var jumpMarker = body.querySelector('.jump-marker');
   var queryEl = body.querySelector('.query-ind');
@@ -2096,6 +2131,16 @@ function createSessionView(INFO){
   // beside the session cost as "$1.23/5h:24%/w:41%" — on a plan the dollars are notional
   // list price and the windows are the figure that actually runs out.
   var subInfo = null, lastStats = null;
+  // The plan windows for the foot, as pills. planWinHtml above stays as it is: it feeds
+  // the header block too, where the line is prose and a bar would not sit in it.
+  function planPillsHtml(st) {
+    if (!subInfo || !subInfo.windows) return '';
+    var onPlan = (st.providers||[]).some(function(p){ return p.provider === 'anthropic' && p.cost > 0; });
+    if (!onPlan) return '';
+    var w = subInfo.windows;
+    var s = footWin('5h', w.fiveHour) + footWin('7d', w.sevenDay);
+    return s ? '<span class="fwins" title="'+esc(subWinTitle(subInfo))+'">'+s+'</span>' : '';
+  }
   function planWinHtml(st) {
     if (!subInfo || !subInfo.windows) return '';
     // A Bedrock or API-key session on a machine that also has a login is not billed to
@@ -2138,20 +2183,15 @@ function createSessionView(INFO){
       '  &middot;  <b>'+fmtTokShort(st.totalTokens)+'</b>  '+tokStr+ctxStr;
     renderFoot();
   }
-  // The status line, in the shape statusline-instructions.md describes: model, session
-  // cost with the plan windows appended, turns, and context as current/peak/resend. No
-  // monthly estimate — that one is a whole-machine figure and this line is one session's.
-  // The model is whichever one the last turn ran on, not the one that cost the most:
-  // this reports what the session IS, and the header behind it lists the rest.
+  // The status line: session cost, the plan windows it is drawn from, and context as
+  // current/peak/resend. No monthly estimate — that one is a whole-machine figure and this
+  // line is one session's. The model used to lead it and no longer does — the header block
+  // behind the dots names it in full, with the rest of them beside it. The turn count kept
+  // its number and lost its label: next to the money, a bare count reads as a count.
   function renderFoot(){
     var st = lastStats;
     if (!st) { footEl.innerHTML = ''; return; }
     var ctx = st.context, cmax = st.contextMax;
-    var mdl = ctx && ctx.model ? prettyModel(ctx.model) : '';
-    if (!mdl) {
-      var ms = (st.models||[]).slice().sort(function(a,b){ return (b.cost||0)-(a.cost||0); });
-      if (ms.length) mdl = prettyModel(ms[0].model);
-    }
     var ctxStr = '';
     if (ctx) {
       var peak = (cmax && cmax.tokens > ctx.tokens) ? cmax.tokens : ctx.tokens;
@@ -2160,11 +2200,11 @@ function createSessionView(INFO){
     }
     var turns = st.turns||0, subTurns = st.subTurns||0;
     footEl.innerHTML = [
-      mdl ? '<b>'+esc(mdl)+'</b>' : '',
-      '<b>'+fmtCost(st.cost)+'</b>'+planWinHtml(st),
-      'turns:<b>'+turns+'</b>'+(subTurns?'+'+subTurns:''),
-      ctxStr,
-    ].filter(Boolean).join('&nbsp;&nbsp;');
+      '<b>'+fmtCost(st.cost)+'</b>',
+      planPillsHtml(st),
+      '<span><b>'+turns+'</b>'+(subTurns?'<span class="sl-sub">+'+subTurns+'</span>':'')+'</span>',
+      ctxStr ? '<span class="sl-ctx">'+ctxStr+'</span>' : '',
+    ].filter(Boolean).join('');
   }
   // Session state from the live sidecar: busy = Claude is working, idle = it finished the
   // turn and is waiting for your input ("session end" in the turn sense), no sidecar = the
@@ -2189,15 +2229,9 @@ function createSessionView(INFO){
       statusRow.innerHTML = '⏸ finished responding' + (at ? ' at <b>'+esc(fd(at))+'</b>' : '') +
         ' · waiting for input' + (since ? ' <b>'+since+'</b>' : '');
       statusRow.classList.add('show');
-      // The header it normally lives in is hidden now, and "it stopped and is waiting for
-      // you" is the one piece of status you should not have to open a block to learn.
-      footIdleEl.textContent = '⏸ waiting' + (since ? ' ' + since : '');
-      footIdleEl.title = statusRow.textContent;
     } else {
       statusRow.classList.remove('show');
       statusRow.innerHTML = '';
-      footIdleEl.textContent = '';
-      footIdleEl.title = '';
     }
   }
   var queryCount = 0;

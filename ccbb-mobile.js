@@ -238,6 +238,17 @@ body.has-max .panel:not(.max){display:none}
 .pbtn:active{background:var(--line);color:var(--ink)}
 .pbtn[data-k="term"]{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:13px}
 .pbtn.on{color:var(--accent)}
+/* ── a session's actions, folded away ──
+   The same trade the desktop makes: four buttons in the bar and a detail block under it,
+   all of it on screen for the sake of the moment you want one of them. On a phone that
+   block cost two of the lines the transcript wanted. ⋮ unfolds the buttons where they
+   were and the block below them; the next tap anywhere folds it back, so nothing stays
+   open behind you. */
+.pacts{display:none;align-items:center;gap:2px}
+.panel.menu .pacts{display:flex}
+.panel:not(.menu) .subhead{display:none}
+.pbtn.pdots{font-size:18px}
+.panel.menu .pbtn.pdots{color:var(--accent)}
 .dot{flex-shrink:0;width:9px;height:9px;border-radius:50%;background:var(--ink-faint)}
 .dot.live{background:var(--ok);animation:pulse 2s infinite}
 .dot.idle{background:#d4a72c}
@@ -304,12 +315,36 @@ body.has-max .panel:not(.max){display:none}
   font-size:11.5px;color:var(--ink-soft);display:flex;flex-direction:column;gap:3px}
 .subhead .sdir{color:var(--ink-soft)}
 .subhead .swhen{color:var(--ink-faint)}
-/* The status line, in the shape statusline-instructions.md defines: dim monospace, and
-   the cache-write half of the resend cost in orange once the prompt cache has gone cold.
-   That flip is wall-clock, so it is re-rendered on a timer, not on data arriving. */
-.sline{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--ink-faint);
-  white-space:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch}
-.sline::-webkit-scrollbar{display:none}
+/* The status line lives at the foot now, where the desktop puts it and where a status
+   line belongs — it was the third line of a header block that is itself folded away most
+   of the time. It is the list footer's twin, .foot and all: same pills, same type, so the
+   two screens end on the same object. The cache-write half of the resend cost turns
+   orange once the prompt cache has gone cold; that flip is wall-clock, so the line is
+   re-rendered on a timer rather than when data arrives. */
+/* Tighter than the list's footer everywhere it can be. That footer has one line of plain
+   text and room to breathe; this one carries the same pills plus the ctx figure, and at
+   375pt the difference between fitting and ellipsizing the resend cost is about ten
+   pixels — which is the padding, the gaps and a pixel off each pill. */
+/* Before the first stats arrive there is nothing to say, and a blank band above the
+   composer reads as a layout bug rather than as a wait. */
+.sfoot.empty{display:none}
+.sfoot{padding-left:6px;padding-right:6px}
+.sfoot .tot{gap:5px}
+.sfoot .fwin{padding-left:5px;padding-right:5px;gap:3px}
+.sfoot .fwin em{font-size:8.5px}
+.sfoot .fsub{color:var(--ink)}
+/* Turns without the word: a bare count next to the money reads as a count, and "turns:"
+   was four characters the line could not spare. Sub-agent turns are the same number in
+   miniature, the way the pills wear their percentages. */
+.sfoot .fturns b{color:var(--ink);font-weight:600}
+.sfoot .fturns em{font-style:normal;font-size:9px;color:var(--ink-soft)}
+
+/* Half a point under the rest of the line. A monospace face reads a size larger than the
+   sans beside it anyway, and this is the field that was still one character too wide at
+   375pt with both windows counting down and the cache gone cold — the worst case the line
+   has, and the one it has to survive. */
+.sfoot .fctx{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  font-family:ui-monospace,Menlo,monospace;font-size:10.5px}
 .sl-cold{color:var(--warn)}
 .transcript{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
   padding:10px 12px 4px;overflow-anchor:none}
@@ -549,6 +584,31 @@ body.comp-max .pbody.cmax .cbox::after{display:none}
   background:var(--surface);color:var(--ink);font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
   display:flex;align-items:center;justify-content:center;padding:0 2px;overflow:hidden}
 .tkey:active,.tkey.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+/* ── the buffer as plain text ──
+   xterm cannot be selected on a phone, and it is not a setting anyone left off: its
+   selection is built on mousedown/mousemove with no touch path at all
+   (xtermjs/xterm.js#1291, open since 2018), and xterm.css switches the browser's own
+   selection off with user-select:none on top of that. A third thing would bite even if
+   both were fixed — a touch on the grid focuses xterm's hidden textarea, which is how
+   typing works, so a long press raises the keyboard instead of a selection callout.
+   So copying needs a surface xterm is not drawing. The ⧉ key hands the whole buffer,
+   scrollback included, to a <pre> where selection is the browser's own job.
+   The grid is hidden rather than covered: xterm measures itself against a real box, and
+   a live one underneath an overlay would keep reflowing to a size nobody can see. It
+   costs a refit on the way back, which is the price of not maintaining two geometries. */
+.tsel{flex:1 1 auto;min-height:0;display:none;flex-direction:column;background:var(--bg)}
+#termwrap.selon{background:var(--bg)}
+#termwrap.selon .tbody{display:none}
+#termwrap.selon .tsel{display:flex}
+.tselnote{flex:0 0 auto;padding:6px 12px;font-size:11.5px;color:var(--ink-faint);
+  background:var(--bg-alt);border-bottom:1px solid var(--line)}
+/* -webkit-user-select is the one that does the work: it is the property xterm.css turns
+   off, and the one WebKit reads. word-break keeps a line too long for the screen on the
+   screen — this pane is for reading and copying, not for reproducing the grid. */
+.tseltext{flex:1 1 auto;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch;
+  margin:0;padding:10px 12px;font-family:ui-monospace,Menlo,monospace;font-size:12px;
+  line-height:1.45;color:var(--ink);white-space:pre-wrap;word-break:break-word;
+  -webkit-user-select:text;user-select:text}
 /* pointer-events:none is not cosmetic: the toast sits over the composer, and a "send
    failed" message that swallowed the next tap on the send button would make the failure
    look permanent. */
@@ -601,17 +661,11 @@ function fmtAge(ms){ var s=Math.round(ms/1000); if(s<60)return s+'s'; var m=Math
   if(m<60)return m+'m'; return Math.round(m/60)+'h'; }
 // ── subscription windows ──
 // A Claude.ai plan runs out of WINDOW, not money. The two rolling limits come from
-// /api/subscription and travel next to the dollars in both panels: "$1.23/5h:22%/w:27%",
-// the shape statusline-instructions.md defines. A window the account doesn't report is
-// dropped rather than drawn as 0%.
+// /api/subscription and travel next to the dollars in both footers, drawn as filled
+// pills — see subFootWin. A window the account doesn't report is dropped rather than
+// drawn as 0%. (statusline-instructions.md writes them "5h:22%/w:27%"; the phone has
+// the room for a bar and no room for parsing.)
 function subPct(w){ return w ? Math.round(w.pct)+'%' : '—'; }
-function subWinStr(win){
-  if (!win) return '';
-  var p = [];
-  if (win.fiveHour) p.push('5h:'+subPct(win.fiveHour));
-  if (win.sevenDay) p.push('w:'+subPct(win.sevenDay));
-  return p.length ? '/'+p.join('/') : '';
-}
 // Time until a window resets. Whole-ish units — the seconds on a four-hour countdown are
 // noise — and unspaced ("4h21m"), so the compound stays one visual token in a foot that
 // is already packed. The desktop keeps its spaced form; it has columns to sit in.
@@ -642,12 +696,6 @@ function rel(iso){
   var d=Math.floor(h/24); if(d<7) return d+'d ago';
   try{ return new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric'}); }catch(e){ return d+'d ago'; }
 }
-function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown';
-  var x=m.replace(/^(us|eu|apac|au|global)\\./,'').replace(/^anthropic\\./,'').replace(/^claude-/,'').replace(/-\\d{6,}$/,'').replace(/[:-]v\\d+(:\\d+)?$/,'');
-  var parts=x.split('-'), name=(parts.shift()||'');
-  name=name.charAt(0).toUpperCase()+name.slice(1);
-  var ver=parts.filter(function(p){ return /^\\d+$/.test(p); }).join('.');
-  return ver?name+' '+ver:name; }
 function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
   m=m.replace(/^(us|eu|apac|au|global)\\./,'').replace(/^(anthropic|bedrock)[./]/,'').replace(/[:-]v\\d+(:\\d+)?$/,'');
   return m; }
@@ -801,18 +849,54 @@ function removePanel(p){
   // Something has to be open, and the list is the only panel that is always there.
   if (!panels.some(function(q){ return q.state !== 'min'; })) setState(panels[0], 'exp');
 }
-function headButtons(specs){
+// menu:true folds the buttons behind a ⋮, as the desktop's session bar does. The buttons
+// are still built and still in the bar — only hidden — so everything that reaches for one
+// by data-k, p.onState included, finds it whether the menu is open or not.
+function headButtons(specs, menu){
   var wrap = el('div','pbtns');
+  var host = wrap;
+  if (menu) { host = el('span','pacts'); wrap.appendChild(host); }
   specs.forEach(function(s){
     var b = el('button','pbtn', s.html);
     b.title = s.title || '';
     b.dataset.k = s.k;
-    wrap.appendChild(b);
+    host.appendChild(b);
   });
+  if (menu) {
+    var d = el('button','pbtn pdots','&#8942;');
+    d.title = 'Actions and details';
+    d.dataset.k = 'menu';
+    wrap.appendChild(d);
+  }
   return wrap;
 }
 var ICON = { refresh:'&#8635;', min:'&#8211;', max:'&#9723;', restore:'&#9724;', term:'&gt;_',
   close:'&#10005;', up:'&#9650;', down:'&#9660;', send:'&#8593;', expand:'&#9633;' };
+
+// An account and its two rolling windows, as the pills both footers are built from —
+// the list's, totalling every server, and a session's, showing the one account paying
+// for it. Module-level because there are two callers now, and because the shape of a
+// plan window is not a property of either screen.
+// compact drops two things the session's footer has no width for. The account name says
+// WHOSE quota this is, which only means something where several accounts are being added
+// up — one session has one account. The reset countdown is the least urgent thing on
+// either line, and it is the 70px that decide whether the ctx figure beside it is whole.
+// The list's footer keeps both: it carries a count and a total and nothing else.
+function subFootHtml(g, compact){
+  var w = g.windows || {};
+  return '<span class="fgrp">'+(compact ? '' : '<span class="fname">'+esc(g.account.name)+'</span>')+
+    subFootWin('5h', w.fiveHour, compact) + subFootWin('7d', w.sevenDay, compact) + '</span>';
+}
+function subFootWin(label, w, compact){
+  if (!w) return '';
+  var pc = Math.max(0, Math.min(100, w.pct));
+  var cls = pc >= 90 ? ' hot' : pc >= 70 ? ' warm' : '';
+  // A few percent of a short pill is a sub-pixel sliver that renders as nothing, which
+  // reads as an untouched window. Any nonzero usage gets at least a visible edge.
+  var fill = 'width:'+pc.toFixed(1)+'%' + (pc > 0 ? ';min-width:3px' : '');
+  return '<span class="fwin'+cls+'"><i style="'+fill+'"></i>'+
+    '<b>'+label+'</b><em>'+subPct(w)+(compact ? '' : ' '+esc(fmtUntil(w.resetsAt)))+'</em></span>';
+}
 
 // ── session list panel ────────────────────────────────────────────────────────
 function createListPanel(){
@@ -925,21 +1009,6 @@ function createListPanel(){
       html += '<span class="fsep">·</span>' + subFootHtml(g);
     });
     totEl.innerHTML = html;
-  }
-  function subFootHtml(g){
-    var w = g.windows || {};
-    return '<span class="fgrp"><span class="fname">'+esc(g.account.name)+'</span>'+
-      subFootWin('5h', w.fiveHour) + subFootWin('7d', w.sevenDay) + '</span>';
-  }
-  function subFootWin(label, w){
-    if (!w) return '';
-    var pc = Math.max(0, Math.min(100, w.pct));
-    var cls = pc >= 90 ? ' hot' : pc >= 70 ? ' warm' : '';
-    // A few percent of a short pill is a sub-pixel sliver that renders as nothing, which
-    // reads as an untouched window. Any nonzero usage gets at least a visible edge.
-    var fill = 'width:'+pc.toFixed(1)+'%' + (pc > 0 ? ';min-width:3px' : '');
-    return '<span class="fwin'+cls+'"><i style="'+fill+'"></i>'+
-      '<b>'+label+'</b><em>'+subPct(w)+' '+esc(fmtUntil(w.resetsAt))+'</em></span>';
   }
   rowsEl.addEventListener('click', function(e){
     var r = e.target.closest('[data-sid]');
@@ -1221,14 +1290,13 @@ function createSessionPanel(sid, server){
     { k:'max', html:ICON.max, title:'Maximize' },
     { k:'term', html:ICON.term, title:'Terminal' },
     { k:'close', html:ICON.close, title:'Close' },
-  ].filter(function(b){ return !(RO && b.k === 'term'); })));
+  ].filter(function(b){ return !(RO && b.k === 'term'); }), true));
   root.appendChild(head);
 
   var body = el('div','pbody',
     '<div class="subhead">'+
       '<div class="sdir" data-r="dir"></div>'+
       '<div class="swhen" data-r="when"></div>'+
-      '<div class="sline" data-r="sline"></div>'+
     '</div>'+
     '<div class="trwrap">'+
       '<div class="transcript" data-r="tr"></div>'+
@@ -1250,7 +1318,8 @@ function createSessionPanel(sid, server){
         '<div class="cbox" data-r="box" data-ph="Message the session…"></div>'+
         '<button class="send" data-c="send" title="Send">'+ICON.send+'</button>'+
       '</div>'+
-    '</div>');
+    '</div>'+
+    '<div class="foot sfoot empty"><span class="tot" data-r="sline"></span></div>');
   root.appendChild(body);
 
   var dotEl = head.querySelector('[data-r="dot"]');
@@ -1303,15 +1372,13 @@ function createSessionPanel(sid, server){
     else if (INFO && INFO.live) bits.push('working');
     whenEl.textContent = bits.join('  ·  ');
   }
-  // This session's server, when it is on a Claude.ai plan. The two rolling windows hang
-  // off the cost as "$1.23/5h:22%/w:27%", exactly as the status line renders them.
+  // This session's server, when it is on a Claude.ai plan.
   var SUB = null;
-  function planWin(){
-    if (!SUB || !SUB.windows || !STATS) return '';
+  function onPlan(){
+    if (!SUB || !SUB.windows || !STATS) return false;
     // A Bedrock or API-key session on a machine that also has a login is not billed to
     // that plan, so the plan's windows say nothing about this session.
-    var onPlan = (STATS.providers||[]).some(function(x){ return x.provider === 'anthropic' && x.cost > 0; });
-    return onPlan ? subWinStr(SUB.windows) : '';
+    return (STATS.providers||[]).some(function(x){ return x.provider === 'anthropic' && x.cost > 0; });
   }
   function loadSub(){
     // No ?cost=1: this panel wants the windows, not a whole-history cost pass.
@@ -1321,10 +1388,17 @@ function createSessionPanel(sid, server){
       renderStatusLine();
     }).catch(function(){});
   }
-  // The status line of statusline-instructions.md, minus the one field ccbb cannot know:
-  // the month-to-date figure. The cost is ccbb's own list-price estimate rather than
-  // Claude Code's reported spend — on a plan the windows beside it are the real limit.
+  // The status line of statusline-instructions.md, less three things. The month-to-date
+  // figure ccbb cannot know. The model and the turn count were dropped on purpose: the
+  // block behind ⋮ names the one and the transcript above is the other, and what is left
+  // is the part nothing else on the screen says — spend, the plan windows it is drawn
+  // from, and the context that prices the next resend. No session status here either;
+  // the dot in the title bar has carried that all along.
+  // The cost is ccbb's own list-price estimate rather than Claude Code's reported spend —
+  // on a plan the windows beside it are the real limit anyway.
   function renderStatusLine(){
+    var foot = slineEl.parentNode;
+    foot.classList.toggle('empty', !STATS);
     if (!STATS) { slineEl.innerHTML = ''; return; }
     var st = STATS;
     var model = (st.context && st.context.model) || (st.models && st.models[0] && st.models[0].model) || '';
@@ -1336,11 +1410,17 @@ function createSessionPanel(sid, server){
     var lastA = st.lastAssistantAt ? Date.parse(st.lastAssistantAt) : NaN;
     var cold = !isNaN(lastA) && (Date.now() - lastA) > ttl * 1000;
     var write = ctx * ((ttl >= 3600 ? pr.cacheWrite1h : pr.cacheWrite5m) || 0) / 1e6;
-    var turns = 'turns:' + (st.turns||0) + ((st.subTurns||0) ? '+' + st.subTurns : '');
-    var ctxs = 'ctx:' + fmtK(ctx) + '/' + fmtK(peak) + '/' + fmtCost(read) +
-      (cold && ctx ? '<span class="sl-cold">-&gt;' + fmtCost(write) + '</span>' : '');
-    slineEl.innerHTML = esc(prettyModel(model)) + '  ' + fmtCost(st.cost) + esc(planWin()) +
-      '  ' + turns + '  ' + ctxs;
+    // No middot separators, unlike the list's footer: a filled pill is already its own
+    // object, and the two dots cost more width than the ctx figure had to spare at 375pt.
+    var turns = st.turns || 0, subTurns = st.subTurns || 0;
+    var html = '<span class="fsub">' + fmtCost(st.cost) + '</span>';
+    if (onPlan()) html += subFootHtml(SUB, true);
+    html += '<span class="fturns"><b>' + turns + '</b>' +
+      (subTurns ? '<em>+' + subTurns + '</em>' : '') + '</span>';
+    html += '<span class="fctx">ctx:' + fmtK(ctx) + '/' + fmtK(peak) +
+      '/' + fmtCost(read) + (cold && ctx ? '<span class="sl-cold">-&gt;' + fmtCost(write) + '</span>' : '') +
+      '</span>';
+    slineEl.innerHTML = html;
   }
   // Wall-clock, not data: the cache goes cold with nothing written anywhere, so nothing
   // but a timer can notice. 10s, the same cadence the status-line spec asks of the shell.
@@ -2049,6 +2129,14 @@ function createSessionPanel(sid, server){
   });
 
   // — header buttons —
+  // Unfolded, the menu listens on the way DOWN through the document, so a tap meant for
+  // something else folds it before that something else acts on the tap. Taps inside the
+  // bar are the exception: the buttons it just revealed are in there.
+  function onOutside(e){ if (!head.contains(e.target)) foldMenu(); }
+  function foldMenu(){
+    root.classList.remove('menu');
+    document.removeEventListener('click', onOutside, true);
+  }
   head.addEventListener('click', function(e){
     var b = e.target.closest('.pbtn');
     if (!b) {
@@ -2057,6 +2145,13 @@ function createSessionPanel(sid, server){
       return;
     }
     var k = b.dataset.k;
+    if (k === 'menu') {
+      if (root.classList.toggle('menu')) document.addEventListener('click', onOutside, true);
+      else document.removeEventListener('click', onOutside, true);
+      return;
+    }
+    // Every other button is the end of the errand the menu was opened for.
+    foldMenu();
     if (k === 'refresh') { loadInfo(); loadSub(); refreshDrivable(); }
     else if (k === 'max') setState(p, p.state === 'max' ? 'exp' : 'max');
     else if (k === 'term') openTerminal(server, sid);
@@ -2101,6 +2196,7 @@ function createSessionPanel(sid, server){
     // leave document.body wearing comp-max or cmd-max with nothing left to fill it.
     if (composerMax) setComposerMax(false);
     if (cmdMax) setCmdMax(false);
+    foldMenu();               // its document listener outlives the panel otherwise
     clearInterval(tick); clearInterval(subTick); clearTimeout(reconnectTimer);
     offWake();
     if (gapObserver) { try { gapObserver.disconnect(); } catch(e){} }
@@ -2187,6 +2283,10 @@ function openTerminal(server, sessionId){
       '<button class="pbtn" data-t="theme" title="Contrast">&#9681;</button>'+
       '<button class="pbtn" data-t="close" title="Close">&#10005;</button></div>'+
     '<div class="tbody"></div>'+
+    '<div class="tsel">'+
+      '<div class="tselnote">Press and hold to select \u2014 the shell keeps running.</div>'+
+      '<pre class="tseltext"></pre>'+
+    '</div>'+
     '<div class="tkeys">'+
       '<button class="tkey" data-k="esc">esc</button>'+
       '<button class="tkey" data-k="tab">tab</button>'+
@@ -2197,13 +2297,14 @@ function openTerminal(server, sessionId){
       '<button class="tkey" data-k="left">&#9664;</button>'+
       '<button class="tkey" data-k="right">&#9654;</button>'+
       '<button class="tkey" data-k="ctrlc">^C</button>'+
-      '<button class="tkey" data-k="kbd">&#9000;</button>'+
+      '<button class="tkey" data-k="sel">&#10697;</button>'+
     '</div>';
   var head = wrap.querySelector('.thead');
   var titleEl = wrap.querySelector('.ttitle');
   var geomEl = wrap.querySelector('.tgeom');
   var bodyEl = wrap.querySelector('.tbody');
   var keysEl = wrap.querySelector('.tkeys');
+  var selTextEl = wrap.querySelector('.tseltext');
   titleEl.textContent = name;
 
   function wsSendJ(o){ if (t.ws && t.ws.readyState === 1) { try { t.ws.send(JSON.stringify(o)); } catch(e){} } }
@@ -2295,22 +2396,64 @@ function openTerminal(server, sessionId){
       if (t.term) t.term.options.theme = TERM_THEMES[t.theme];
     }
   });
-  // No return key: the software keyboard behind the ⌨ key already has one, and it is
-  // the key most likely to be pressed by accident on a bar this narrow. \\x60 is a
-  // backtick, spelled as a code so it cannot close the template literal this file is in.
+  // No return key: touching the grid raises the software keyboard, which has one, and on
+  // a bar this narrow return is the key most likely to be hit by accident. There is no
+  // key for raising that keyboard either — the touch that would reach for it already does
+  // the job. \\x60 is a backtick, spelled as a code so it cannot close the template
+  // literal this file is in.
   var KEYS = { esc:'\\x1b', tab:'\\t', bt:'\\x60', ctrlc:'\\x03',
                up:'\\x1b[A', down:'\\x1b[B', right:'\\x1b[C', left:'\\x1b[D' };
   keysEl.addEventListener('click', function(e){
     var b = e.target.closest('.tkey');
     if (!b || !t.term) return;
     var k = b.dataset.k;
-    if (k === 'kbd') { t.term.focus(); return; }
+    if (k === 'sel') { setSel(!selOn); return; }
+    if (selOn) return;                      // the grid is not on screen to type into
     if (k === 'ctrl') { t.ctrl = !t.ctrl; b.classList.toggle('on', t.ctrl); t.term.focus(); return; }
     var s = KEYS[k];
     if (s) { sendData(s); t.term.focus(); }
   });
   function sendData(d){
     wsSendJ({ type:'in', b: b64FromBytes(new TextEncoder().encode(d)) });
+  }
+
+  // Every line the terminal remembers, with a wrapped line and its continuations rejoined
+  // into the one logical line they were before the grid cut them — a command you copy back
+  // out should be a command, not two halves with a newline through the middle.
+  // translateToString(true) trims the blanks a row carries out to the right margin, but
+  // only on the last row of a wrap: trimming an inner one would eat the space between two
+  // words the wrap happened to split.
+  function bufferText(){
+    if (!t.term) return '';
+    var buf = t.term.buffer.active, out = [], cur = '';
+    for (var i = 0; i < buf.length; i++) {
+      var line = buf.getLine(i);
+      if (!line) continue;
+      var next = buf.getLine(i + 1);
+      var wraps = !!(next && next.isWrapped);
+      cur += line.translateToString(!wraps);
+      if (!wraps) { out.push(cur); cur = ''; }
+    }
+    // A terminal's buffer is padded out to the bottom of the grid; those rows are not
+    // output and a selection that starts by dragging through them is a nuisance.
+    while (out.length && !out[out.length - 1]) out.pop();
+    return out.join('\\n');
+  }
+  var selOn = false;
+  function setSel(on){
+    selOn = !!on;
+    wrap.classList.toggle('selon', selOn);
+    var b = keysEl.querySelector('[data-k="sel"]');
+    if (b) b.classList.toggle('on', selOn);
+    if (selOn) {
+      selTextEl.textContent = bufferText();
+      selTextEl.scrollTop = selTextEl.scrollHeight;   // the end is what you just watched
+    } else {
+      selTextEl.textContent = '';
+      // The grid measured zero the whole time it was display:none, so the font size it
+      // settled on is meaningless now and has to be searched for again.
+      fitTermGrid(0);
+    }
   }
 
   note('Starting a shell on <code>'+esc(name)+'</code>…');
