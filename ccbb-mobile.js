@@ -152,7 +152,16 @@ const MOBILE_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<!-- black-translucent is the whole of the "use the full screen" story: with default or
+     black, iOS reserves the status bar, the page starts below it, and safe-area-inset-top
+     is 0 even in standalone — which is why the --safe-t padding below did nothing. Only
+     this value puts the page under the clock and makes that inset real. Apple has it
+     marked deprecated with nothing to replace it (display:fullscreen and theme_color in
+     the manifest are both ignored on iOS), so it stays until it stops working. Note the
+     value is read when the icon is added: changing it needs the Home Screen app deleted
+     and re-added, not just a reload. Known cost: the clock and battery are drawn white
+     regardless of theme, so in light mode they sit on the cream header. -->
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#f0eee6" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1c1b19" media="(prefers-color-scheme: dark)">
 <title>ccbb</title>
@@ -397,11 +406,14 @@ body.has-max .panel:not(.max){display:none}
   font-size:14px;font-weight:600;font-family:inherit;width:100%;min-height:44px}
 .ask-submit:disabled{opacity:.45}
 /* ── command output ── */
-/* An explicit share, not flex:0 1 auto: sized by content it collapses to its own title
-   bar, because the transcript above it takes every free pixel first. */
+/* Output takes the whole body, not a share of it: a phone has no room for two scrollers,
+   and the answer to a // command is the thing you just asked for. The transcript is not
+   resized to nothing but hidden outright — a 0px flex child still renders its jump
+   button, and .transcript would keep a scroll position measured against no height. */
 .cmd-box{display:none;min-height:0;flex-direction:column;
   border-top:1px solid var(--line);background:var(--bg)}
-.cmd-box.show{display:flex;flex:1 1 45%;max-height:55%;min-height:140px}
+.cmd-box.show{display:flex;flex:1 1 auto;min-height:0}
+.pbody.cmdon .trwrap{display:none}
 .cmd-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;min-height:40px;
   background:var(--bg-alt);border-bottom:1px solid var(--line);font-size:12px}
 .cmd-title{flex:1;font-family:ui-monospace,Menlo,monospace;font-weight:600;overflow:hidden;
@@ -410,6 +422,15 @@ body.has-max .panel:not(.max){display:none}
 .cmd-content pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:9px 10px;
   font-size:11.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word;overflow:auto}
 .cmd-content.code pre{white-space:pre;word-break:normal}
+/* Maximized: out over the panel header and the composer both, on the same --app-h and
+   the same z-index as the full-screen editor. Only one of the two may be open at a time
+   — see compMaxOwner — so they never stack. The safe-area padding goes on .cmd-head
+   rather than on the fixed box, so the strip behind the status bar is the header's
+   colour instead of the content's white. */
+body.cmd-max .pbody.cmdmax .cmd-box{position:fixed;top:0;left:0;right:0;height:var(--app-h,100dvh);
+  z-index:150;border-top:none}
+body.cmd-max .pbody.cmdmax .cmd-head{padding-top:var(--safe-t);min-height:calc(40px + var(--safe-t))}
+body.cmd-max .pbody.cmdmax .cmd-content{padding-bottom:calc(10px + var(--safe-b))}
 /* ── composer ── */
 /* --bg-alt, the header colour, not --bg: this is the bottom edge of the app, and Safari
    tints the strip under it with the page's canvas colour (see body). Matching the two
@@ -514,13 +535,19 @@ body.comp-max .pbody.cmax .cbox::after{display:none}
 .tbody .xterm{padding:2px 0 2px 4px}
 .tnote{padding:16px;font-size:13px;color:var(--ink-soft);line-height:1.6}
 .tnote code{font-family:ui-monospace,Menlo,monospace;background:var(--code-bg);border-radius:4px;padding:0 4px}
-/* The key bar exists because an iOS keyboard has no Esc, Tab, Ctrl or arrows, and Claude
-   Code needs all four. Ctrl is a sticky modifier: tap it, then a letter. */
-.tkeys{flex:0 0 auto;display:flex;gap:4px;padding:5px 6px;background:var(--bg-alt);
-  border-top:1px solid var(--line);overflow-x:auto}
-.tkey{flex:0 0 auto;min-width:42px;height:38px;border:1px solid var(--line);border-radius:8px;
-  background:var(--surface);color:var(--ink);font-family:ui-monospace,Menlo,monospace;font-size:12px;
-  display:flex;align-items:center;justify-content:center;padding:0 8px}
+/* The key bar exists because an iOS keyboard has no Esc, Tab, Ctrl or arrows, and buries
+   the backtick two layers deep — Claude Code needs all of them. Ctrl is a sticky
+   modifier: tap it, then a letter. ^C is its own key because interrupting is the one
+   thing you never want to need two taps for. */
+/* Ten keys share one row rather than scrolling: a bar you have to swipe hides exactly the
+   key you were reaching for. flex:1 with min-width:0 divides whatever the phone is wide —
+   about 33px each at 375pt, the narrowest screen worth fitting — and "ctrl", the widest
+   label, is what the font size has to stay inside. */
+.tkeys{flex:0 0 auto;display:flex;gap:3px;padding:5px 6px;background:var(--bg-alt);
+  border-top:1px solid var(--line)}
+.tkey{flex:1 1 0;min-width:0;height:38px;border:1px solid var(--line);border-radius:8px;
+  background:var(--surface);color:var(--ink);font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
+  display:flex;align-items:center;justify-content:center;padding:0 2px;overflow:hidden}
 .tkey:active,.tkey.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
 /* pointer-events:none is not cosmetic: the toast sits over the composer, and a "send
    failed" message that swallowed the next tap on the send button would make the failure
@@ -696,6 +723,23 @@ function asTextarea(el){
   return el;
 }
 
+// ── waking up ─────────────────────────────────────────────────────────────────
+// iOS suspends a backgrounded page: timers stop and sockets are closed under it. A retry
+// scheduled on the way out may therefore not run until long after the app is back — or
+// never, if the page returned from the bfcache rather than being resumed. Anything that
+// heals itself on a timer needs a nudge on the way in too. pageshow covers the bfcache
+// restore, visibilitychange the ordinary app switch; both are cheap and either may be
+// the only one that fires.
+function onForeground(fn){
+  function hit(){ if (!document.hidden) fn(); }
+  document.addEventListener('visibilitychange', hit);
+  window.addEventListener('pageshow', hit);
+  return function(){
+    document.removeEventListener('visibilitychange', hit);
+    window.removeEventListener('pageshow', hit);
+  };
+}
+
 // ── viewport ──────────────────────────────────────────────────────────────────
 // iOS reports a 100dvh that includes the space the keyboard is covering, so the stack is
 // sized from visualViewport instead. The scrollTo(0,0) undoes Safari's habit of scrolling
@@ -718,14 +762,16 @@ syncViewport();
 // ── panel stack ───────────────────────────────────────────────────────────────
 var stackEl = document.getElementById('stack');
 var panels = [];
-// The maximized composer covers the whole screen, so at most one may be open; this is the
-// setter of whichever session owns it, or null. See setComposerMax.
+// A maximized composer — or a maximized // output — covers the whole screen, so at most
+// one of them may be open across the whole stack; this is the setter of whichever one
+// owns it, or null. Every setter takes (on) and folds the incumbent before claiming it.
+// See setComposerMax and setCmdMax.
 var compMaxOwner = null;
 // Accordion: expanding one panel minimizes the rest. 'max' additionally hides every
 // other panel's header, so a maximized session is the whole screen.
 function setState(p, st){
-  // A full-screen composer is fixed inside its panel's body, so it vanishes the moment
-  // that panel is minimized or hidden behind another's maximize. Fold it first.
+  // A full-screen overlay is position:fixed inside its panel's body, so it vanishes the
+  // moment that panel is minimized or hidden behind another's maximize. Fold it first.
   if (compMaxOwner) compMaxOwner(false);
   if (st !== 'min') {
     panels.forEach(function(q){ if (q !== p) { q.state='min'; applyState(q); } });
@@ -1190,7 +1236,8 @@ function createSessionPanel(sid, server){
     '</div>'+
     '<div class="cmd-box" data-r="cmd">'+
       '<div class="cmd-head"><span class="cmd-title" data-r="cmdtitle"></span>'+
-        '<button class="pbtn" data-c="close">&#10005;</button></div>'+
+        '<button class="pbtn" data-c="cmdmax" title="Maximize output">'+ICON.max+'</button>'+
+        '<button class="pbtn" data-c="close">'+ICON.close+'</button></div>'+
       '<div class="cmd-content" data-r="cmdbody"></div>'+
     '</div>'+
     '<div class="composer">'+
@@ -1779,10 +1826,16 @@ function createSessionPanel(sid, server){
     var first = !connected;
     try { ws = new WebSocket(proto+'//'+location.host+API+'/ws/'+sid); }
     catch(e) { reconnectTimer = setTimeout(connect, 3000); return; }
+    // Everything below belongs to THIS socket. connect() can run again before a socket
+    // the phone left behind has finished dying — waking to the foreground is exactly
+    // that race — and a close event arriving late must not be read as the live socket
+    // dropping, or it schedules a reconnect on top of a healthy one.
+    var mine = ws;
     // The tail starts at end-of-file, so entries written while we were
     // disconnected are gone from this view unless we go back for them.
-    ws.onopen = function(){ connected = true; if (!first) loadHistory(true); };
+    ws.onopen = function(){ if (ws !== mine) return; connected = true; if (!first) loadHistory(true); };
     ws.onmessage = function(e){
+      if (ws !== mine) return;
       var m; try { m = JSON.parse(e.data); } catch(err) { return; }
       if (m.type === 'transcript') {
         histCount++;   // keep the resume cursor in step with the file being tailed
@@ -1802,8 +1855,13 @@ function createSessionPanel(sid, server){
         else renderAsk(m.block);
       }
     };
-    ws.onclose = function(){ if (!destroyed) reconnectTimer = setTimeout(connect, 2000); };
+    ws.onclose = function(){ if (ws !== mine || destroyed) return; reconnectTimer = setTimeout(connect, 2000); };
   }
+  var offWake = onForeground(function(){
+    if (destroyed) return;
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+    connect();
+  });
 
   // — composer —
   function setDrivable(ok){
@@ -1861,10 +1919,34 @@ function createSessionPanel(sid, server){
       .then(showCmd)
       .catch(function(e){ showCmd({ error:String(e) }); });
   }
+  // Full screen, sharing compMaxOwner with the maximized editor: whichever is opened
+  // second folds the first, so document.body never wears two overlays at once.
+  var cmdMax = false;
+  function setCmdMax(on){
+    on = !!on;
+    if (on && compMaxOwner && compMaxOwner !== setCmdMax) compMaxOwner(false);
+    cmdMax = on;
+    compMaxOwner = on ? setCmdMax : (compMaxOwner === setCmdMax ? null : compMaxOwner);
+    body.classList.toggle('cmdmax', on);
+    document.body.classList.toggle('cmd-max', on);
+    var b = cmdBox.querySelector('[data-c="cmdmax"]');
+    b.innerHTML = on ? ICON.restore : ICON.max;
+    b.title = on ? 'Restore output' : 'Maximize output';
+    b.classList.toggle('on', on);
+  }
+  function hideCmd(){
+    setCmdMax(false);
+    cmdBox.classList.remove('show');
+    body.classList.remove('cmdon');
+    // The transcript comes back from display:none with its old scrollTop, which is the
+    // wrong place if turns landed while it was away.
+    if (following) transcript.scrollTop = transcript.scrollHeight;
+  }
   function showCmd(d){
     if (d && d.cwd) cmdCwd = d.cwd;
-    if (d && d.kind === 'clear') { cmdBox.classList.remove('show'); return; }
+    if (d && d.kind === 'clear') { hideCmd(); return; }
     cmdBox.classList.add('show');
+    body.classList.add('cmdon');
     if (d && d.error) {
       cmdTitle.textContent = 'error';
       cmdBody.className = 'cmd-content';
@@ -1881,7 +1963,8 @@ function createSessionPanel(sid, server){
     }
   }
   cmdBox.addEventListener('click', function(e){
-    if (e.target.closest('[data-c="close"]')) cmdBox.classList.remove('show');
+    if (e.target.closest('[data-c="close"]')) hideCmd();
+    else if (e.target.closest('[data-c="cmdmax"]')) setCmdMax(!cmdMax);
   });
 
   // — prompt history —
@@ -2014,10 +2097,12 @@ function createSessionPanel(sid, server){
 
   p.destroy = function(){
     destroyed = true;
-    // Before anything else: a closing panel that still owns the full-screen composer
-    // would leave document.body wearing comp-max with nothing left to fill it.
+    // Before anything else: a closing panel that still owns a full-screen overlay would
+    // leave document.body wearing comp-max or cmd-max with nothing left to fill it.
     if (composerMax) setComposerMax(false);
+    if (cmdMax) setCmdMax(false);
     clearInterval(tick); clearInterval(subTick); clearTimeout(reconnectTimer);
+    offWake();
     if (gapObserver) { try { gapObserver.disconnect(); } catch(e){} }
     try { mo.disconnect(); } catch(e){}
     if (ws) { try { ws.close(); } catch(e){} }
@@ -2106,11 +2191,12 @@ function openTerminal(server, sessionId){
       '<button class="tkey" data-k="esc">esc</button>'+
       '<button class="tkey" data-k="tab">tab</button>'+
       '<button class="tkey" data-k="ctrl">ctrl</button>'+
+      '<button class="tkey" data-k="bt">&#96;</button>'+
       '<button class="tkey" data-k="up">&#9650;</button>'+
       '<button class="tkey" data-k="down">&#9660;</button>'+
       '<button class="tkey" data-k="left">&#9664;</button>'+
       '<button class="tkey" data-k="right">&#9654;</button>'+
-      '<button class="tkey" data-k="enter">&#9166;</button>'+
+      '<button class="tkey" data-k="ctrlc">^C</button>'+
       '<button class="tkey" data-k="kbd">&#9000;</button>'+
     '</div>';
   var head = wrap.querySelector('.thead');
@@ -2209,7 +2295,11 @@ function openTerminal(server, sessionId){
       if (t.term) t.term.options.theme = TERM_THEMES[t.theme];
     }
   });
-  var KEYS = { esc:'\\x1b', tab:'\\t', up:'\\x1b[A', down:'\\x1b[B', right:'\\x1b[C', left:'\\x1b[D', enter:'\\r' };
+  // No return key: the software keyboard behind the ⌨ key already has one, and it is
+  // the key most likely to be pressed by accident on a bar this narrow. \\x60 is a
+  // backtick, spelled as a code so it cannot close the template literal this file is in.
+  var KEYS = { esc:'\\x1b', tab:'\\t', bt:'\\x60', ctrlc:'\\x03',
+               up:'\\x1b[A', down:'\\x1b[B', right:'\\x1b[C', left:'\\x1b[D' };
   keysEl.addEventListener('click', function(e){
     var b = e.target.closest('.tkey');
     if (!b || !t.term) return;
@@ -2292,8 +2382,13 @@ function openTerminal(server, sessionId){
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto+'//'+location.host+API+'/ws-term/'+t.id+(t.lastSeq!=null?'?from='+t.lastSeq:''));
     t.ws = ws;
-    ws.onopen = function(){ if (!t.pinned) wsSendJ({ type:'size', cols:t.cols, rows:t.rows }); };
+    // t.ws !== ws means this socket has been superseded — the usual way being a wake
+    // from the background beating the close event of the socket the phone froze. Frames
+    // from the loser would be replayed out of sequence and its close would schedule a
+    // reconnect the live socket does not need.
+    ws.onopen = function(){ if (t.ws !== ws) return; if (!t.pinned) wsSendJ({ type:'size', cols:t.cols, rows:t.rows }); };
     ws.onmessage = function(ev){
+      if (t.ws !== ws) return;
       var f; try { f = JSON.parse(ev.data); } catch(e){ return; }
       if (f.type === 'o') {
         if (t.lastSeq != null && f.seq !== t.lastSeq + 1) { t.lastSeq = null; try { ws.close(); } catch(e){} return; }
@@ -2308,15 +2403,24 @@ function openTerminal(server, sessionId){
       }
     };
     ws.onclose = function(){
-      if (t.destroyed || t.dead) return;
+      if (t.ws !== ws || t.destroyed || t.dead) return;
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(connect, 1000);
     };
   }
+  // The shell outlives the socket for TERM_GRACE_MS, so coming back inside that window
+  // has to actually reconnect — not sit on a retry the phone froze on the way out.
+  var offWake = onForeground(function(){
+    if (t.destroyed || t.dead || !t.id) return;
+    if (t.ws && (t.ws.readyState === 0 || t.ws.readyState === 1)) return;
+    clearTimeout(reconnectTimer);
+    connect();
+  });
 
   t.destroy = function(){
     t.destroyed = true;
     clearTimeout(reconnectTimer); clearTimeout(fitTimer);
+    offWake();
     window.removeEventListener('resize', refit);
     if (window.visualViewport) window.visualViewport.removeEventListener('resize', refit);
     if (t.id && !t.dead) {

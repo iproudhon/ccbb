@@ -3956,7 +3956,7 @@ function answerAsk(sessionId, answers) {
 // THERE is what makes the kernel raise SIGWINCH, so resize still reaches full-screen
 // programs.
 const TERM_BACKLOG_BYTES = 256 * 1024;   // replayed after a dropped socket
-const TERM_GRACE_MS = 60 * 1000;         // reconnect window after the last socket goes
+const TERM_GRACE_MS = 5 * 60 * 1000;     // reconnect window after the last socket goes
 const terms = new Map();                 // id → terminal
 let termIds = 0;
 function clampInt(v, lo, hi, dflt) {
@@ -4435,8 +4435,10 @@ function attachTerm(t, ws, from) {
     t.subs.delete(ws);
     t.idleSince = Date.now();
     if (t.subs.size || !t.alive || t.graceTimer) return;
-    // The window owns the shell. The grace period is only wide enough for a reconnect
-    // (a reload, a blipped tunnel) — not for walking away and coming back.
+    // The window owns the shell. The grace period covers a reconnect — a reload, a
+    // blipped tunnel — and, the case that sets its length, a phone whose browser was
+    // backgrounded: iOS closes the socket on the way out, so answering a message used
+    // to cost you the shell. Not wide enough for walking away and coming back.
     t.graceTimer = setTimeout(() => { t.graceTimer = null; if (!t.subs.size) closeTerm(t); }, TERM_GRACE_MS);
     if (t.graceTimer.unref) t.graceTimer.unref();
   };
