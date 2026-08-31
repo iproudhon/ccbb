@@ -699,15 +699,26 @@ function rel(iso){
 function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
   m=m.replace(/^(us|eu|apac|au|global)\\./,'').replace(/^(anthropic|bedrock)[./]/,'').replace(/[:-]v\\d+(:\\d+)?$/,'');
   return m; }
-function priceFor(model){
+// provider 'bedrock' adds the regional-inference premium (a uniform per-model multiplier
+// over list price); anything else is first-party. Mirrors priceForModelIn() in ccbb-common.js.
+function priceFor(model, provider){
   var t=PRICE_TABLE||{}, byId=t.byId||{}, tiers=t.tiers||{}, id=normId(model);
-  if(byId[id])return byId[id];
-  var trimmed=id.replace(/-\\d{6,}$/,''); if(trimmed!==id&&byId[trimmed])return byId[trimmed];
-  if(id.indexOf('opus')!==-1)return tiers.opus;
-  if(id.indexOf('haiku')!==-1)return tiers.haiku;
-  if(id.indexOf('sonnet')!==-1)return tiers.sonnet;
-  return t.default||tiers.sonnet;
+  var trimmed=id.replace(/-\\d{6,}$/,''), base;
+  if(byId[id])base=byId[id];
+  else if(trimmed!==id&&byId[trimmed])base=byId[trimmed];
+  else if(id.indexOf('opus')!==-1)base=tiers.opus;
+  else if(id.indexOf('haiku')!==-1)base=tiers.haiku;
+  else if(id.indexOf('sonnet')!==-1)base=tiers.sonnet;
+  else base=t.default||tiers.sonnet;
+  if(provider!=='bedrock'||!base)return base;
+  var mm=t.bedrockMult||{};
+  var k=mm[id]!=null?mm[id]:(mm[trimmed]!=null?mm[trimmed]:(t.bedrockPremium||1));
+  if(!(k>0)||k===1)return base;
+  return { input:base.input*k, output:base.output*k, cacheRead:base.cacheRead*k,
+    cacheWrite:base.cacheWrite*k, cacheWrite5m:base.cacheWrite5m*k, cacheWrite1h:base.cacheWrite1h*k };
 }
+// The only provider signal a message carries: Bedrock stamps ids with a msg_bdrk_ prefix.
+function provOf(id){ return String(id||'').indexOf('msg_bdrk_')===0?'bedrock':'anthropic'; }
 var toastTimer;
 function toast(msg){
   var t=document.getElementById('toast');
@@ -1402,7 +1413,10 @@ function createSessionPanel(sid, server){
     if (!STATS) { slineEl.innerHTML = ''; return; }
     var st = STATS;
     var model = (st.context && st.context.model) || (st.models && st.models[0] && st.models[0].model) || '';
-    var pr = priceFor(model) || { cacheRead:0, cacheWrite5m:0, cacheWrite1h:0 };
+    // The context carries the provider of the turn that set it; before any turn is seen, fall
+    // back to the session's dominant provider so a Bedrock session isn't priced as first-party.
+    var prov = (st.context && st.context.provider) || (st.providers && st.providers[0] && st.providers[0].provider) || '';
+    var pr = priceFor(model, prov) || { cacheRead:0, cacheWrite5m:0, cacheWrite1h:0 };
     var ctx = st.context ? (st.context.tokens||0) : 0;
     var peak = Math.max(ctx, st.contextMax ? (st.contextMax.tokens||0) : 0);
     var read = ctx * (pr.cacheRead||0) / 1e6;
@@ -1453,13 +1467,13 @@ function createSessionPanel(sid, server){
     var cc = u.cache_creation || null;
     var cw5 = cc ? (cc.ephemeral_5m_input_tokens||0) : cw;
     var cw1 = cc ? (cc.ephemeral_1h_input_tokens||0) : 0;
-    var pr = priceFor(msg.model) || {};
+    var pr = priceFor(msg.model, provOf(msg.id)) || {};
     STATS.cost = (STATS.cost||0) + (inp*(pr.input||0) + out*(pr.output||0) + cr*(pr.cacheRead||0) +
       cw5*(pr.cacheWrite5m||0) + cw1*(pr.cacheWrite1h||0)) / 1e6;
     STATS.totalTokens = (STATS.totalTokens||0) + inp+out+cr+cw;
     if (msg.id && !seenTurnIds[msg.id]) { seenTurnIds[msg.id] = 1; STATS.turns = (STATS.turns||0) + 1; }
     var ctxTok = inp+cr+cw+out;
-    STATS.context = { tokens: ctxTok, cost: ctxTok*(pr.cacheRead||0)/1e6, model: msg.model||null };
+    STATS.context = { tokens: ctxTok, cost: ctxTok*(pr.cacheRead||0)/1e6, model: msg.model||null, provider: provOf(msg.id) };
     if (!STATS.contextMax || ctxTok > (STATS.contextMax.tokens||0)) STATS.contextMax = { tokens: ctxTok };
     if (cw1 > 0) STATS.cacheTtl = 3600; else if (cw5 > 0) STATS.cacheTtl = 300;
     STATS.lastAssistantAt = ts || new Date().toISOString();

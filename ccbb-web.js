@@ -891,15 +891,26 @@ function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown';
 function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
   m=m.replace(/^(us|eu|apac|au|global)\\./,'').replace(/^(anthropic|bedrock)[./]/,'').replace(/[:-]v\\d+(:\\d+)?$/,'');
   return m; }
-function priceFor(model){
+// provider 'bedrock' adds the regional-inference premium (a uniform per-model multiplier
+// over list price); anything else is first-party. Mirrors priceForModelIn() in ccbb-common.js.
+function priceFor(model, provider){
   var t=PRICE_TABLE||{}, byId=t.byId||{}, tiers=t.tiers||{}, id=normId(model);
-  if(byId[id])return byId[id];
-  var trimmed=id.replace(/-\\d{6,}$/,''); if(trimmed!==id&&byId[trimmed])return byId[trimmed];
-  if(id.indexOf('opus')!==-1)return tiers.opus;
-  if(id.indexOf('haiku')!==-1)return tiers.haiku;
-  if(id.indexOf('sonnet')!==-1)return tiers.sonnet;
-  return t.default||tiers.sonnet;
+  var trimmed=id.replace(/-\\d{6,}$/,''), base;
+  if(byId[id])base=byId[id];
+  else if(trimmed!==id&&byId[trimmed])base=byId[trimmed];
+  else if(id.indexOf('opus')!==-1)base=tiers.opus;
+  else if(id.indexOf('haiku')!==-1)base=tiers.haiku;
+  else if(id.indexOf('sonnet')!==-1)base=tiers.sonnet;
+  else base=t.default||tiers.sonnet;
+  if(provider!=='bedrock'||!base)return base;
+  var mm=t.bedrockMult||{};
+  var k=mm[id]!=null?mm[id]:(mm[trimmed]!=null?mm[trimmed]:(t.bedrockPremium||1));
+  if(!(k>0)||k===1)return base;
+  return { input:base.input*k, output:base.output*k, cacheRead:base.cacheRead*k,
+    cacheWrite:base.cacheWrite*k, cacheWrite5m:base.cacheWrite5m*k, cacheWrite1h:base.cacheWrite1h*k };
 }
+// The only provider signal a message carries: Bedrock stamps ids with a msg_bdrk_ prefix.
+function provOf(id){ return String(id||'').indexOf('msg_bdrk_')===0?'bedrock':'anthropic'; }
 var toastTimer;
 function toast(msg){
   var t = document.getElementById('toast');
@@ -2264,7 +2275,7 @@ function createSessionView(INFO){
     var cacheRead=u.cache_read_input_tokens||0, cacheWrite=u.cache_creation_input_tokens||0;
     var totalTok = input+output+cacheRead+cacheWrite;
     if (!totalTok) return;
-    var p = priceFor(msg.model);
+    var p = priceFor(msg.model, provOf(msg.id));
     var cIn=input*p.input/1e6, cOut=output*p.output/1e6;
     var cCr=cacheRead*p.cacheRead/1e6, cCw=cacheWrite*p.cacheWrite/1e6;
     var cost = cIn+cOut+cCr+cCw;

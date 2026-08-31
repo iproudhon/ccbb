@@ -29,12 +29,34 @@ const c = COLOR ? {
   bold: s => '\x1b[1m' + s + '\x1b[0m',
   cyan: s => '\x1b[36m' + s + '\x1b[0m',
   green: s => '\x1b[32m' + s + '\x1b[0m',
+  red: s => '\x1b[31m' + s + '\x1b[0m',
   yellow: s => '\x1b[33m' + s + '\x1b[0m',
   magenta: s => '\x1b[35m' + s + '\x1b[0m',
   gray: s => '\x1b[90m' + s + '\x1b[0m',
 } : new Proxy({}, { get: () => (s => String(s)) });
 
 function fmtCost(v) { return v != null ? '$' + Number(v).toFixed(2) : '—'; }
+
+// Resending the context costs cache-read price while the prompt cache is still warm, and
+// cache-write price once it has expired — a wall-clock question, so it is answered here at
+// render time rather than baked into the cached stats.
+function cacheCold(s) {
+  const t = s.lastAssistantAt ? Date.parse(s.lastAssistantAt) : NaN;
+  return isNaN(t) || (Date.now() - t) > (s.cacheTtl || 300) * 1000;
+}
+function ctxResendCost(s) {
+  const ctx = s.context;
+  if (!ctx) return null;
+  return cacheCold(s) && ctx.costWrite != null ? ctx.costWrite : ctx.cost;
+}
+// Green cost = a cheap cache read; red = the cache went cold and the whole context is rebilled
+// at write price. The token count stays yellow either way.
+function ctxColor(v, s) {
+  const i = v.lastIndexOf('$');
+  if (i <= 0) return c.yellow(v);
+  return c.yellow(v.slice(0, i)) + (cacheCold(s) ? c.red : c.green)(v.slice(i));
+}
+
 function fmtTokK(t) {
   t = t || 0;
   if (t >= 1e9) return (t / 1e9).toFixed(1) + 'B';
@@ -317,15 +339,21 @@ function runLs(args) {
     // current [/ largest] / would-be cost. Largest is shown only when it differs from
     // current (after a /compact, or when the last turn was smaller than an earlier peak).
     // Context is an all-time property of the session, so it shows even in period-scoped views.
-    cols.push({ head: 'CONTEXT', align: 'r', w: 20, color: c.yellow,
+    cols.push({ head: 'CONTEXT', align: 'r', w: 20, color: ctxColor,
       get: s => {
         const ctx = s.context;
         if (!ctx) return '—';
         const cur = (ctx.postCompact ? '~' : '') + fmtTokK(ctx.tokens);
         const mx = s.contextMax;
         const showMax = mx && fmtTokK(mx.tokens) !== fmtTokK(ctx.tokens);
-        return cur + (showMax ? '/' + fmtTokK(mx.tokens) : '') + '/' + fmtCost(ctx.cost);
+        return cur + (showMax ? '/' + fmtTokK(mx.tokens) : '') + '/' + fmtCost(ctxResendCost(s));
       } });
+  } else {
+    // Narrow view: current context size and what the next turn pays to resend it.
+    cols.push({ head: 'CTX', align: 'r', w: 14, color: ctxColor,
+      get: s => s.context
+        ? (s.context.postCompact ? '~' : '') + fmtTokK(s.context.tokens) + '/' + fmtCost(ctxResendCost(s))
+        : '—' });
   }
   cols.push({ head: 'ACTIVITY', align: 'l', w: 12,
     get: s => fmtDate(s.lastActivity), color: c.cyan });

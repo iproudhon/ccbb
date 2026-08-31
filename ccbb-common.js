@@ -142,6 +142,30 @@ const SNAPSHOT_BY_ID = {
   'claude-sonnet-5':            SNAP(2, 10, 0.2, 2.5, 4),
 };
 
+// AWS Bedrock charges a premium over list price for the regional inference profiles Claude
+// Code uses there ("geo and in-region cross-region inference"): +10% on every price
+// component for Sonnet 4.5 / Haiku 4.5 / Opus 4.5 and newer, nothing on the older models.
+// Transcripts record only the bare model id, never the us./eu./apac. profile it was invoked
+// through, so the premium is keyed off the provider instead: a message id starting with
+// `msg_bdrk_` is Bedrock. The premium is a uniform scalar per model (verified against the
+// us.anthropic.* entries in LiteLLM and AWS's own price list), so it's held as a multiplier
+// over the first-party price rather than a second price table. Ids not listed here — i.e.
+// any new model — get BEDROCK_PREMIUM, which is the right guess for anything recent.
+const BEDROCK_PREMIUM = 1.1;
+const SNAPSHOT_BEDROCK_MULT = {
+  'claude-3-5-haiku': 1,
+  'claude-3-5-sonnet': 1,
+  'claude-3-7-sonnet': 1,
+  'claude-3-haiku': 1,
+  'claude-3-opus': 1,
+  'claude-3-sonnet': 1,
+  'claude-4-opus': 1,
+  'claude-4-sonnet': 1,
+  'claude-opus-4': 1,
+  'claude-opus-4-1': 1,
+  'claude-sonnet-4': 1,
+};
+
 function pnum(v, d) { return typeof v === 'number' && isFinite(v) ? v : d; }
 function round6(x) { return Math.round(x * 1e6) / 1e6; }
 
@@ -171,28 +195,42 @@ function tiersFrom(src) {
   return t;
 }
 
+// Returns { byId, bedrockMult }. byId holds the first-party prices (LiteLLM's bare `claude-*`
+// keys); bedrockMult is derived by dividing each `us.anthropic.*` regional profile price by
+// the matching first-party one — see BEDROCK_PREMIUM above.
 function convertLiteLLM(j) {
-  const byId = {};
+  const byId = {}, regional = {};
   for (const key of Object.keys(j).sort()) {
-    if (!/^claude/i.test(key)) continue;
+    const isRegional = /^us\.anthropic\./i.test(key);
+    if (!isRegional && !/^claude/i.test(key)) continue;
     const e = j[key];
     if (!e || typeof e !== 'object') continue;
     if (e.input_cost_per_token == null || e.output_cost_per_token == null) continue;
-    byId[normalizeId(key)] = priceObj(
+    const p = priceObj(
       e.input_cost_per_token * 1e6,
       e.output_cost_per_token * 1e6,
       (e.cache_read_input_token_cost || 0) * 1e6,
       (e.cache_creation_input_token_cost || 0) * 1e6,
       e.cache_creation_input_token_cost_above_1hr != null ? e.cache_creation_input_token_cost_above_1hr * 1e6 : null,
     );
+    (isRegional ? regional : byId)[normalizeId(key)] = p;
   }
-  return byId;
+  const bedrockMult = {};
+  for (const id of Object.keys(regional)) {
+    const trimmed = id.replace(/-\d{6,}$/, '');
+    const base = byId[id] || byId[trimmed];
+    if (!base || !base.input) continue;
+    const k = round6(regional[id].input / base.input);
+    if (k > 0) bedrockMult[trimmed] = bedrockMult[id] = k;
+  }
+  return { byId, bedrockMult };
 }
 
 function readJson(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
 
 function loadTable() {
-  const table = { byId: {}, tiers: tiersFrom(FALLBACK_TIERS), default: null };
+  const table = { byId: {}, tiers: tiersFrom(FALLBACK_TIERS), default: null,
+                  bedrockMult: { ...SNAPSHOT_BEDROCK_MULT }, bedrockPremium: BEDROCK_PREMIUM };
   table.default = table.tiers.sonnet;
   for (const k of Object.keys(SNAPSHOT_BY_ID)) table.byId[k] = normalizePrice(SNAPSHOT_BY_ID[k]);
   const j = readJson(LIVE_FILE);
@@ -200,11 +238,15 @@ function loadTable() {
     if (j.byId) for (const k of Object.keys(j.byId)) table.byId[k] = normalizePrice(j.byId[k]);
     if (j.tiers) for (const k of Object.keys(j.tiers)) table.tiers[k] = normalizePrice(j.tiers[k]);
     if (j.default) table.default = normalizePrice(j.default);
+    if (j.bedrockMult) for (const k of Object.keys(j.bedrockMult)) table.bedrockMult[k] = pnum(j.bedrockMult[k], 1);
+    // A live cache written before the Bedrock premium existed is missing bedrockMult;
+    // treat it as stale so maybeRefreshPricing() rebuilds it regardless of its age.
+    else table.needsRefresh = true;
   }
   return table;
 }
 
-function priceForModelIn(model, table) {
+function basePriceIn(model, table) {
   const byId = table.byId || {};
   const id = normalizeId(model);
   if (byId[id]) return byId[id];
@@ -216,10 +258,41 @@ function priceForModelIn(model, table) {
   return table.default || table.tiers.sonnet;
 }
 
+function bedrockMultIn(model, table) {
+  const mm = table.bedrockMult || {};
+  const id = normalizeId(model);
+  if (mm[id] != null) return mm[id];
+  const trimmed = id.replace(/-\d{6,}$/, '');
+  if (mm[trimmed] != null) return mm[trimmed];
+  return pnum(table.bedrockPremium, BEDROCK_PREMIUM);
+}
+
+// provider: 'bedrock' applies the regional-inference premium; anything else (or omitted) is
+// first-party list price. Scaled prices are memoized — this is called per billed message.
+function priceForModelIn(model, table, provider) {
+  const base = basePriceIn(model, table);
+  if (provider !== 'bedrock') return base;
+  const k = bedrockMultIn(model, table);
+  if (!(k > 0) || k === 1) return base;
+  // Non-enumerable: the table is JSON-serialized into the web/mobile pages as __PRICING__.
+  let memo = table._bedrockPrices;
+  if (!memo) Object.defineProperty(table, '_bedrockPrices', { value: memo = new Map(), enumerable: false });
+  const key = normalizeId(model) + '@' + k;
+  let p = memo.get(key);
+  if (!p) {
+    p = priceObj(base.input * k, base.output * k, base.cacheRead * k,
+                 base.cacheWrite5m * k, base.cacheWrite1h * k);
+    memo.set(key, p);
+  }
+  return p;
+}
+
 function tableSig(table) {
-  const norm = { byId: {}, tiers: {}, default: table.default };
+  const norm = { byId: {}, tiers: {}, default: table.default,
+                 bedrockMult: {}, bedrockPremium: table.bedrockPremium };
   for (const k of Object.keys(table.byId).sort()) norm.byId[k] = table.byId[k];
   for (const k of Object.keys(table.tiers).sort()) norm.tiers[k] = table.tiers[k];
+  for (const k of Object.keys(table.bedrockMult || {}).sort()) norm.bedrockMult[k] = table.bedrockMult[k];
   return crypto.createHash('sha1').update(JSON.stringify(norm)).digest('hex').slice(0, 16);
 }
 
@@ -240,13 +313,14 @@ async function fetchLiteLLM() {
 async function updatePricingNow() {
   touchAttempt();
   const j = await fetchLiteLLM();
-  const byId = convertLiteLLM(j);
+  const { byId, bedrockMult } = convertLiteLLM(j);
   if (!Object.keys(byId).length) throw new Error('no anthropic models parsed from LiteLLM');
   const out = {
     _comment: 'Auto-generated by ccbb from LiteLLM (refreshed daily). Do not hand-edit — this file is overwritten. Delete it to force a rebuild.',
     _source: LITELLM_URL,
     _fetchedAt: new Date().toISOString(),
     byId,
+    bedrockMult,
     tiers: tiersFrom(FALLBACK_TIERS),
     default: normalizePrice(FALLBACK_TIERS.sonnet),
   };
@@ -258,7 +332,7 @@ async function updatePricingNow() {
 // detached child to refresh it for next time. Never blocks or throws.
 function maybeRefreshPricing() {
   try {
-    if (fileAgeMs(LIVE_FILE) <= MAX_AGE_MS) return;
+    if (fileAgeMs(LIVE_FILE) <= MAX_AGE_MS && !PRICE_TABLE.needsRefresh) return;
     if (fileAgeMs(ATTEMPT_FILE) <= RETRY_MS) return;
     touchAttempt();
     const child = spawn(process.execPath, [__filename, '--update-pricing'], { detached: true, stdio: 'ignore' });
@@ -269,7 +343,10 @@ function maybeRefreshPricing() {
 
 const PRICE_TABLE = loadTable();
 const PRICING = PRICE_TABLE.tiers;
-function priceForModel(model) { return priceForModelIn(model, PRICE_TABLE); }
+function priceForModel(model, provider) { return priceForModelIn(model, PRICE_TABLE, provider); }
+// A message id prefixed `msg_bdrk_` came through AWS Bedrock; everything else is first-party
+// (Claude subscription or API key). This is the only provider signal a transcript carries.
+function providerOf(messageId) { return String(messageId || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic'; }
 function contextMaxFor(model) { return 200000; }
 
 // ── Subscription usage windows ───────────────────────────────────────────────
@@ -588,7 +665,8 @@ function computeSessionStats(sessionId, opts) {
         const u = d.message.usage;
         const inp = u.input_tokens || 0, out = u.output_tokens || 0;
         const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
-        const p = priceForModel(d.message.model);
+        const prov = providerOf(d.message.id);
+        const p = priceForModel(d.message.model, prov);
         const cInp = inp * p.input / 1e6, cOut = out * p.output / 1e6;
         const cCr = cr * p.cacheRead / 1e6;
         const cc = u.cache_creation || null;
@@ -614,7 +692,6 @@ function computeSessionStats(sessionId, opts) {
         if (!modelMap[key]) modelMap[key] = { model: key, tokens: 0, cost: 0 };
         modelMap[key].tokens += msgTok;
         modelMap[key].cost += msgCost;
-        const prov = String(d.message.id || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic';
         if (!providerMap[prov]) providerMap[prov] = { provider: prov, tokens: 0, cost: 0 };
         providerMap[prov].tokens += msgTok;
         providerMap[prov].cost += msgCost;
@@ -653,14 +730,14 @@ function computeSessionStats(sessionId, opts) {
         const ctxTok = inp + cr + cw + out;
         if (!lastCtxTs || (d.timestamp && d.timestamp >= lastCtxTs)) {
           lastCtxTs = d.timestamp || lastCtxTs;
-          lastCtx = { tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6, model: d.message.model || null, max: contextMaxFor(d.message.model) };
+          lastCtx = { tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6, model: d.message.model || null, provider: prov, max: contextMaxFor(d.message.model) };
         }
         // Collect per-turn context samples (deduped by message id, in chronological order)
         // so the peak can be computed after the loop with spike artifacts discounted.
         if (!(d.message.id && seenCtxIds.has(d.message.id))) {
           if (d.message.id) seenCtxIds.add(d.message.id);
           ctxSamples.push({ tokens: ctxTok, cost: ctxTok * p.cacheRead / 1e6,
-            model: d.message.model || null, ts: d.timestamp ? Date.parse(d.timestamp) : null });
+            model: d.message.model || null, provider: prov, ts: d.timestamp ? Date.parse(d.timestamp) : null });
         }
       }
     }
@@ -680,16 +757,26 @@ function computeSessionStats(sessionId, opts) {
       if (hi > 0 && c.tokens >= SPIKE_RATIO * hi && lo >= NEIGHBOR_SYM * hi) continue;
     }
     if (!maxCtx || c.tokens > maxCtx.tokens)
-      maxCtx = { tokens: c.tokens, cost: c.cost, model: c.model, max: contextMaxFor(c.model) };
+      maxCtx = { tokens: c.tokens, cost: c.cost, model: c.model, provider: c.provider, max: contextMaxFor(c.model) };
   }
   if (lastCompactTs && (!lastCtxTs || lastCompactTs > lastCtxTs)) {
     const model = lastCtx ? lastCtx.model : null;
-    const p = priceForModel(model);
+    const provider = lastCtx ? lastCtx.provider : null;
+    const p = priceForModel(model, provider);
     lastCtx = {
       tokens: lastCompactTokens,
       cost: lastCompactTokens * p.cacheRead / 1e6,
-      model, max: contextMaxFor(model), postCompact: true,
+      model, provider, max: contextMaxFor(model), postCompact: true,
     };
+  }
+  // What one more turn costs to resend this context: at cache-read price while the prompt
+  // cache is still warm, at cache-write price once it has expired. Which of the two applies
+  // is a function of wall-clock time, so it is decided at render; both prices are recorded
+  // here, where the model's price is still in hand.
+  if (lastCtx) {
+    const p = priceForModel(lastCtx.model, lastCtx.provider);
+    const ttl = s.cacheTtl || 300;
+    lastCtx.costWrite = lastCtx.tokens * (ttl >= 3600 ? p.cacheWrite1h : p.cacheWrite5m) / 1e6;
   }
   s.context = periodFilter ? null : lastCtx;
   s.contextMax = periodFilter ? null : maxCtx;
@@ -824,9 +911,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 9 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 10 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 9, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 10, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 // The cache is a few hundred KB, and a watched server rebuilds its list every time a
@@ -1522,6 +1609,7 @@ function periodView(st, kind, key) {
   return {
     title: st.title, startedAt: st.startedAt, lastActivity: st.lastActivity,
     hasUsage: st.hasUsage, context: st.context, contextMax: st.contextMax,
+    cacheTtl: st.cacheTtl, lastAssistantAt: st.lastAssistantAt,
     cost: b ? b.cost : 0, totalTokens: b ? b.tokens : 0,
     turns: b ? b.turns : 0, subTurns: b ? b.subTurns : 0,
     categories: b ? b.categories : emptyCats,
@@ -1547,6 +1635,8 @@ function sessionRow(sessionId, projectPath, stats, rec) {
     subTurns: stats.subTurns,
     context: stats.context,
     contextMax: stats.contextMax,
+    cacheTtl: stats.cacheTtl || null,
+    lastAssistantAt: stats.lastAssistantAt || null,
     inputTokens: cat.input.tokens,
     cacheReadTokens: cat.cacheRead.tokens,
     cacheCreationTokens: cat.cacheWrite.tokens,
@@ -1718,7 +1808,8 @@ function sessionContribution(usagePaths) {
       const u = d.message.usage;
       const inp = u.input_tokens || 0, out = u.output_tokens || 0;
       const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
-      const p = priceForModel(d.message.model);
+      const prov = providerOf(d.message.id);
+      const p = priceForModel(d.message.model, prov);
       const cc = u.cache_creation || null;
       const cw5 = cc ? (cc.ephemeral_5m_input_tokens || 0) : cw;
       const cw1 = cc ? (cc.ephemeral_1h_input_tokens || 0) : 0;
@@ -1740,7 +1831,6 @@ function sessionContribution(usagePaths) {
         tokens: inp + out + cr + cw, cost: cInp + cOut + cCr + cCw,
         respMs,
       };
-      const prov = String(d.message.id || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic';
       const model = d.message.model || 'unknown';
       addScope(overall, m, prov, model);
       for (const kind of ['day', 'week', 'month']) {
@@ -1775,7 +1865,7 @@ module.exports = {
   // multi-server
   serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable,
   // pricing
-  PRICING, priceTable: PRICE_TABLE, priceForModel, contextMaxFor,
+  PRICING, priceTable: PRICE_TABLE, priceForModel, providerOf, contextMaxFor,
   loadTable, priceForModelIn, tableSig, normalizeId, convertLiteLLM,
   maybeRefreshPricing, updatePricingNow, LITELLM_URL, LIVE_FILE, MAX_AGE_MS, fileAgeMs,
   // discovery + stats
