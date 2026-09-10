@@ -125,6 +125,7 @@ function parseLsArgs(args) {
     else if (a === '-x' || a === '--wide') { opt.wide = true; }
     else if (a === '-n' || a === '--limit') { opt.limit = parseInt(args[++i], 10) || 0; }
     else if (a === '-h' || a === '--help') { opt.help = true; }
+    else if (a === '--mux') { opt.mux = true; }
     else if (a === '-d' || a === '--daily') { opt.group = 'day'; }
     else if (a === '-w' || a === '--weekly') { opt.group = 'week'; }
     else if (a === '-m' || a === '--monthly') { opt.group = 'month'; }
@@ -158,6 +159,8 @@ the period; sessions with no usage in scope are dropped):
   -g, --group <unit> day | week | month   (periods use local time)
 
 Display:
+  --mux              list the sessions running in the mux instead (status, attached
+                     clients, unanswered requests) — see also: ccbb new
   -x, --wide         force extended columns
   -z, --empty        include sessions with no usage in scope
   -n, --limit <n>    show only the first n rows
@@ -293,6 +296,11 @@ function printCostSummary(scope, label, extended) {
 function runLs(args) {
   const opt = parseLsArgs(args);
   if (opt.help) return lsHelp();
+  // A different question with a different answer: --mux asks the running mux what it
+  // is holding, where everything else here reads transcripts off disk. Sorting, period
+  // scoping and the cost summary have nothing to say about a live child, so this
+  // branches before any of them rather than growing flags they'd all have to honour.
+  if (opt.mux) return require('./ccbb-mux').runMuxLs();
   if (!SORT_KEYS[opt.sort]) {
     console.error(`ccbb: unknown sort key '${opt.sort}'. Valid: ${Object.keys(SORT_KEYS).join(', ')}`);
     process.exit(1);
@@ -384,6 +392,10 @@ Usage:
      [--webex]             ...also run the Webex front-end (one process)
      [--confluence]        ...also run the Confluence page front-end
                            multi-machine: add "peers" to ccbb-config.json (peers.md)
+  ccbb new [-n name]       start a session in the mux and attach a terminal (ccbb new -h)
+  ccbb attach [name|id]    attach a terminal to a running mux session (ccbb attach -h)
+  ccbb stop [name|id]      end a mux session (ccbb stop -h)
+  ccbb ls --mux            list the sessions the mux is running
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
   ccbb skel [-o file]      extract privacy-safe session skeletons to one JSON (see: ccbb skel -h)
   ccbb stats <file...>     render an HTML stats report from skeletons (see: ccbb stats -h)
@@ -398,6 +410,9 @@ function main() {
   if (cmd === 'help' || cmd === '-h' || cmd === '--help') return topHelp();
   if (!cmd || cmd.startsWith('-')) { cmd = 'ls'; rest = argv; } // no command / bare flags → ls
   if (cmd === 'ls') return runLs(rest);
+  if (cmd === 'new') return require('./ccbb-mux').runNew(rest);
+  if (cmd === 'stop') return require('./ccbb-mux').runStop(rest);
+  if (cmd === 'attach') return require('./ccbb-mux-tui').runAttach(rest);
   if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);
   if (cmd === 'web') return require('./ccbb-web').runWeb(rest);
   if (cmd === 'skel') return require('./ccbb-stats').runSkel(rest);

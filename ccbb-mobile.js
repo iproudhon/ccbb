@@ -275,6 +275,9 @@ body.has-max .panel:not(.max){display:none}
 .srow .r1{display:flex;align-items:center;gap:7px;min-width:0}
 .srow .stitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14.5px}
 .srow .stime{flex-shrink:0;font-size:11.5px;color:var(--ink-faint);font-variant-numeric:tabular-nums}
+.mux-tag{flex-shrink:0;font-size:9px;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--accent);border:1px solid var(--accent-soft);background:var(--accent-soft);
+  border-radius:3px;padding:0 4px}
 .srv{flex-shrink:0;font-size:10.5px;font-weight:700;letter-spacing:.02em;text-transform:uppercase;
   color:var(--ink-soft);background:var(--bg-alt);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
 .srv.local{color:var(--accent);border-color:var(--accent-soft);background:var(--accent-soft)}
@@ -983,10 +986,12 @@ function createListPanel(){
     } else {
       rowsEl.innerHTML = sessions.map(function(s){
         var live = s.live ? ' live' : '';
-        return '<div class="srow" data-sid="'+esc(s.sessionId)+'" data-srv="'+esc(s.server||'')+'">'+
+        return '<div class="srow" data-sid="'+esc(s.sessionId)+'" data-srv="'+esc(s.server||'')+'"'+
+            (s.mux ? ' data-mux="1"' : '')+'>'+
           '<div class="r1">'+
             '<span class="dot'+live+'"></span>'+
             '<span class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</span>'+
+            (s.mux ? '<span class="mux-tag">mux</span>' : '')+
             '<span class="stitle">'+esc(s.title || '(untitled)')+'</span>'+
             '<span class="stime">'+esc(rel(s.lastActivity || s.startedAt))+'</span>'+
           '</div>'+
@@ -1023,7 +1028,18 @@ function createListPanel(){
   }
   rowsEl.addEventListener('click', function(e){
     var r = e.target.closest('[data-sid]');
-    if (r) openSession(r.dataset.sid, r.dataset.srv || null);
+    if (!r) return;
+    // A mux session has no pane to tail, so there is no panel to open: leave the
+    // phone UI for the mux client, proxied through this server (or through the peer
+    // that owns it). This is the case the whole proxy exists for — a phone reaches
+    // ccbb and nothing else, so a link straight to the mux's port would go nowhere.
+    if (r.dataset.mux && !RO) {
+      var srv = r.dataset.srv;
+      var base = (srv && srv !== SELF.name) ? '/peer/'+encodeURIComponent(srv) : '';
+      location.href = base + '/mux/s/' + r.dataset.sid;
+      return;
+    }
+    openSession(r.dataset.sid, r.dataset.srv || null);
   });
 
   function tickAgo(){

@@ -18,6 +18,16 @@ const zlib = require('zlib');
 const { spawnSync, spawn } = require('child_process');
 
 const common = require('./ccbb-common');
+// The JSON-mode multiplexer. It runs INSIDE this process — no second port, no second
+// TCP server, no address indirection — and ccbb web hosts it under /mux. Guarded,
+// because ccbb web must keep working on an install that has neither file: every use
+// below is behind muxWeb && / mux &&.
+let muxWeb = null, muxLib = null;
+try { muxWeb = require('./ccbb-mux-web'); } catch { muxWeb = null; }
+try { muxLib = require('./ccbb-mux'); } catch { muxLib = null; }
+// Constructed at require time so the sessions outlive any one request, but it opens
+// nothing and spawns nothing until something asks it to.
+const mux = muxLib ? new muxLib.Mux({}) : null;
 // The phone front-end. Same server, same API, its own page — see ccbb-mobile.js.
 const { mobilePageHtml, isMobileUA, serveVendor } = require('./ccbb-mobile');
 const {
@@ -254,23 +264,156 @@ function webManifest(self) {
   };
 }
 
-const APP_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ccbb</title>
-<link rel="shortcut icon" href="data:image/svg+xml,%3Csvg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='16' y='12' width='32' height='28' rx='4' fill='%23FF6B35'/%3E%3Ccircle cx='24' cy='20' r='4' fill='%23fff'/%3E%3Ccircle cx='40' cy='20' r='4' fill='%23fff'/%3E%3Crect x='20' y='28' width='24' height='2' fill='%23fff' rx='1'/%3E%3Crect x='18' y='42' width='28' height='16' rx='2' fill='%23FF6B35'/%3E%3Crect x='8' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3Crect x='46' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3C/svg%3E" />
-<!-- The SVG is what a tab draws. Chrome's app installer wants a raster and a
-     manifest, and gets both here — see iconPngFor()/webManifest() in ccbb-web.js. -->
-<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
-<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
-<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
-<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
-<style>
+// The whole page stylesheet, hoisted out of APP_HTML so the standalone mux page
+// (ccbb-mux-web.js mount()) can serve the SAME rules. The mux client renders ccbb's
+// classes now — .msg, .tool-card, .input-area, .sv-foot — and a second copy of those
+// rules living in the mux file is exactly how the two clients drift apart.
+// Page JS the standalone mux page needs too: the composer editable and the tool-card
+// toggle. The mux client renders ccbb's .input-box and .tool-card markup, so it needs
+// ccbb's behaviour for them — hoisted rather than copied, for the same reason APP_CSS was.
+const SHARED_JS = `
+// ── shared helpers ────────────────────────────────────────────────────────────
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function trunc(s,n){ s=String(s||''); return s.length>n?s.slice(0,n-1)+'…':s; }
+function fc(c){ return c!=null?'$'+(+c).toFixed(2):'—'; }
+function ft(t){ return t!=null?Number(t).toLocaleString():'—'; }
+function fd(iso){ if(!iso)return '—'; try{ return new Date(iso).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso.slice(0,16); } }
+function fmtMonth(mk){ var p=mk.split('-'), names=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return (names[+p[1]-1]||mk)+' '+p[0]; }
+function fmtTokK(t){ t=t||0; if(t>=1e9)return (t/1e9).toFixed(1)+'B'; if(t>=1e6)return (t/1e6).toFixed(1)+'M'; if(t>=1e3)return (t/1e3).toFixed(1)+'K'; return String(t); }
+function fmtTokShort(n){ n=n||0; if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+'M'; if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1)+'K'; return String(n); }
+function fmtCost(c){ return '$'+(c||0).toFixed(2); }
+function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s'; var m=Math.floor(s/60); if(m<60)return m+'m '+Math.round(s%60)+'s'; var h=Math.floor(m/60); if(h<24)return h+'h '+(m%60)+'m'; return Math.floor(h/24)+'d '+(h%24)+'h'; }
+function fmtPct(part,whole){ return (whole>0?(100*part/whole):0).toFixed(1)+'%'; }
+function fmtStatDate(iso){ return fd(iso); }
+// ── subscription windows ──
+// A Claude.ai plan runs out of WINDOW, not money, so the two rolling limits travel next
+// to every dollar figure: "$1.23/5h:24%/w:41%", the same shape the status line uses.
+// A window that the account doesn't report is dropped rather than shown as 0%.
+function subPct(w){ return w ? Math.round(w.pct)+'%' : '—'; }
+// One window as a filled pill: the bar IS the pill's background, with the label and the
+// numbers riding on top, so a window costs one element's width instead of three. Amber
+// past 70%, red past 90%. The phone's footers draw the same thing — see ccbb-mobile.js —
+// and the two are meant to stay the same object; they are apart only because the files are.
+function footWin(label, w){
+  if (!w) return '';
+  var pc = Math.max(0, Math.min(100, w.pct));
+  var cls = pc >= 90 ? ' hot' : pc >= 70 ? ' warm' : '';
+  // A few percent of a short pill is a sub-pixel sliver that renders as nothing, which
+  // reads as an untouched window. Any nonzero usage gets at least a visible edge.
+  var fill = 'width:'+pc.toFixed(1)+'%' + (pc > 0 ? ';min-width:3px' : '');
+  return '<span class="fwin'+cls+'"><i style="'+fill+'"></i>'+
+    '<b>'+label+'</b><em>'+subPct(w)+' '+esc(fmtUntil(w.resetsAt))+'</em></span>';
+}
+// How long until a window resets. Whole-ish units — this is read at a glance, and the
+// seconds on a 4-hour countdown are noise.
+function fmtUntil(iso){
+  if(!iso) return '—';
+  var t = Date.parse(iso); if (isNaN(t)) return '—';
+  var s = Math.round((t - Date.now())/1000);
+  if (s <= 0) return 'due';
+  var m = Math.floor(s/60), h = Math.floor(m/60), d = Math.floor(h/24);
+  if (d > 0) return d+'d '+(h%24)+'h';
+  if (h > 0) return h+'h '+(m%60)+'m';
+  return m+'m';
+}
+function subWinStr(win){
+  if (!win) return '';
+  var p = [];
+  if (win.fiveHour) p.push('5h:'+subPct(win.fiveHour));
+  if (win.sevenDay) p.push('w:'+subPct(win.sevenDay));
+  return p.length ? '/'+p.join('/') : '';
+}
+// Where the reading came from and how old it is — a percentage with no provenance is
+// indistinguishable from a stale one.
+function subWinTitle(sub){
+  if (!sub || !sub.windows) return '';
+  var w = sub.windows, parts = [];
+  if (w.fiveHour) parts.push('5-hour window '+subPct(w.fiveHour)+' used, resets in '+fmtUntil(w.fiveHour.resetsAt));
+  if (w.sevenDay) parts.push('7-day window '+subPct(w.sevenDay)+' used, resets in '+fmtUntil(w.sevenDay.resetsAt));
+  if (sub.fetchedAt) parts.push('read '+fmtUntilAge(sub.fetchedAt)+' ago from '+(sub.source==='api'?'the account API':'Claude Code\\'s cache'));
+  return parts.join('\\n');
+}
+function fmtUntilAge(ms){
+  var s = Math.max(0, Math.round((Date.now()-ms)/1000));
+  if (s < 60) return s+'s';
+  var m = Math.floor(s/60); if (m < 60) return m+'m';
+  var h = Math.floor(m/60); if (h < 24) return h+'h';
+  return Math.floor(h/24)+'d';
+}
+// The composer's tooltips. They are the only place the key bindings are written down
+// for the reader, so both composers say the same thing by sharing the strings.
+var SEND_TIP = 'Send  \u00b7  Ctrl+Enter  \u00b7  Enter inserts a newline  \u00b7  //help for commands';
+var EXPAND_TIP = 'Expand the composer to the whole session';
+var HIST_PREV_TIP = 'Earlier input  \u00b7  this session\\'s prompts and this page\\'s // commands';
+var HIST_NEXT_TIP = 'Later input  \u00b7  past the newest returns what you were typing';
+// ── the composer's editable ───────────────────────────────────────────────────
+// Makes a contenteditable div answer to the three textarea properties the composer code
+// uses — value, placeholder, setSelectionRange — so the swap costs nothing above this
+// line. It has to be a div: the send button sits in a notch cut out of the last line by
+// a floated ::after, and a textarea has no inline content for a float to displace.
+// Sizing is CSS now (min-height/max-height), so there is no autoGrow to call: a div is
+// exactly as tall as its text.
+function asTextarea(el){
+  el.setAttribute('contenteditable', 'plaintext-only');
+  el.setAttribute('spellcheck', 'false');
+  // Paste is flattened by hand rather than left to plaintext-only: Firefox before 136
+  // ignores that value and silently falls back to full rich-text editing, and a pasted
+  // stack trace would arrive as markup. execCommand, deprecated as it is, is the only
+  // insert that the browser's own undo stack still knows about.
+  el.addEventListener('paste', function(e){
+    var cd = e.clipboardData || window.clipboardData;
+    if (!cd) return;
+    e.preventDefault();
+    document.execCommand('insertText', false, cd.getData('text/plain'));
+  });
+  // :empty is not usable for the placeholder — browsers leave a stray <br> behind in an
+  // "empty" editable — so the class is maintained by hand.
+  function sync(){ el.classList.toggle('empty', !el.innerText); }
+  el.addEventListener('input', sync);
+  Object.defineProperty(el, 'value', {
+    // innerText, not textContent: it is the one reader that turns however this browser
+    // chose to represent the line breaks (<br>, nested divs) back into real newlines.
+    // Trailing ones go: an editable keeps a bogus block after the last line, so a prompt
+    // ended with Enter would arrive at the pane with a blank line after it — which in a
+    // pane that submits on Enter is not a cosmetic difference.
+    get: function(){ return el.innerText.replace(/\\n+$/, ''); },
+    set: function(v){ el.textContent = v == null ? '' : String(v); sync(); }
+  });
+  Object.defineProperty(el, 'placeholder', {
+    get: function(){ return el.getAttribute('data-ph') || ''; },
+    set: function(v){ el.setAttribute('data-ph', v == null ? '' : String(v)); }
+  });
+  // Only ever called collapsed (start === end): the history buttons put the caret at one
+  // end of what they just dropped in.
+  el.setSelectionRange = function(_start, end){ edCaret(el, end); };
+  sync();
+  return el;
+}
+function edCaret(el, pos){
+  var sel = window.getSelection();
+  if (!sel) return;
+  var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+  var n, seen = 0, node = null, off = 0;
+  while ((n = walker.nextNode())) {
+    node = n; off = n.nodeValue.length;
+    if (seen + off >= pos) { off = pos - seen; break; }
+    seen += off;
+  }
+  var r = document.createRange();
+  if (node) r.setStart(node, Math.max(0, Math.min(off, node.nodeValue.length)));
+  else r.selectNodeContents(el);
+  r.collapse(true);
+  sel.removeAllRanges(); sel.addRange(r);
+  el.focus();
+}
+function toggleTool(hdr) {
+  var body = hdr.nextElementSibling, toggle = hdr.querySelector('.tool-toggle');
+  var open = body.classList.toggle('open');
+  if (toggle) toggle.innerHTML = open?'&#9660;':'&#9654;';
+}
+`;
+
+const APP_CSS = `
 :root{
   --bg:#fff; --bg-alt:#f0eee6; --surface:#fff; --ink:#3d3d3a; --ink-soft:#6e6d66;
   --ink-faint:#9b998f; --line:#e6e3da; --line-soft:#efece4; --accent:#c96442;
@@ -370,6 +513,11 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .lv .dt{color:#57606a;font-size:12px;white-space:nowrap}
 .lv .proj{color:#8250df;font-size:12px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lv .ctx-tag{font-size:10px;color:#8c959f;margin-left:4px}
+/* Marks a row that lives in the mux rather than in a tmux pane. Deliberately quiet:
+   it is a different route to the same session, not a different class of session. */
+.lv .mux-tag{font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--accent);
+  border:1px solid var(--accent-soft);background:var(--accent-soft);border-radius:3px;
+  padding:0 4px;margin-left:6px;vertical-align:1px}
 .lv .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2da44e;margin-right:6px;vertical-align:middle;animation:pulse 1.6s ease-in-out infinite}
 .lv .live-dot.off{background:transparent;animation:none}
 .lv .lmsg{text-align:center;padding:48px;color:#57606a}
@@ -784,11 +932,39 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .lv .chip-term:hover{background:#d0d7de;color:#1f2328}
 /* toast (replaces alert(): alerts block browser automation and yank focus) */
 #toast{position:fixed;bottom:18px;right:18px;background:#3d3d3a;color:#fff;border-radius:10px;padding:10px 16px;font-size:13px;z-index:99;display:none;max-width:420px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+/* A mux view's body: the client is a flex column that wants to fill it. */
+.sv .mux-tag{font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--accent);
+  border:1px solid var(--accent);border-radius:4px;padding:0 3px;flex-shrink:0}
+.sv .mux-mode{font-size:11px;color:var(--ink-faint);flex-shrink:0}
+.mux-body>.muxv{flex:1 1 auto;min-height:0;height:auto}
+`;
+
+const APP_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ccbb</title>
+<link rel="shortcut icon" href="data:image/svg+xml,%3Csvg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='16' y='12' width='32' height='28' rx='4' fill='%23FF6B35'/%3E%3Ccircle cx='24' cy='20' r='4' fill='%23fff'/%3E%3Ccircle cx='40' cy='20' r='4' fill='%23fff'/%3E%3Crect x='20' y='28' width='24' height='2' fill='%23fff' rx='1'/%3E%3Crect x='18' y='42' width='28' height='16' rx='2' fill='%23FF6B35'/%3E%3Crect x='8' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3Crect x='46' y='46' width='10' height='8' rx='2' fill='%23FF6B35'/%3E%3C/svg%3E" />
+<!-- The SVG is what a tab draws. Chrome's app installer wants a raster and a
+     manifest, and gets both here — see iconPngFor()/webManifest() in ccbb-web.js. -->
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<style>__CCBB_CSS__
+__MUX_CSS__
 </style>
 </head>
 <body>
 <div id="views"></div>
 <div id="toast"></div>
+<script>
+__MUX_JS__
+</script>
 <script>
 __APP_JS__
 </script>
@@ -811,82 +987,24 @@ var INIT_OPEN = __INIT_OPEN__;   // {sessionId, server} to open on load (deep li
 // per view is the whole difference between driving a local and a remote session.
 function isLocal(server){ return !server || server === SELF.name; }
 function apiBase(server){ return isLocal(server) ? '' : '/peer/'+encodeURIComponent(server); }
-function sessionHref(sid, server){ return apiBase(server)+'/session/'+sid; }
+// A mux session has no tmux pane to show, so its row opens the mux client instead.
+// A peer's mux row goes through that peer: /peer/<name>/mux/s/<id> reaches the peer's
+// own /mux/s/<id>, and the client derives its base from the page path, so its socket
+// lands on /peer/<name>/mux/mux and rides the peer proxy's upgrade splice.
+function sessionHref(sid, server, mux){ return apiBase(server)+(mux ? '/mux/s/' : '/session/')+sid; }
 function parseSessionHref(href){
-  var m = href.match(/^\\/peer\\/([^/]+)\\/session\\/([^/?#]+)/);
+  var m = href.match(/^\\/peer\\/([^/]+)\\/mux\\/s\\/([^/?#]+)/);
+  if (m) return { server: decodeURIComponent(m[1]), sessionId: m[2], mux: true };
+  m = href.match(/^\\/mux\\/s\\/([^/?#]+)/);
+  if (m) return { server: null, sessionId: m[1], mux: true };
+  m = href.match(/^\\/peer\\/([^/]+)\\/session\\/([^/?#]+)/);
   if (m) return { server: decodeURIComponent(m[1]), sessionId: m[2] };
   m = href.match(/^\\/session\\/([^/?#]+)/);
   return m ? { server: null, sessionId: m[1] } : null;
 }
 
-// ── shared helpers ────────────────────────────────────────────────────────────
-function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function trunc(s,n){ s=String(s||''); return s.length>n?s.slice(0,n-1)+'…':s; }
-function fc(c){ return c!=null?'$'+(+c).toFixed(2):'—'; }
-function ft(t){ return t!=null?Number(t).toLocaleString():'—'; }
-function fd(iso){ if(!iso)return '—'; try{ return new Date(iso).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso.slice(0,16); } }
-function fmtMonth(mk){ var p=mk.split('-'), names=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return (names[+p[1]-1]||mk)+' '+p[0]; }
-function fmtTokK(t){ t=t||0; if(t>=1e9)return (t/1e9).toFixed(1)+'B'; if(t>=1e6)return (t/1e6).toFixed(1)+'M'; if(t>=1e3)return (t/1e3).toFixed(1)+'K'; return String(t); }
-function fmtTokShort(n){ n=n||0; if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+'M'; if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1)+'K'; return String(n); }
-function fmtCost(c){ return '$'+(c||0).toFixed(2); }
-function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s'; var m=Math.floor(s/60); if(m<60)return m+'m '+Math.round(s%60)+'s'; var h=Math.floor(m/60); if(h<24)return h+'h '+(m%60)+'m'; return Math.floor(h/24)+'d '+(h%24)+'h'; }
-function fmtPct(part,whole){ return (whole>0?(100*part/whole):0).toFixed(1)+'%'; }
-function fmtStatDate(iso){ return fd(iso); }
-// ── subscription windows ──
-// A Claude.ai plan runs out of WINDOW, not money, so the two rolling limits travel next
-// to every dollar figure: "$1.23/5h:24%/w:41%", the same shape the status line uses.
-// A window that the account doesn't report is dropped rather than shown as 0%.
-function subPct(w){ return w ? Math.round(w.pct)+'%' : '—'; }
-// One window as a filled pill: the bar IS the pill's background, with the label and the
-// numbers riding on top, so a window costs one element's width instead of three. Amber
-// past 70%, red past 90%. The phone's footers draw the same thing — see ccbb-mobile.js —
-// and the two are meant to stay the same object; they are apart only because the files are.
-function footWin(label, w){
-  if (!w) return '';
-  var pc = Math.max(0, Math.min(100, w.pct));
-  var cls = pc >= 90 ? ' hot' : pc >= 70 ? ' warm' : '';
-  // A few percent of a short pill is a sub-pixel sliver that renders as nothing, which
-  // reads as an untouched window. Any nonzero usage gets at least a visible edge.
-  var fill = 'width:'+pc.toFixed(1)+'%' + (pc > 0 ? ';min-width:3px' : '');
-  return '<span class="fwin'+cls+'"><i style="'+fill+'"></i>'+
-    '<b>'+label+'</b><em>'+subPct(w)+' '+esc(fmtUntil(w.resetsAt))+'</em></span>';
-}
-// How long until a window resets. Whole-ish units — this is read at a glance, and the
-// seconds on a 4-hour countdown are noise.
-function fmtUntil(iso){
-  if(!iso) return '—';
-  var t = Date.parse(iso); if (isNaN(t)) return '—';
-  var s = Math.round((t - Date.now())/1000);
-  if (s <= 0) return 'due';
-  var m = Math.floor(s/60), h = Math.floor(m/60), d = Math.floor(h/24);
-  if (d > 0) return d+'d '+(h%24)+'h';
-  if (h > 0) return h+'h '+(m%60)+'m';
-  return m+'m';
-}
-function subWinStr(win){
-  if (!win) return '';
-  var p = [];
-  if (win.fiveHour) p.push('5h:'+subPct(win.fiveHour));
-  if (win.sevenDay) p.push('w:'+subPct(win.sevenDay));
-  return p.length ? '/'+p.join('/') : '';
-}
-// Where the reading came from and how old it is — a percentage with no provenance is
-// indistinguishable from a stale one.
-function subWinTitle(sub){
-  if (!sub || !sub.windows) return '';
-  var w = sub.windows, parts = [];
-  if (w.fiveHour) parts.push('5-hour window '+subPct(w.fiveHour)+' used, resets in '+fmtUntil(w.fiveHour.resetsAt));
-  if (w.sevenDay) parts.push('7-day window '+subPct(w.sevenDay)+' used, resets in '+fmtUntil(w.sevenDay.resetsAt));
-  if (sub.fetchedAt) parts.push('read '+fmtUntilAge(sub.fetchedAt)+' ago from '+(sub.source==='api'?'the account API':'Claude Code\\'s cache'));
-  return parts.join('\\n');
-}
-function fmtUntilAge(ms){
-  var s = Math.max(0, Math.round((Date.now()-ms)/1000));
-  if (s < 60) return s+'s';
-  var m = Math.floor(s/60); if (m < 60) return m+'m';
-  var h = Math.floor(m/60); if (h < 24) return h+'h';
-  return Math.floor(h/24)+'d';
-}
+// (the shared-helpers and subscription-window block moved to SHARED_JS above:
+// ccbb-mux-web.js draws the same status line and needs the same formatters)
 function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown'; var x=m.replace(/^claude-/,'').replace(/-\\d{6,}$/,''); var parts=x.split('-'); var name=(parts.shift()||''); name=name.charAt(0).toUpperCase()+name.slice(1); var ver=parts.join('.'); return ver?name+' '+ver:name; }
 function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
   m=m.replace(/^(us|eu|apac|au|global)\\./,'').replace(/^(anthropic|bedrock)[./]/,'').replace(/[:-]v\\d+(:\\d+)?$/,'');
@@ -917,71 +1035,7 @@ function toast(msg){
   t.textContent = msg; t.style.display = 'block';
   clearTimeout(toastTimer); toastTimer = setTimeout(function(){ t.style.display = 'none'; }, 4000);
 }
-// ── the composer's editable ───────────────────────────────────────────────────
-// Makes a contenteditable div answer to the three textarea properties the composer code
-// uses — value, placeholder, setSelectionRange — so the swap costs nothing above this
-// line. It has to be a div: the send button sits in a notch cut out of the last line by
-// a floated ::after, and a textarea has no inline content for a float to displace.
-// Sizing is CSS now (min-height/max-height), so there is no autoGrow to call: a div is
-// exactly as tall as its text.
-function asTextarea(el){
-  el.setAttribute('contenteditable', 'plaintext-only');
-  el.setAttribute('spellcheck', 'false');
-  // Paste is flattened by hand rather than left to plaintext-only: Firefox before 136
-  // ignores that value and silently falls back to full rich-text editing, and a pasted
-  // stack trace would arrive as markup. execCommand, deprecated as it is, is the only
-  // insert that the browser's own undo stack still knows about.
-  el.addEventListener('paste', function(e){
-    var cd = e.clipboardData || window.clipboardData;
-    if (!cd) return;
-    e.preventDefault();
-    document.execCommand('insertText', false, cd.getData('text/plain'));
-  });
-  // :empty is not usable for the placeholder — browsers leave a stray <br> behind in an
-  // "empty" editable — so the class is maintained by hand.
-  function sync(){ el.classList.toggle('empty', !el.innerText); }
-  el.addEventListener('input', sync);
-  Object.defineProperty(el, 'value', {
-    // innerText, not textContent: it is the one reader that turns however this browser
-    // chose to represent the line breaks (<br>, nested divs) back into real newlines.
-    // Trailing ones go: an editable keeps a bogus block after the last line, so a prompt
-    // ended with Enter would arrive at the pane with a blank line after it — which in a
-    // pane that submits on Enter is not a cosmetic difference.
-    get: function(){ return el.innerText.replace(/\\n+$/, ''); },
-    set: function(v){ el.textContent = v == null ? '' : String(v); sync(); }
-  });
-  Object.defineProperty(el, 'placeholder', {
-    get: function(){ return el.getAttribute('data-ph') || ''; },
-    set: function(v){ el.setAttribute('data-ph', v == null ? '' : String(v)); }
-  });
-  // Only ever called collapsed (start === end): the history buttons put the caret at one
-  // end of what they just dropped in.
-  el.setSelectionRange = function(_start, end){ edCaret(el, end); };
-  sync();
-  return el;
-}
-function edCaret(el, pos){
-  var sel = window.getSelection();
-  if (!sel) return;
-  var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
-  var n, seen = 0, node = null, off = 0;
-  while ((n = walker.nextNode())) {
-    node = n; off = n.nodeValue.length;
-    if (seen + off >= pos) { off = pos - seen; break; }
-    seen += off;
-  }
-  var r = document.createRange();
-  if (node) r.setStart(node, Math.max(0, Math.min(off, node.nodeValue.length)));
-  else r.selectNodeContents(el);
-  r.collapse(true);
-  sel.removeAllRanges(); sel.addRange(r);
-  el.focus();
-}
-function toggleTool(hdr) {
-  var body = hdr.nextElementSibling, toggle = hdr.querySelector('.tool-toggle');
-  var open = body.classList.toggle('open');
-  if (toggle) toggle.innerHTML = open?'&#9660;':'&#9654;';
-}
+__SHARED_JS__
 
 // ── view stack manager ────────────────────────────────────────────────────────
 // views[0] is always the session list. A view object:
@@ -1096,6 +1150,8 @@ function viewBtnsHtml(buttons){
     '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
     (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal in this view">$_</button>' : '')+
     (buttons && buttons.term && !RO ? '<button class="vb-btn" data-act="termwin" title="Floating terminal for this session">#_</button>' : '')+
+    (buttons && buttons.resume && !RO ? '<button class="vb-btn vb-resume" data-act="resume" hidden '+
+      'title="Resume this session in the mux — starts a Claude Code process you can drive from here">&#9654;mux</button>' : '')+
     (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
     (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
 }
@@ -1171,6 +1227,7 @@ function makeViewBar(v, barMain, buttons){
       else if (b.dataset.act === 'fold') toggleFold(v);
       else if (b.dataset.act === 'max') toggleMax(v);
       else if (b.dataset.act === 'orient') toggleOrientation();
+      else if (b.dataset.act === 'resume') { if (v.onResume) v.onResume(); }
       else if (b.dataset.act === 'close') closeView(v);
       return;
     }
@@ -1187,7 +1244,7 @@ function makeViewBar(v, barMain, buttons){
   v.barEl = bar;
   return bar;
 }
-function openSession(sid, server){
+function openSession(sid, server, mux, title){
   // A session is identified by (server, id): the same id could exist on two machines,
   // and two views of "the same" id on different servers are two different sessions.
   var srv = isLocal(server) ? null : server;
@@ -1196,6 +1253,16 @@ function openSession(sid, server){
       if (!views[i].maxed) toggleMax(views[i]);
       return;
     }
+  }
+  // A mux session has no transcript-and-pane to fetch info for; the client's own
+  // snapshot carries everything the bar shows, so it opens without a round trip.
+  if (mux) {
+    var mv = createMuxSessionView({ sessionId: sid, server: srv, title: title || '' });
+    views.push(mv);
+    viewsEl.appendChild(mv.el);
+    relayout();
+    setTimeout(function(){ mv.barEl.scrollIntoView({block:'nearest'}); }, 0);
+    return;
   }
   fetch(apiBase(srv)+'/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
     var info = { sessionId: sid, server: srv, title: (d&&d.title)||'', projectPath: (d&&d.projectPath)||'',
@@ -1745,7 +1812,9 @@ function createListView(){
   function multiServer(){ return servers.length > 1; }
   function rowHtml(s) {
     var sid = s.sessionId, sh = sid.slice(0,8);
-    var href = sessionHref(sid, s.server);
+    // A read-only browser cannot drive a mux session, and /mux/* refuses it — so
+    // point it at the transcript view instead of at a 403.
+    var href = sessionHref(sid, s.server, s.mux && !RO);
     var titleHtml = s.title
       ? '<a class="ttl-text" href="'+href+'" title="'+esc(s.title)+'">'+esc(trunc(s.title,44))+'</a>'
       : '<a class="ttl-text empty" href="'+href+'">(no title)</a>';
@@ -1759,7 +1828,10 @@ function createListView(){
     return '<tr>'
       + '<td>'+(s.live?'<span class="live-dot" title="Active"></span>':'<span class="live-dot off"></span>')+'</td>'
       + (multiServer() ? '<td class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</td>' : '')
-      + '<td><a class="sid" href="'+href+'">'+sh+'</a></td>'
+      + '<td><a class="sid" href="'+href+'">'+sh+'</a>'
+        + (s.mux ? '<span class="mux-tag" title="Runs in the ccbb mux (JSON mode)'
+            + (s.muxClients ? ' — '+s.muxClients+' client'+(s.muxClients===1?'':'s')+' attached' : '')
+            + '">mux</span>' : '') + '</td>'
       + '<td class="ttl">'+titleHtml+'</td>'
       + '<td class="cost">'+fc(s.totalCost)+'</td>'
       + '<td class="tok">'+ft(s.totalTokens)+'</td>'
@@ -1808,10 +1880,15 @@ function createListView(){
     var chip = e.target.closest('.chip[data-srv]');
     if (chip) { toggleServer(chip.dataset.srv); return; }
     // Session links open a stacked view instead of navigating (middle-click still works).
-    var a = e.target.closest('a[href*="/session/"]');
+    var a = e.target.closest('a[href*="/session/"], a[href*="/mux/s/"]');
     if (a) {
       var ref = parseSessionHref(a.getAttribute('href'));
-      if (ref) { e.preventDefault(); openSession(ref.sessionId, ref.server); return; }
+      if (ref) {
+        e.preventDefault();
+        var tc = a.closest('tr') && a.closest('tr').querySelector('.ttl');
+        openSession(ref.sessionId, ref.server, ref.mux, tc ? tc.textContent.trim() : '');
+        return;
+      }
     }
     var th = e.target.closest('th[data-col]');
     if (th) clickHeader(th.dataset.col, e.shiftKey);
@@ -1853,11 +1930,72 @@ function createListView(){
 
 // The composer keeps no hint line under it — the keys live in the send button's tooltip
 // instead, so the transcript gets the space back.
-var SEND_TIP = 'Send  ·  Ctrl+Enter  ·  Enter inserts a newline  ·  //help for commands';
 var SEND_TIP_OFF = 'Session not running in a tmux pane here — input disabled. // commands still work.';
-var EXPAND_TIP = 'Expand the composer to the whole session';
-var HIST_PREV_TIP = 'Earlier input  ·  this session\\'s prompts and this page\\'s // commands';
-var HIST_NEXT_TIP = 'Later input  ·  past the newest returns what you were typing';
+
+// ── mux session view ──────────────────────────────────────────────────────────
+// A mux session is driven over the mux's own WebSocket protocol, never by scraping a
+// tmux pane, so this view HOSTS ccbb-mux-web.js's client rather than reimplementing
+// it. window.createMuxView is that client, refactored into a factory for exactly this
+// reason: there is one renderer for mux sessions, and the standalone /mux/s/<id> page
+// calls the same one.
+//
+// The bar is ccbb web's (bar:false), so a mux view folds, maximizes and closes like
+// every other view; the client pushes label, status and permission mode up through
+// onChrome for that bar to draw. No $_ or #_ buttons — a mux session has no tmux pane
+// for a terminal to attach to, and offering one would open an empty window.
+function createMuxSessionView(INFO){
+  var v = { kind:'session', mux:true, sessionId: INFO.sessionId, server: INFO.server || null, maxed:false, unseen:false };
+  var SRV = INFO.server || SELF.name;
+  var el = document.createElement('div');
+  el.className = 'view sv';
+  v.el = el;
+
+  var barMain = document.createElement('div');
+  barMain.style.cssText = 'display:flex;align-items:center;gap:10px;flex:1;min-width:0';
+  barMain.innerHTML = '<div class="status-dot"></div>'
+    + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
+    + '<span class="mux-tag" title="Driven over the mux protocol, not a tmux pane">mux</span>'
+    + '<div class="hdr-title">'+esc(INFO.title || INFO.sessionId.slice(0,8))+'</div>'
+    + '<span class="mux-mode"></span>';
+  el.appendChild(makeViewBar(v, barMain, { close:true, menu:true }));
+  var dotEl = barMain.querySelector('.status-dot');
+  var titleEl = barMain.querySelector('.hdr-title');
+  var modeEl = barMain.querySelector('.mux-mode');
+
+  var body = document.createElement('div');
+  body.className = 'view-body mux-body';
+  el.appendChild(body);
+  v.bodyEl = body;
+  var host = document.createElement('div');
+  body.appendChild(host);
+
+  // base is the PREFIX the client hangs everything off. Proxied through ccbb web the
+  // socket lands on <base>/mux — the outer /mux is this server's prefix, the inner one
+  // is the mux's own WebSocket path — and a peer's mux rides the peer proxy the same way.
+  v.client = window.createMuxView(host, {
+    base: apiBase(INFO.server) + '/mux',
+    session: INFO.sessionId,
+    label: 'web-' + INFO.sessionId.slice(0, 4),
+    bar: false,
+    onChrome: function(c){
+      titleEl.textContent = c.label;
+      titleEl.title = c.cwd || '';
+      // Matches every other view's dot: green pulsing while working, amber when idle,
+      // grey when the socket is gone.
+      dotEl.className = 'status-dot' + (c.connected ? ' live' : '') + (c.status === 'idle' ? ' idle' : '');
+      dotEl.title = c.connected ? (c.status || '') : 'disconnected';
+      modeEl.textContent = c.connected ? c.permissionMode : 'disconnected';
+    },
+  });
+  // closeView calls this; without it the client's reconnect timer outlives the view and
+  // the mux goes on counting a client nobody can see. closeSession goes further: closing
+  // the tab is how you say you're done, and a mux session with nobody attached is a
+  // claude process nobody can see either. The mux only acts on it if the room is
+  // empty — another browser, or a terminal on ccbb attach, keeps it alive.
+  v.destroy = function(){ try { v.client.destroy({ closeSession: true }); } catch(e){} };
+  v.refresh = function(){};
+  return v;
+}
 
 function createSessionView(INFO){
   var v = { kind:'session', sessionId: INFO.sessionId, server: INFO.server || null, maxed:false, unseen:false };
@@ -1883,7 +2021,7 @@ function createSessionView(INFO){
   var headEl = document.createElement('div');
   headEl.className = 'sv-stats';
   headEl.innerHTML = '<span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status"></div>';
-  el.appendChild(makeViewBar(v, barMain, { close:true, term:true, menu:true, headEl:headEl }));
+  el.appendChild(makeViewBar(v, barMain, { close:true, term:true, menu:true, resume:true, headEl:headEl }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
 
@@ -2887,6 +3025,11 @@ function createSessionView(INFO){
   }
   function setDrivable(ok) {
     canDrive = ok;
+    // The same fact drives both: a session running in a tmux pane here is already
+    // being worked on and this view can drive it, so there is nothing to resume. One
+    // with no pane is inert — the mux is the only way to make it answer.
+    var rb = el.querySelector('.vb-resume');
+    if (rb) rb.hidden = ok;
     if (ok) {
       sendBtn.title = SEND_TIP;
       inputBox.placeholder = 'Message the session…  (/compact, // for commands)';
@@ -3090,6 +3233,39 @@ function createSessionView(INFO){
     if (gapObserver) { try { gapObserver.disconnect(); } catch(e) {} }
     if (scrollObserver) { try { scrollObserver.disconnect(); } catch(e) {} }
     if (ws) { try { ws.close(); } catch(e) {} }
+  };
+
+  // Resume in the mux. This session has no pane here, so this view can show it but
+  // not drive it; the mux can start a claude child on the same transcript, and then
+  // it is drivable from the browser with no terminal anywhere. Resuming IN PLACE keeps
+  // the session id, so the row, the file on disk and this view all go on naming one
+  // thing — which is also why the transcript view has to close before the mux view
+  // opens: openSession dedupes on (server, id) and would otherwise just re-focus this.
+  v.onResume = function(){
+    if (RO) return;
+    var btn = el.querySelector('.vb-resume');
+    if (btn) btn.disabled = true;
+    fetch(API+'/mux/api/sessions', { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ resume: INFO.sessionId, cwd: INFO.projectPath || undefined,
+        label: INFO.title || undefined }) })
+      .then(function(r){ return r.json().then(function(d){ return { code:r.status, d:d }; }); })
+      .then(function(r){
+        // 409 running-in-mux is not a failure: the thing the button would have made
+        // already exists, and what was wanted was to look at it. Every other refusal
+        // leaves this view standing — closing first and asking after would lose the
+        // user's transcript to a race they can't see.
+        var ok = r.code === 200 || (r.code === 409 && r.d && r.d.reason === 'running-in-mux');
+        if (!ok) {
+          if (btn) btn.disabled = false;
+          toast((r.d && r.d.error) || 'Could not resume this session in the mux');
+          return;
+        }
+        var sess = r.d && r.d.session;
+        closeView(v);
+        openSession((sess && sess.id) || INFO.sessionId, INFO.server, true,
+          (sess && sess.label) || INFO.title || '');
+      })
+      .catch(function(e){ if (btn) btn.disabled = false; toast('Resume failed: '+e); });
   };
 
   renderTitle();
@@ -3654,8 +3830,13 @@ if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
 // ── Page HTML assembly ─────────────────────────────────────────────────────────
 function appPageHtml(initOpenSessionId, initOpenServer, ro) {
   const open = initOpenSessionId ? { sessionId: initOpenSessionId, server: initOpenServer || null } : null;
-  return APP_HTML.replace('__APP_JS__',
+  return APP_HTML
+    .replace('__CCBB_CSS__', () => APP_CSS)
+    .replace('__MUX_CSS__', () => (muxWeb ? muxWeb.APP_CSS : ''))
+    .replace('__MUX_JS__', () => (muxWeb ? muxWeb.APP_JS : ''))
+    .replace('__APP_JS__',
     () => APP_JS
+      .replace('__SHARED_JS__', () => SHARED_JS)
       .replace('__PRICING__', () => JSON.stringify(priceTable))
       .replace('__SELF__', () => JSON.stringify(serverIdentity()))
       .replace('__RO__', () => JSON.stringify(!!ro))
@@ -3703,8 +3884,13 @@ const listClients = new Set();   // { ws, month, rows: Map<sessionId, json>, tot
 const clients = new Map();       // sessionId → Set<ws>, the open session views
 let listUnwatch = null;
 
+// The one place the session list is built — the HTTP route, the socket's opening
+// snapshot and every delta push all come through here, so merging the mux's rows
+// at this single point is what puts them in the live list rather than only in a
+// reload of it.
 function listSnapshot(month) {
-  return getSessions(month ? { period: 'month', key: month } : null);
+  const snap = getSessions(month ? { period: 'month', key: month } : null);
+  return muxWeb && mux ? muxWeb.mergeMuxRows(snap, mux) : snap;
 }
 
 function sendList(c, snap) {
@@ -4724,9 +4910,15 @@ function closeAllTerms() {
   for (const t of Array.from(terms.values())) killTermChild(t);
   terms.clear();
 }
-process.on('exit', closeAllTerms);
+// The mux's children are real `claude` processes and this process is their parent.
+// Standalone, the daemon dying reaped them; here nothing else would.
+function closeMux() {
+  if (mux) { try { mux.killAll(); } catch {} }
+  try { fs.unlinkSync(path.join(CLAUDE_DIR, 'ccbb-mux', 'address')); } catch {}
+}
+process.on('exit', () => { closeAllTerms(); closeMux(); });
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.on(sig, () => { closeAllTerms(); process.exit(0); });
+  process.on(sig, () => { closeAllTerms(); closeMux(); process.exit(0); });
 }
 
 // Backstop. The grace timer normally does this, but a terminal that never had a socket
@@ -5285,12 +5477,17 @@ function runWeb(args) {
 
     const isDesktopPage = method === 'GET' && (pathname === '/' || pathname === '/index.html' ||
       /^\/session\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/session\/[^/]+$/.test(pathname));
+    // The mux client, local or on a peer. Deliberately NOT a "desktop page": that
+    // predicate drives the redirect to /m, which would rewrite this to /m/mux/s/<id>
+    // and 404. The page is responsive, so a phone gets the same one.
+    const isMuxPage = method === 'GET' &&
+      (/^\/mux\/s\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/mux\/s\/[^/]+$/.test(pathname));
     const isMobilePage = method === 'GET' && (pathname === '/m' || pathname === '/m/' ||
       pathname === '/m/index.html' || /^\/m\/session\/[^/]+$/.test(pathname) ||
       /^\/m\/peer\/[^/]+\/session\/[^/]+$/.test(pathname));
     // Both UIs' pages: what the ?token=… hand-off and the HTML 401 apply to. A /m page
     // left out here would take the JSON-401 branch and could never bank the token.
-    const isPage = isDesktopPage || isMobilePage;
+    const isPage = isDesktopPage || isMobilePage || isMuxPage;
 
     // The app icons, ahead of the token check on purpose. They are seven rectangles and
     // two circles — they say nothing about this machine or the sessions on it — and the
@@ -5348,6 +5545,30 @@ function runWeb(args) {
         return res.end();
       }
     }
+    // ── the mux, on this port ───────────────────────────────────────────────
+    // Mux sessions are listed here alongside the tmux ones, so they have to be
+    // openable here too: a phone or an ssh forward that already reaches ccbb must
+    // not need a second route, a second port and a second token to reach the mux.
+    // Everything under /mux/ is handed to the mux with our own credentials added on
+    // this side, so the browser never holds the mux's token.
+    //
+    // Placed BELOW the ?token=… hand-off and the /m redirect on purpose. Above them
+    // it answered first, so a mux page never banked its cookie: open it once with a
+    // token, come back without one, get a 401 — on the client the proxy exists for.
+    if (pathname === '/mux' || pathname.startsWith('/mux/')) {
+      if (!mux) return send(res, 501, { error: 'ccbb-mux is not installed' });
+      // A mux client submits turns and answers permission prompts, so it is a write
+      // surface — a read-only caller is refused rather than shown a page whose every
+      // control fails. Their list row points at the transcript view instead.
+      if (ro) return send(res, 403, { error: 'read-only' });
+      // The index page links relatively, so it only resolves under a trailing slash.
+      if (pathname === '/mux') { res.writeHead(302, { Location: '/mux/' }); return res.end(); }
+      // A direct call, not a proxy hop. The prefix is stripped here because only this
+      // side knows how much of the path is ours; req.url is left alone so that every
+      // later handler still sees the URL that was actually asked for.
+      return mux.onHttp(req, res, req.url.slice(4) || '/');
+    }
+
     // marked/xterm, fetched by us and cached — see ccbb-mobile.js.
     if (method === 'GET' && serveVendor(pathname, res)) return;
     if (isMobilePage) {
@@ -5406,7 +5627,7 @@ function runWeb(args) {
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');
       const filter = mk && /^\d{4}-\d{2}$/.test(mk) ? { period: 'month', key: mk } : null;
-      return send(res, 200, getSessions(filter));
+      return send(res, 200, listSnapshot(filter ? filter.key : null));
     }
     if (method === 'GET' && pathname === '/api/cost-summary') return send(res, 200, getCostSummary());
     // This server's Claude.ai plan windows. `{}` — not a 404 — when it isn't on a
@@ -5558,9 +5779,36 @@ function runWeb(args) {
     send(res, 404, { error: 'Not found' });
   });
 
+  // In-process, so the mux can simply say when a row moved — no poll, no cache, and
+  // no window where the list is up to two seconds stale. Coalesced because several
+  // row-moving events land together at the end of a turn (result, then status), and
+  // each push walks every open browser's session list.
+  if (mux) {
+    let pending = null;
+    mux.onChange = () => {
+      if (pending) return;
+      pending = setTimeout(() => { pending = null; try { pushListDeltas(); } catch {} }, 120);
+      if (pending.unref) pending.unref();
+    };
+  }
+
   server.listen(port, host, () => {
     const self = serverIdentity();
     console.log(`ccbb http://127.0.0.1:${port}  (server "${self.name}" on ${self.hostname})`);
+    // The mux has no address of its own to publish, so ccbb web publishes one for it:
+    // our port, our pid, and the prefix we host it under. `ccbb mux ls` and
+    // `ccbb attach` read this file, and the pid is what tells them a file left behind
+    // by a dead server is not a running mux.
+    if (mux) {
+      try {
+        const dir = path.join(CLAUDE_DIR, 'ccbb-mux');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'address'), JSON.stringify({
+          port, host: '127.0.0.1', prefix: '/mux', pid: process.pid, startedAt: new Date().toISOString(),
+        }), { mode: 0o600 });
+      } catch {}
+      console.log('ccbb: mux running in-process — ccbb new / ccbb ls --mux, open at /mux/s/<id>');
+    }
     if (host !== '127.0.0.1') for (const a of lanAddrs()) console.log(`ccbb http://${a}:${port}`);
     const peers = peerList();
     if (peers.length) console.log(`ccbb peers: ${peers.map(p => p.name + ' → ' + p.url).join(', ')}`);
@@ -5609,6 +5857,13 @@ function runWeb(args) {
       // A socket has no status code to refuse with that a browser would show, so a
       // read-only caller reaching for a peer, a peer link or a shell just gets nothing.
       const ro = level === 'read';
+      // The mux's own socket, reached through our port — the other half of the /mux
+      // proxy above. Without it the page would load from here and then try to open a
+      // socket against a port the caller may have no route to.
+      if (/^\/mux\//.test(url.split('?')[0])) {
+        if (ro || !mux) return socket.destroy();
+        return wss.handleUpgrade(req, socket, head, ws => mux.onWs(ws, req));
+      }
       // A peer opening its reverse channel to us. It authenticated above like any other
       // request; from here on we can call back into it whenever the UI asks.
       if (/^\/peer-link(\?|$)/.test(url)) {
@@ -5726,11 +5981,18 @@ function runWeb(args) {
 
 module.exports = {
   runWeb, DEFAULT_PORT,
+  // Page assets the standalone mux page serves too, so both pages get ONE copy.
+  APP_CSS, SHARED_JS,
   // Server-side seam shared with the in-process front-ends (webex/confluence). They
   // subscribe to the event bus and drive sessions through the SAME hook+scrape path.
   onServerEvent, activePrompts,
   answerPrompt, answerAsk, runCommand,
   startWatching, stopWatching, startPaneWatch, stopPaneWatch,
 };
+
+// Handed to the mux client rather than required back out of here: it requires this
+// file for mount(), so a require in the other direction lands mid-evaluation and gets
+// an exports object these two are not on yet.
+if (muxWeb && muxWeb.setHostAssets) muxWeb.setHostAssets({ APP_CSS, SHARED_JS });
 
 if (require.main === module) runWeb(process.argv.slice(2));

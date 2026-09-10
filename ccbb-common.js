@@ -1010,6 +1010,15 @@ function procStartTime(pid) {
 // One directory read → sessionId → sidecar record for every live session. When a session
 // has several live pids (a resume racing the old process), the most recently updated one
 // wins. Records are the raw sidecar plus a normalized `status`.
+// A JSON-mode child owned by `ccbb mux` writes the same ~/.claude/sessions record an
+// interactive one does, but it is NOT a tmux session: it is a subprocess of the mux daemon,
+// and climbing its ancestry lands on whatever pane the daemon happens to be running in.
+// Left unfiltered, ccbb adopts the daemon's own terminal as the session's pane — it pipes
+// that pane for permission scraping and, worse, injectToPane types the user's message into
+// it. The mux supplies liveness for its own sessions over its API, which is the better
+// source anyway; on an install with no mux these are correctly just not-live.
+function isMuxRecord(d) { return !!d && d.entrypoint === 'ccbb-mux'; }
+
 function liveSessionRecords() {
   const sessionsDir = path.join(CLAUDE_DIR, 'sessions');
   const out = new Map();
@@ -1019,7 +1028,7 @@ function liveSessionRecords() {
     if (!f.endsWith('.json')) continue;
     let d;
     try { d = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8')); } catch { continue; }
-    if (!d || !d.sessionId || !pidAlive(d.pid, d.procStart)) continue;
+    if (!d || !d.sessionId || isMuxRecord(d) || !pidAlive(d.pid, d.procStart)) continue;
     const rec = {
       sessionId: d.sessionId, pid: Number(d.pid), cwd: d.cwd || '',
       name: d.name || '', status: d.status || 'unknown',
@@ -1054,7 +1063,7 @@ function livePidsForSession(sessionId) {
   for (const f of files) {
     if (!f.endsWith('.json')) continue;
     let d; try { d = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { continue; }
-    if (d && d.sessionId === sessionId && d.pid && pidAlive(d.pid, d.procStart)) out.add(Number(d.pid));
+    if (d && d.sessionId === sessionId && !isMuxRecord(d) && d.pid && pidAlive(d.pid, d.procStart)) out.add(Number(d.pid));
   }
   return out;
 }
