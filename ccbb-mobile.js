@@ -228,6 +228,19 @@ body.has-max .panel:not(.max){display:none}
   min-height:var(--head-h);background:var(--bg-alt);border-bottom:1px solid var(--line)}
 .panel.min .phead{border-bottom:none}
 .pbody{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+/* A mux panel's whole body is the mux client, which is its own flex column. Its own
+   sheet gives it height:100%, which in a flex column is measured against a parent that
+   has not sized itself yet — so it is told to flex instead. */
+.pbody>.muxv{flex:1 1 auto;min-height:0;height:auto}
+/* The desktop composer this view borrows centres itself on a 740px column and pads for
+   a mouse. On a 390px screen that padding is most of the gutter. */
+.pbody>.muxv .input-area{padding:8px 10px}
+.pbody>.muxv .mx-wrap{padding:0 10px}
+/* The one rule of this file's own that reaches INTO the mux view and wins there: the
+   phone draws a user turn's bubble on .msg.you, the desktop draws it on .msg.you
+   .msg-body, and with both in the page the turn came out as a bubble inside a bubble.
+   The desktop's is the one this view is dressed in, so the phone's is turned off. */
+.pbody>.muxv .msg.you{background:none;border-radius:0;padding:0}
 .ptitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   font-weight:600;font-size:14px}
 .pbtns{margin-left:auto;display:flex;align-items:center;gap:2px;flex-shrink:0}
@@ -249,9 +262,15 @@ body.has-max .panel:not(.max){display:none}
 .panel:not(.menu) .subhead{display:none}
 .pbtn.pdots{font-size:18px}
 .panel.menu .pbtn.pdots{color:var(--accent)}
-.dot{flex-shrink:0;width:9px;height:9px;border-radius:50%;background:var(--ink-faint)}
-.dot.live{background:var(--ok);animation:pulse 2s infinite}
-.dot.idle{background:#d4a72c}
+/* Colour is what the session is doing, shape is how you reach it — the same mark ccbb
+   web's list and session page draw. Colour rides on the color property so the dot and
+   the mux's M share one palette and only the shape branches. */
+.dot{flex-shrink:0;width:9px;height:9px;border-radius:50%;background:currentColor;color:var(--ink-faint)}
+.dot.live{color:var(--ok);animation:pulse 2s infinite}
+.dot.idle{color:#d4a72c;animation:none}
+.dot.mux{width:14.6px;height:9px;border-radius:0;background:none}
+.dot.mux svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;
+  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .ago{font-size:11.5px;color:var(--ink-faint);flex-shrink:0}
 /* ── session list ── */
@@ -275,9 +294,6 @@ body.has-max .panel:not(.max){display:none}
 .srow .r1{display:flex;align-items:center;gap:7px;min-width:0}
 .srow .stitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14.5px}
 .srow .stime{flex-shrink:0;font-size:11.5px;color:var(--ink-faint);font-variant-numeric:tabular-nums}
-.mux-tag{flex-shrink:0;font-size:9px;letter-spacing:.04em;text-transform:uppercase;
-  color:var(--accent);border:1px solid var(--accent-soft);background:var(--accent-soft);
-  border-radius:3px;padding:0 4px}
 .srv{flex-shrink:0;font-size:10.5px;font-weight:700;letter-spacing:.02em;text-transform:uppercase;
   color:var(--ink-soft);background:var(--bg-alt);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
 .srv.local{color:var(--accent);border-color:var(--accent-soft);background:var(--accent-soft)}
@@ -392,6 +408,15 @@ body.has-max .panel:not(.max){display:none}
 .tool-toggle{flex-shrink:0;color:var(--ink-faint);font-size:10px;width:14px;text-align:center}
 .tool-body{display:none;border-top:1px solid var(--line)}
 .tool-body.open{display:block}
+.subagent-body{display:none}
+.subagent-body.open{display:block}
+/* The same slide ccbb web's cards use (slideOpen, from the shared helpers): the height
+   moves instead of the card cutting in, and the padding and the top rule travel with it —
+   box-sizing is border-box, so a height of 0 alone would leave a stripe behind. Laid out
+   only while it moves; closed and settled it is display:none exactly as before. */
+.tool-body.sliding,.subagent-body.sliding{display:block;overflow:hidden;
+  transition:height .2s cubic-bezier(.4,0,.2,1),padding .2s cubic-bezier(.4,0,.2,1),
+             border-width .2s cubic-bezier(.4,0,.2,1)}
 .tool-input,.tool-output{padding:8px 11px}
 .tool-input pre,.tool-output pre{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
   line-height:1.45;white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;
@@ -619,11 +644,23 @@ body.comp-max .pbody.cmax .cbox::after{display:none}
   background:#3d3d3a;color:#fff;border-radius:12px;padding:11px 14px;font-size:13px;z-index:300;
   display:none;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none}
 </style>
+<!-- The mux client's stylesheet, and the slice of ccbb web's that it borrows. Both are
+     scoped under .muxv, so a mux panel gets the desktop's composer, tool cards and
+     status line while every other panel keeps the phone's own. Last in the head, so a
+     tie on specificity goes to the view that asked for them. -->
+<style>__MUX_HOST_CSS__</style>
+<style>__MUX_CSS__</style>
 </head>
 <body>
 <div id="stack"></div>
 <div id="termwrap"></div>
 <div id="toast"></div>
+<!-- ccbb web's shared helpers first: the mux client calls asTextarea, footWin and the
+     composer's tooltip strings by name. MOBILE_JS is last and redefines the handful of
+     formatters it wants differently, which is exactly the order that leaves the phone's
+     own versions in force everywhere outside the mux view. -->
+<script>__MUX_SHARED_JS__</script>
+<script>__MUX_JS__</script>
 <script>
 __APP_JS__
 </script>
@@ -645,8 +682,9 @@ var INIT_OPEN = __INIT_OPEN__;
 // /peer/<name>. Note these are absolute — the page lives under /m, the API does not.
 function isLocal(server){ return !server || server === SELF.name; }
 function apiBase(server){ return isLocal(server) ? '' : '/peer/'+encodeURIComponent(server); }
-function mobileHref(sid, server){
-  return isLocal(server) ? '/m/session/'+sid : '/m/peer/'+encodeURIComponent(server)+'/session/'+sid;
+function mobileHref(sid, server, mux){
+  var tail = (mux ? '/mux/s/' : '/session/') + sid;
+  return isLocal(server) ? '/m'+tail : '/m/peer/'+encodeURIComponent(server)+tail;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -985,13 +1023,14 @@ function createListPanel(){
       rowsEl.innerHTML = errors.length ? '' : '<div class="lmsg">'+(waiting ? 'Loading…' : 'No sessions yet.')+'</div>';
     } else {
       rowsEl.innerHTML = sessions.map(function(s){
-        var live = s.live ? ' live' : '';
+        // Green working, amber alive and waiting, grey gone — and an M rather than a dot
+        // when the session is driven over the mux, which used to need a tag of its own.
+        var live = s.live ? (s.liveStatus === 'idle' ? ' idle' : ' live') : '';
         return '<div class="srow" data-sid="'+esc(s.sessionId)+'" data-srv="'+esc(s.server||'')+'"'+
             (s.mux ? ' data-mux="1"' : '')+'>'+
           '<div class="r1">'+
-            '<span class="dot'+live+'"></span>'+
+            '<span class="dot'+live+(s.mux ? ' mux' : '')+'">'+(s.mux ? MUX_GLYPH : '')+'</span>'+
             '<span class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</span>'+
-            (s.mux ? '<span class="mux-tag">mux</span>' : '')+
             '<span class="stitle">'+esc(s.title || '(untitled)')+'</span>'+
             '<span class="stime">'+esc(rel(s.lastActivity || s.startedAt))+'</span>'+
           '</div>'+
@@ -1029,14 +1068,12 @@ function createListPanel(){
   rowsEl.addEventListener('click', function(e){
     var r = e.target.closest('[data-sid]');
     if (!r) return;
-    // A mux session has no pane to tail, so there is no panel to open: leave the
-    // phone UI for the mux client, proxied through this server (or through the peer
-    // that owns it). This is the case the whole proxy exists for — a phone reaches
-    // ccbb and nothing else, so a link straight to the mux's port would go nowhere.
-    if (r.dataset.mux && !RO) {
-      var srv = r.dataset.srv;
-      var base = (srv && srv !== SELF.name) ? '/peer/'+encodeURIComponent(srv) : '';
-      location.href = base + '/mux/s/' + r.dataset.sid;
+    // A mux session opens as a panel like any other, and behaves like one — the
+    // accordion, maximize, >_ and close are the phone's, and only the content inside is
+    // the mux client's. It used to navigate away to the standalone /mux/s page, which
+    // left the app for a page with its own bar and no way back into the stack.
+    if (r.dataset.mux && !RO && window.createMuxView) {
+      openMuxSession(r.dataset.sid, r.dataset.srv || null);
       return;
     }
     openSession(r.dataset.sid, r.dataset.srv || null);
@@ -1287,6 +1324,116 @@ function createListPanel(){
     for (var n in socks) closeSocket(n);
   };
   loadServers().then(function(){ load(); loadMonths(); loadSubs(); });
+  return p;
+}
+
+// ── mux session panel ─────────────────────────────────────────────────────────
+// A mux session is driven over the mux's own WebSocket protocol, so this panel HOSTS
+// ccbb-mux-web.js's client (window.createMuxView) rather than tailing a tmux pane. The
+// panel around it is the phone's own: the same header, the same accordion, the same
+// maximize / >_ / close, so it opens and closes like every other session here.
+//
+// bar:false — the client's own bar (label, cwd, permission-mode select, Stop, a link back
+// to a session index) duplicates a header this app already draws, and its select put a
+// permission mode in the title where a title belongs. What that bar carried and this one
+// needs — status, the working directory, who else is attached — comes up through onChrome
+// and lands in the subhead behind ⋮.
+function openMuxSession(sid, server){
+  var existing = panels.filter(function(p){ return p.kind==='mux' && p.sessionId===sid && (p.server||null)===(server||null); })[0];
+  if (existing) { setState(existing, 'exp'); return existing; }
+  var p = createMuxPanel(sid, server || null);
+  addPanel(p);
+  setState(p, 'exp');
+  try { history.replaceState(null, '', mobileHref(sid, server, true)); } catch(e){}
+  return p;
+}
+
+function createMuxPanel(sid, server){
+  var p = { kind:'mux', sessionId:sid, server:server, state:'min' };
+  var API = apiBase(server);
+  var SRV = server || SELF.name;
+  var root = el('div','panel');
+  p.el = root;
+
+  var head = el('div','phead',
+    '<span class="dot mux" data-r="dot" title="Driven over the mux protocol, not a tmux pane">'+MUX_GLYPH+'</span>'+
+    '<span class="srv'+(isLocal(server)?' local':'')+'">'+esc(SRV)+'</span>'+
+    '<span class="ptitle" data-r="title">'+esc(sid.slice(0,8))+'</span>');
+  head.appendChild(headButtons([
+    { k:'max', html:ICON.max, title:'Maximize' },
+    { k:'term', html:ICON.term, title:'Terminal' },
+    { k:'close', html:ICON.close, title:'Close' },
+  ].filter(function(b){ return !(RO && b.k === 'term'); }), true));
+  root.appendChild(head);
+
+  var body = el('div','pbody',
+    '<div class="subhead">'+
+      '<div class="sdir" data-r="dir"></div>'+
+      '<div class="swhen" data-r="when"></div>'+
+    '</div>');
+  root.appendChild(body);
+  var host = el('div');
+  body.appendChild(host);
+
+  var dotEl = head.querySelector('[data-r="dot"]');
+  var titleEl = head.querySelector('[data-r="title"]');
+  var dirEl = body.querySelector('[data-r="dir"]');
+  var whenEl = body.querySelector('[data-r="when"]');
+
+  var client = window.createMuxView(host, {
+    base: API + '/mux',
+    session: sid,
+    label: 'phone-' + sid.slice(0, 4),
+    bar: false,
+    onChrome: function(c){
+      titleEl.textContent = c.title || sid.slice(0,8);
+      dirEl.textContent = ltr(c.cwd || '');
+      // 'exited' is the case the desktop used to miss too: the child is gone but the
+      // socket is not, and "connected" alone painted a finished session green.
+      var alive = c.connected && c.status !== 'exited' && c.status !== 'gone';
+      dotEl.className = 'dot mux' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
+      var bits = [c.connected ? (c.status || 'idle') : 'disconnected'];
+      if (c.permissionMode) bits.push('mode ' + c.permissionMode);
+      if (c.info && c.info.model) bits.push(prettyModel(c.info.model));
+      if (c.clients && c.clients.length > 1) bits.push(c.clients.length + ' controllers');
+      whenEl.textContent = bits.join('  ·  ');
+    },
+  });
+
+  function foldMenu(){
+    root.classList.remove('menu');
+    document.removeEventListener('click', onOutside, true);
+  }
+  function onOutside(e){ if (!head.contains(e.target)) foldMenu(); }
+  head.addEventListener('click', function(e){
+    var b = e.target.closest('.pbtn');
+    if (!b) { if (p.state === 'min') setState(p, 'exp'); return; }
+    var k = b.dataset.k;
+    if (k === 'menu') {
+      if (root.classList.toggle('menu')) document.addEventListener('click', onOutside, true);
+      else document.removeEventListener('click', onOutside, true);
+      return;
+    }
+    foldMenu();
+    if (k === 'max') setState(p, p.state === 'max' ? 'exp' : 'max');
+    // The server resolves this: the pane a ccbb attach is sitting in if there is one,
+    // otherwise a fresh tmux window in the session's directory, otherwise a login shell
+    // there. Nothing about that is the phone's business.
+    else if (k === 'term') openTerminal(server, sid);
+    else if (k === 'close') removePanel(p);
+  });
+  p.onState = function(){
+    var mx = head.querySelector('[data-k="max"]');
+    mx.innerHTML = p.state === 'max' ? ICON.restore : ICON.max;
+    mx.classList.toggle('on', p.state === 'max');
+  };
+  // Closing the panel is how you say you are done with the session — the same meaning the
+  // desktop gives it. The mux only acts on it if the room is then empty; another browser,
+  // or a ccbb attach, keeps the child alive.
+  p.destroy = function(){
+    foldMenu();
+    try { client.destroy({ closeSession: true }); } catch(e){}
+  };
   return p;
 }
 
@@ -1613,7 +1760,7 @@ function createSessionPanel(sid, server){
         sa.innerHTML = '<div class="subagent-hdr" data-sub="'+esc(id)+'" data-agent="'+esc(subagent.agentId||'')+'">'+
           '<span class="tool-toggle">&#9654;</span> Subagent transcript'+
           (subagent.agentType?' · '+esc(subagent.agentType):'')+'</div>'+
-          '<div class="subagent-body" id="sab-'+id+'" hidden></div>';
+          '<div class="subagent-body" id="sab-'+id+'"></div>';
         outEl.parentNode.appendChild(sa);
       }
       if (askCards[id]) settleAsk(id);
@@ -1624,9 +1771,9 @@ function createSessionPanel(sid, server){
     var bodyEl2 = document.getElementById('sab-'+toolId), block = document.getElementById('sa-'+toolId);
     if (!bodyEl2 || !block) return;
     var tg = block.querySelector('.tool-toggle');
-    var open = bodyEl2.hasAttribute('hidden');
-    if (open) bodyEl2.removeAttribute('hidden'); else bodyEl2.setAttribute('hidden','');
+    var open = !bodyEl2.classList.contains('open');
     if (tg) tg.innerHTML = open ? '&#9660;' : '&#9654;';
+    slideOpen(bodyEl2, open, function (o) { bodyEl2.classList.toggle('open', o); });
     if (open && bodyEl2.dataset.loaded !== '1') {
       bodyEl2.dataset.loaded = '1';
       bodyEl2.innerHTML = '<div class="subagent-loading">Loading…</div>';
@@ -2153,9 +2300,10 @@ function createSessionPanel(sid, server){
     if (!hdr) return;
     var bodyEl2 = hdr.parentNode.querySelector('.tool-body');
     if (!bodyEl2) return;
-    var open = bodyEl2.classList.toggle('open');
+    var open = !bodyEl2.classList.contains('open');
     var tg = hdr.querySelector('.tool-toggle');
     if (tg) tg.innerHTML = open ? '&#9660;' : '&#9654;';
+    slideOpen(bodyEl2, open, function (o) { bodyEl2.classList.toggle('open', o); });
   });
 
   // — header buttons —
@@ -2627,21 +2775,36 @@ window.addEventListener('pagehide', function(e){
 var listPanel = createListPanel();
 addPanel(listPanel);
 setState(listPanel, 'exp');
-if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
+if (INIT_OPEN) {
+  if (INIT_OPEN.mux && window.createMuxView) openMuxSession(INIT_OPEN.sessionId, INIT_OPEN.server);
+  else openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
+}
 `;
+
+// ccbb-web.js HANDS these over rather than being required back: it requires this file,
+// so a require in the other direction lands mid-evaluation and gets an exports object
+// these are not on yet. Absent, the mux panel simply cannot be built and a mux row falls
+// back to the standalone page.
+let MUX = null;
+function setMuxAssets(a) { MUX = a || null; }
 
 // Same assembly as the desktop page: one substitution per value, each with a function
 // replacement so a "$&" or "$1" inside the JSON can never be read as a backreference.
-function mobilePageHtml(initOpenSessionId, initOpenServer, self, priceTable, ro) {
+function mobilePageHtml(initOpenSessionId, initOpenServer, self, priceTable, ro, initMux) {
   const open = initOpenSessionId
-    ? { sessionId: initOpenSessionId, server: initOpenServer || null }
+    ? { sessionId: initOpenSessionId, server: initOpenServer || null, mux: !!initMux }
     : null;
-  return MOBILE_HTML.replace('__APP_JS__',
-    () => MOBILE_JS
-      .replace('__PRICING__', () => JSON.stringify(priceTable))
-      .replace('__SELF__', () => JSON.stringify(self))
-      .replace('__RO__', () => JSON.stringify(!!ro))
-      .replace('__INIT_OPEN__', () => JSON.stringify(open)));
+  return MOBILE_HTML
+    .replace('__MUX_HOST_CSS__', () => (MUX && MUX.hostCss) || '')
+    .replace('__MUX_CSS__', () => (MUX && MUX.muxCss) || '')
+    .replace('__MUX_SHARED_JS__', () => (MUX && MUX.sharedJs) || '')
+    .replace('__MUX_JS__', () => (MUX && MUX.muxJs) || '')
+    .replace('__APP_JS__',
+      () => MOBILE_JS
+        .replace('__PRICING__', () => JSON.stringify(priceTable))
+        .replace('__SELF__', () => JSON.stringify(self))
+        .replace('__RO__', () => JSON.stringify(!!ro))
+        .replace('__INIT_OPEN__', () => JSON.stringify(open)));
 }
 
-module.exports = { mobilePageHtml, isMobileUA, serveVendor };
+module.exports = { mobilePageHtml, isMobileUA, serveVendor, setMuxAssets };

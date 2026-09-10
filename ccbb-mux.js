@@ -31,7 +31,9 @@
 //      state, so stdin stays open for the child's whole life regardless of who is
 //      watching.
 //   3. Late joiners must not see a half-session. Every client event is numbered,
-//      so an attach is either a full snapshot or a delta replay from `sinceSeq`.
+//      so an attach is either a full snapshot or a delta replay from `sinceSeq` —
+//      and a seq is only meaningful with the `epoch` it was counted in, because a
+//      restarted mux resumes the same session id with a ring that counts from 1.
 //
 // Protocol notes that came out of reading the VS Code extension's own bundle and
 // then verifying against a live child (see ccbb-mux-plan.md):
@@ -58,6 +60,18 @@ const MUX_DIR = path.join(CLAUDE_DIR, 'ccbb-mux');       // logs + the daemon's 
 const DELTA_COALESCE_MS = 50;      // token deltas are batched to this cadence per client
 const LOG_RING = 5000;             // client events kept in memory for sinceSeq replay
 const HISTORY_SEED = 1200;         // transcript turns replayed into a --resume, newest-last
+const THINK_COALESCE_MS = 400;     // the child's thinking-token counter, batched to this
+
+// The CLI's spinner vocabulary, and the past-tense verbs it closes a turn with. The
+// exact lists are not published; these are the ones the fidelity capture turned up.
+// They live HERE, in the module both clients require, because both draw the spinner —
+// the terminal one has since ccbb-mux-tui.js was written, the web one now too — and two
+// copies would drift the moment either learned a new word.
+const TURN_VERBS = ['Baked', 'Worked', 'Crunched', 'Cogitated', 'Meandered', 'Puzzled',
+  'Mustered', 'Simmered', 'Percolated', 'Noodled', 'Pondered', 'Mulled'];
+const SPIN_VERBS = ['Mulling', 'Meandering', 'Puzzling', 'Mustering', 'Simmering',
+  'Percolating', 'Noodling', 'Pondering', 'Baking'];
+const SPIN_FRAMES = ['\u273d', '\u273b', '\u2733', '\u2736', '\u2737', '\u2735'];
 
 function uuid() { return crypto.randomUUID(); }
 function nowIso() { return new Date().toISOString(); }
@@ -200,6 +214,11 @@ const ROW_KINDS = new Set(['init', 'status', 'result', 'mode', 'model',
 // and neither can drift from the other.
 const CMD_OUT = /<local-command-(stdout|stderr)>([\s\S]*?)<\/local-command-\1>/;
 const CMD_RUN = /<command-name>\s*\/?([^<\s]*)[^<]*<\/command-name>(?:[\s\S]*?<command-args>([\s\S]*?)<\/command-args>)?/;
+// The harness's note to the model around a locally-typed slash command. A message that
+// is ONLY this is plumbing; one that merely contains it is a person quoting it.
+const CAVEAT_ONLY = /^<local-command-caveat>[\s\S]*<\/local-command-caveat>$/;
+// Likewise: a message that IS a background task reporting back, not one quoting one.
+const TASK_NOTE_ONLY = /^<task-notification>[\s\S]*<\/task-notification>$/;
 function parseCommand(text) {
   if (!text || text.indexOf('<') === -1) return null;
   const o = CMD_OUT.exec(text);
@@ -223,6 +242,14 @@ class Session {
     this.label = opt.label || path.basename(this.cwd);
 
     this.seq = 0;
+    // Which INCARNATION of this session id this is. seq alone cannot say: a mux that
+    // restarts resumes the same session id with a ring that counts from 1 again, so a
+    // page holding seq 40 from the dead process asks for "everything after 40" and the
+    // fresh ring — already past 40 by the time the page reconnects — happily replays
+    // events 41.. of a different process. The page keeps its old transcript, keeps its
+    // old spinner, and the missing status message that would have cleared it is one of
+    // the ones the delta skipped. A seq only means anything inside its own epoch.
+    this.epoch = uuid();
     this.events = [];                 // ring of client events, for sinceSeq replay
     this.clients = new Set();
     this.pending = new Map();         // requestId → { kind, payload, claimedBy }
@@ -231,13 +258,31 @@ class Session {
 
     this.messages = [];               // normalized, render-ready
     this.byToolUseId = new Map();     // tool_use id → its block, for result folding
+    this.pendingCmd = null;           // a slash command whose output has not arrived
+    this.lastCmd = null;              // the most recent command card, answered or not
+    this._compactMeta = null;         // set by compact_boundary, claimed by the summary
     this.state = {
       id: this.id, cwd: this.cwd, label: this.label, status: 'starting',
+      // What every UI calls this session. The LABEL is its address — what `ccbb attach`
+      // takes, unique among live sessions — and it is not a name for reading: it is
+      // whatever the directory was called when the session started. The transcript's
+      // own title is what ccbb's session list has always shown, and showing the label
+      // on the session page meant one session answered to two different names
+      // depending on which screen you were looking at. Seeded to the label so a session
+      // with no transcript yet is not nameless.
+      title: this.label,
       model: null, permissionMode: opt.permissionMode || null,
       tools: [], mcpServers: [], plugins: [], commands: [], slashCommands: [],
       capabilities: [], auth: null, cost: 0, tokens: 0, turns: 0,
+      contextTokens: 0, contextPeak: 0, stats: null,
+      turnStartedAt: null, outTokens: 0, activity: null,
       startedAt: nowIso(), lastActivity: nowIso(), exit: null,
     };
+    // Whether a turn is actually in flight. The child's own 'requesting' cannot answer
+    // this: it says the session is up and asking, and it says it again right after the
+    // result, with nothing afterwards to take it back.
+    this.turnLive = false;
+    this._statusLine = null;          // last status line emitted, for the deduper below
 
     ensureDir(MUX_DIR);
     this.rawLog = fs.createWriteStream(path.join(MUX_DIR, this.id + '.ndjson'), { flags: 'a' });
@@ -269,6 +314,11 @@ class Session {
       try { j = JSON.parse(line); } catch (e) { continue; }
       // The file holds a dozen record types the wire never sends — attachment,
       // file-history-snapshot, mode, custom-title. Only the two that are turns.
+      // The on-disk carrier for a background task reporting back. Not a turn — it is
+      // never rendered — but it is the only record on disk of how a backgrounded call
+      // ended, so it rides along and is replayed in order with the turns it belongs to.
+      if (j.type === 'queue-operation' && j.operation === 'enqueue' &&
+          String(j.content || '').indexOf('<task-notification>') >= 0) { keep.push(j); continue; }
       if (j.type !== 'user' && j.type !== 'assistant') continue;
       if (j.isSidechain) continue;              // a subagent's own thread, not this one's
       // A compact summary is a user message whose content is the ENTIRE prior
@@ -287,7 +337,10 @@ class Session {
     this._seeding = true;
     try {
       for (const j of seed) {
-        try { this.onModelMessage(j, j.type); } catch (e) {}
+        try {
+          if (j.type === 'queue-operation') this.noteTaskNotification(String(j.content || ''));
+          else this.onModelMessage(j, j.type);
+        } catch (e) {}
       }
     } finally { this._seeding = false; }
     // Nothing was emitted (emit() is a no-op while seeding), so seq is still 0 and
@@ -310,10 +363,59 @@ class Session {
     this.child.on('exit', (code, sig) => {
       this.state.status = 'exited';
       this.state.exit = { code, signal: sig };
+      this._statusLine = 'exited';   // keep the deduper in step with the one status it does not send
       this.emit('status', { status: 'exited', exit: this.state.exit });
+      this.refreshStats(300);
       try { this.rawLog.end(); } catch {}
     });
     this.child.on('error', e => this.emit('stderr', { text: `spawn failed: ${e.message}` }));
+    // A resumed session opens with a history that already cost money; a fresh one has a
+    // transcript the moment the child writes its first line. Either way the numbers a
+    // client shows come from the same place ccbb's own session pages read them.
+    this.refreshStats();
+  }
+
+  // ── the numbers ────────────────────────────────────────────────────────────
+  // Cost, turns and context come from the TRANSCRIPT, not from what the mux happened to
+  // watch go past. Three reasons: a resumed session's history is already on disk and its
+  // dollars are real; context is a per-request figure that the very first snapshot has to
+  // carry or a freshly-opened page shows no context at all until the next turn ends; and
+  // ccbb's own session page reads exactly this, so the mux footer and the header block
+  // above it cannot print two different numbers for one session.
+  //
+  // getSessionStats is cache-backed on a (path, size, mtime) signature, so a call with
+  // nothing new to read costs a stat(2). The debounce is for the burst — a result, its
+  // status change and the row notification all land within a few milliseconds — and the
+  // delay lets the child finish flushing the turn it just ended.
+  refreshStats(delay) {
+    if (this.state.status === 'exited' && this._statsDone) return;
+    if (this._statsTimer) return;
+    this._statsTimer = setTimeout(() => {
+      this._statsTimer = null;
+      let st = null;
+      try { st = common.getSessionStats(this.id, {}); } catch (e) { return; }
+      if (!st) return;
+      if (this.state.status === 'exited') this._statsDone = true;
+      const ctx = st.context ? st.context.tokens : 0;
+      const peak = st.contextMax ? st.contextMax.tokens : ctx;
+      const next = {
+        title: st.title || this.label,
+        cost: st.cost || 0, tokens: st.totalTokens || 0,
+        turns: st.turns || 0, subTurns: st.subTurns || 0,
+        contextTokens: ctx, contextPeak: Math.max(peak, ctx),
+        contextMax: (st.context && st.context.max) || 0,
+        contextPostCompact: !!(st.context && st.context.postCompact),
+      };
+      const same = Object.keys(next).every(k => this.state[k] === next[k]);
+      Object.assign(this.state, next);
+      // The whole stats object rides along for the header block ccbb web opens behind
+      // the dots — the same shape /api/session/<id>/stats returns, because it IS that.
+      this.state.stats = st;
+      if (same) return;
+      this.emit('stats', { stats: st, ...next });
+      this.mux.notifyChange();
+    }, delay == null ? 700 : delay);
+    if (this._statsTimer.unref) this._statsTimer.unref();
   }
 
   // ── writing to the child ───────────────────────────────────────────────────
@@ -351,22 +453,26 @@ class Session {
 
   snapshot() {
     return {
-      op: 'snapshot', seq: this.seq,
+      op: 'snapshot', seq: this.seq, epoch: this.epoch,
       state: this.state,
       messages: this.messages,
       pending: [...this.pending.entries()].map(([requestId, p]) => ({ requestId, ...p })),
-      clients: [...this.clients].map(c => ({ label: c.label, kind: c.kind })),
+      clients: [...this.clients].map(c => ({ label: c.label, kind: c.kind, pid: c.pid || null })),
     };
   }
 
   broadcast(msg) { for (const c of this.clients) c.send(msg); }
 
-  attach(client, sinceSeq) {
+  attach(client, sinceSeq, epoch) {
     this.clients.add(client);
     // A reconnecting client that still holds the tail of the log gets a delta —
     // this is the same shape the mobile web client needs after iOS suspends it.
-    if (sinceSeq != null && this.events.length && this.events[0].seq <= sinceSeq + 1) {
-      client.send({ op: 'resumed', seq: this.seq, from: sinceSeq });
+    // The delta is only meaningful if the client's seq was counted by THIS incarnation
+    // (see this.epoch) and this ring still reaches back to it. Anything else — a page
+    // open across a mux restart, a seq from the future — gets the whole snapshot.
+    if (sinceSeq != null && epoch && epoch === this.epoch && sinceSeq <= this.seq &&
+        this.events.length && this.events[0].seq <= sinceSeq + 1) {
+      client.send({ op: 'resumed', seq: this.seq, epoch: this.epoch, from: sinceSeq });
       for (const ev of this.events) if (ev.seq > sinceSeq) client.send(ev);
     } else {
       client.send(this.snapshot());
@@ -380,22 +486,74 @@ class Session {
   }
 
   presence() {
-    this.broadcast({ op: 'presence', clients: [...this.clients].map(c => ({ label: c.label, kind: c.kind })) });
+    this.broadcast({ op: 'presence', clients: [...this.clients].map(c => ({ label: c.label, kind: c.kind, pid: c.pid || null })) });
     this.mux.notifyChange();
   }
 
   // ── client → child ─────────────────────────────────────────────────────────
+  // A turn begins where we begin it. The child's status messages report ON a turn; they
+  // do not delimit one, so this is the only place that can say a turn started and mean
+  // it. It also puts the spinner up on the keystroke rather than on the round trip.
+  beginTurn(activity) {
+    const was = this.state.status;
+    this.turnLive = true;
+    if (was !== 'busy') { this.state.turnStartedAt = Date.now(); this.state.outTokens = 0; }
+    this.state.status = 'busy';
+    this.state.activity = activity || this.state.activity || 'requesting';
+    this.emitStatus();
+  }
+
+  // The one place a status reaches clients, so the deduper has one thing to watch.
+  // The child repeats 'requesting' every few hundred milliseconds — 634 of them in one
+  // session here — and message_start reaches beginTurn once per assistant message; a
+  // status that says exactly what the last one said costs every client a repaint and
+  // costs the replay ring a slot it needs for events that carry something.
+  emitStatus() {
+    const line = this.state.status + '/' + this.state.activity;
+    if (line === this._statusLine) return;
+    this._statusLine = line;
+    // The turn's start travels with it. A client that attached mid-turn, or one whose page
+    // was asleep through the beginning of it, otherwise has to date the turn from whenever
+    // it happened to find out — and the spinner's elapsed count is the one number on it
+    // that is supposed to mean something.
+    return this.emit('status', { status: this.state.status, activity: this.state.activity,
+      turnStartedAt: this.state.turnStartedAt || null });
+  }
+
   submit(text, content, from) {
     const body = content || text;
     // Attribution: the replay echo carries no idea who typed it, so remember the
-    // pairing and reattach the label when the child hands the turn back.
-    // A slash command produces no replay at all (the child answers it synthetically),
-    // so its attribution entry would sit at the head of the FIFO forever and be handed
-    // to the NEXT turn somebody typed. Marked here and claimed by the synthetic result.
+    // pairing and reattach the label when the child hands the turn back. A slash command
+    // is NOT recorded here: it produces no replay at all, so its entry used to sit in the
+    // FIFO until some later command's answer shifted it off and took its name — which is
+    // how /cost came back labelled /usage. The invocation card made below carries the
+    // name and the author outright, so there is nothing left to reclaim.
     const isSlash = typeof body === 'string' && /^\/[^/\s]/.test(body.trim());
-    this.attribution.push({ text: typeof body === 'string' ? body : null, label: from, slash: isSlash });
-    if (this.attribution.length > 64) this.attribution.shift();
+    if (!isSlash) {
+      this.attribution.push({ text: typeof body === 'string' ? body : null, label: from });
+      if (this.attribution.length > 64) this.attribution.shift();
+    }
     const ok = this.write({ type: 'user', message: { role: 'user', content: body }, parent_tool_use_id: null });
+    if (ok) this.beginTurn();
+    // The card for a slash command, made HERE rather than waited for. Over stream-json
+    // the child echoes nothing when a command is submitted — no <command-name>, no
+    // replay — and answers synthetically whenever it is done, which for /compact is
+    // half a minute later. Until then nothing at all appeared: you typed /compact, the
+    // session went quiet, and the only evidence it had been received was the transcript
+    // on disk. The answer folds into this entry the way a tool_result folds into its
+    // call, so it stays one card.
+    if (ok && isSlash) {
+      const mm = /^\/([^\s]*)\s*([\s\S]*)$/.exec(String(body).trim()) || [];
+      const entry = {
+        id: uuid(), apiId: null, role: 'user', ts: nowIso(), model: null,
+        parentToolUseId: null, isMeta: false, isSynthetic: true, hist: false,
+        by: from, blocks: [], command: { kind: 'run', name: mm[1] || '', args: (mm[2] || '').trim() },
+      };
+      this.settlePendingCmd();
+      this.messages.push(entry);
+      this.pendingCmd = this.lastCmd = entry;
+      this.emit('message', { message: entry, replaced: false });
+    }
     this.emit('submitted', { by: from, text: typeof body === 'string' ? body : '[attachments]', accepted: ok });
     return ok;
   }
@@ -510,12 +668,29 @@ class Session {
       case 'stream_event': return this.onStreamEvent(m);
 
       case 'result': {
+        // The one event that ends a turn. Everything after it that says 'requesting' is
+        // the child idling, not working.
+        this.turnLive = false;
         this.state.status = 'idle';
+        // The verb dies with the turn. Left standing, the NEXT turn's spinner opened on
+        // whatever the last one had been doing — "Compacting…" most memorably, on a
+        // turn that was doing nothing of the kind.
+        this.state.activity = null;
+        // Through emitStatus, not around it: the deduper can only skip a repeat if every
+        // move of the status is recorded in it. Ending a turn silently here left it still
+        // holding 'busy/requesting', so the NEXT turn's beginTurn looked like a repeat and
+        // sent nothing — the first turn of a page got a spinner and no turn after it did.
+        this.emitStatus();
+        this.settlePendingCmd();
+        const u = m.usage || {};
+        // Provisional: the turn's own numbers, so the footer moves the instant the turn
+        // ends. refreshStats replaces them with the transcript's a moment later, which is
+        // the figure that survives a reattach.
         this.state.cost = (this.state.cost || 0) + (m.total_cost_usd || 0);
         this.state.turns += (m.num_turns || 0);
-        const u = m.usage || {};
         this.state.tokens += (u.input_tokens || 0) + (u.output_tokens || 0) +
           (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        this.refreshStats();
         return this.emit('result', {
           isError: !!m.is_error, subtype: m.subtype, stopReason: m.stop_reason,
           costUsd: m.total_cost_usd, usage: u, durationMs: m.duration_api_ms,
@@ -592,8 +767,56 @@ class Session {
       return this.emit('commands', { commands: this.state.commands });
     }
     if (m.subtype === 'status') {
-      if (m.status === 'requesting') this.state.status = 'busy';
-      return this.emit('status', { status: m.status });
+      // How a compaction ends. It is reported on a status message rather than as an
+      // error, so it was falling through as "status: null" — the session went quiet, the
+      // dot went blank, and the only word anywhere was the child's synthetic
+      // "Compaction canceled." with no reason attached to it.
+      if (m.compact_result) {
+        this.state.status = 'idle';
+        this.state.activity = null;
+        this.turnLive = false;
+        this.emit('compact_done', { result: m.compact_result, error: m.compact_error || '' });
+        return this.emitStatus();
+      }
+      // 'compacting' is a compaction; the child may name others. Those are the session
+      // WORKING, and the word is what a client shows instead of a generic spinner —
+      // auto-compaction in particular starts on its own, so the child naming it is the
+      // only notice anyone gets.
+      //
+      // 'requesting' is the exception, and it is why the spinner used to run forever:
+      // it does not mean a turn is starting, it means the session is up and asking, and
+      // the child says it once more right after the result — with no closing status of
+      // any kind afterwards to take it back. Believed, it turned every finished turn
+      // back into a running one. So it is a report on a turn we already know about, and
+      // outside one it means the opposite of busy.
+      const named = m.status && m.status !== 'idle' && m.status !== 'done';
+      const work = named && (m.status !== 'requesting' || this.turnLive);
+      if (work) {
+        if (this.state.status !== 'busy') { this.state.turnStartedAt = Date.now(); this.state.outTokens = 0; }
+        this.state.status = 'busy';
+        this.state.activity = m.status;
+      } else {
+        // Includes status:null — the child saying it stopped, which fell through every
+        // branch here and left the last verb standing.
+        this.turnLive = false;
+        this.state.status = 'idle';
+        this.state.activity = null;
+      }
+      return this.emitStatus();
+    }
+    // The counter the CLI's spinner shows as "\u2193 N tokens". Coalesced: the child
+    // emits one of these every few tokens — 359 in one session here — and a client
+    // that has to redraw a spinner does not need them at that rate.
+    if (m.subtype === 'thinking_tokens') {
+      this.state.outTokens = m.estimated_tokens || 0;
+      if (!this._thinkTimer) {
+        this._thinkTimer = setTimeout(() => {
+          this._thinkTimer = null;
+          this.emit('thinking_tokens', { tokens: this.state.outTokens || 0 });
+        }, THINK_COALESCE_MS);
+        if (this._thinkTimer.unref) this._thinkTimer.unref();
+      }
+      return;
     }
     // Bedrock/SSO: a credential refresh mid-turn is indistinguishable from a hang
     // unless the session says so out loud.
@@ -616,12 +839,69 @@ class Session {
     // the result lands. So this is what a client gets to show instead: the moment
     // execution really began (which is NOT when the tool_use block arrived — there were
     // three seconds between them in the probe) and a one-line description of it.
-    if (m.subtype === 'task_started' || m.subtype === 'task_notification')
+    if (m.subtype === 'task_started' || m.subtype === 'task_notification') {
+      // A BACKGROUNDED call answered its tool_result at launch and settled minutes ago;
+      // this notification is the only word on what it actually did. Recorded ON the
+      // block, not merely broadcast, because an event is gone by the time somebody
+      // attaches — and a client that joined late would show the launch message as the
+      // outcome forever.
+      const blk = m.tool_use_id ? this.byToolUseId.get(m.tool_use_id) : null;
+      if (blk && m.subtype === 'task_notification' && blk.status !== 'running')
+        blk.bg = { status: m.status || 'completed', description: m.description || m.summary || '' };
       return this.emit('tool_run', { toolUseId: m.tool_use_id || null, taskId: m.task_id || null,
         phase: m.subtype === 'task_started' ? 'started' : 'finished',
         description: m.description || m.summary || '', taskType: m.task_type || null,
         status: m.status || null, backgrounded: !!m.is_backgrounded });
+    }
+    // The seam a compaction leaves. What follows it on the wire is one synthetic user
+    // message holding the ENTIRE summary of the conversation — 30k characters nobody
+    // typed. On disk that message is flagged isCompactSummary and seedHistory drops it;
+    // the WIRE sends no such flag, so the boundary is what marks it, and the next user
+    // turn is tagged from here.
+    if (m.subtype === 'compact_boundary') this._compactMeta = m.compact_metadata || {};
     return this.emit('system', { subtype: m.subtype, body: m });
+  }
+
+  // An invocation nobody answered. /usage, /context and their kind are drawn by the CLI
+  // in its own terminal and send NOTHING back over stream-json, so the card would spin
+  // for the rest of the session waiting for output that does not exist. Anything that
+  // happens after the invocation is proof enough that no output is coming.
+  settlePendingCmd() {
+    const p = this.pendingCmd;
+    if (!p) return;
+    this.pendingCmd = null;
+    p.command = Object.assign({}, p.command, { kind: 'out', stream: 'stdout', text: '', noOutput: true });
+    if (this.messages.some(x => x.id === p.id)) this.emit('message', { message: p, replaced: true });
+  }
+
+  // The OTHER carrier for a finished background task: the harness injects the same
+  // <task-notification> the system message carries as an ordinary user turn, and for an
+  // agent that is often the only one naming the tool it belongs to. Stamped on the block
+  // so a card reads the same whether a client watched it happen or attached afterwards.
+  //
+  // Called from two places, which is the whole reason it is a method: the live wire
+  // delivers it as a user message, but the TRANSCRIPT does not — on disk it is a
+  // `queue-operation` record, a type seedHistory skips along with the dozen other
+  // non-turn kinds. A resumed session therefore rebuilt every backgrounded card with no
+  // outcome at all, and they all read "running in background…" forever.
+  noteTaskNotification(raw) {
+    // Anchored, not a substring search: a notification IS the message, start to end.
+    // Matching anywhere meant any turn that so much as quoted the tag — a compaction
+    // summary of a conversation about this code, for one — was mistaken for one.
+    if (!TASK_NOTE_ONLY.test(String(raw || '').trim())) return;
+    const grab = re => (re.exec(raw) || [])[1];
+    const tid = (grab(/<tool-use-id>([\s\S]*?)<\/tool-use-id>/) || '').trim();
+    const blk = tid ? this.byToolUseId.get(tid) : null;
+    if (!blk || blk.status === 'running' || blk.bg) return;
+    blk.bg = {
+      status: (grab(/<status>([\s\S]*?)<\/status>/) || 'completed').trim(),
+      description: (grab(/<summary>([\s\S]*?)<\/summary>/) || '').trim(),
+    };
+    // The same event the system carrier raises, so the clients have ONE handler for
+    // "a background task reported back" rather than one per carrier.
+    this.emit('tool_run', { toolUseId: tid, taskId: null, phase: 'finished',
+      description: blk.bg.description, taskType: null, status: blk.bg.status,
+      backgrounded: true });
   }
 
   // Normalize an assistant/user message into the render-ready shape both clients
@@ -668,9 +948,35 @@ class Session {
       by: null, blocks: [], command: null,
     };
 
+    // The compaction summary itself. Kept — it is the only record of everything that
+    // was dropped — but tagged, so a client draws the seam and the text sits behind it
+    // instead of a wall of prose landing in the middle of the transcript attributed to
+    // whoever happened to type /compact.
+    if (role === 'user' && this._compactMeta) {
+      const md = this._compactMeta; this._compactMeta = null;
+      entry.compact = {
+        trigger: md.trigger || 'manual',
+        preTokens: md.pre_tokens || 0, postTokens: md.post_tokens || 0,
+        durationMs: md.duration_ms || 0,
+      };
+      entry.blocks = content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text }));
+      this.messages.push(entry);
+      return this.emit('message', { message: entry, replaced: false });
+    }
+
+    if (role === 'user') this.noteTaskNotification(content.filter(b => b.type === 'text').map(b => b.text).join('\n'));
+
     // A local command's result, in whichever carrier it arrived. Tagged, not rendered
     // as a turn: it is output, and the thing that produced it was a command.
     const text0 = content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+    // Pure plumbing: the harness wraps a locally-typed slash command in a caveat aimed
+    // at the model ("DO NOT respond to these messages"). It is not a turn, it is not
+    // output, and it was being rendered as a user message directly under the command
+    // card. Dropped here rather than hidden in each client — and dropping it also keeps
+    // it from landing between an invocation and its output, where it would break the
+    // pairing below.
+    if (CAVEAT_ONLY.test(text0.trim())) return;
+
     const cmd = parseCommand(m.local_command_source || '') ||
       (role === 'user' || entry.isMeta ? parseCommand(text0) : null);
     if (cmd) {
@@ -680,24 +986,55 @@ class Session {
       entry.command = cmd.kind === 'out'
         ? { kind: 'out', stream: cmd.stream, text: (m.local_command_source && text0) || cmd.text }
         : cmd;
-      // Who ran it. The synthetic result is the only echo a slash command ever gets,
-      // so this is also where its attribution entry is reclaimed.
-      const i = this.attribution.findIndex(a => a.slash);
-      if (i >= 0) {
-        const a = this.attribution[i];
-        entry.by = a.label;
-        if (entry.command.kind === 'run' || !entry.command.name) {
-          const mm = /^\/([^\s]*)\s*([\s\S]*)$/.exec(String(a.text || '').trim());
-          if (mm) { entry.command.name = entry.command.name || mm[1]; entry.command.args = entry.command.args || mm[2]; }
+      // One command, one card. The child reports a slash command in two messages — the
+      // <command-name> invocation, then the <local-command-stdout> answer — and each was
+      // becoming a card of its own: an invocation stuck at "running" forever, and an
+      // unlabelled block of output under it. They are one act, so the answer folds into
+      // the invocation the way a tool_result folds into its tool_use.
+      if (entry.command.kind === 'run') {
+        // The child echoing back the command the mux just drew a card for. Not every
+        // build does this — a live child sends no <command-name> over the wire at all —
+        // but where it does, the echo is the same act and must not become a second card
+        // beside the one already waiting for an answer.
+        const p0 = this.pendingCmd;
+        if (p0 && p0.command.name === entry.command.name) return;
+        // Otherwise it is a genuinely new invocation, and it settles the one before it:
+        // two commands in a row must not leave the earlier card spinning forever.
+        this.settlePendingCmd();
+        this.pendingCmd = this.lastCmd = entry;
+      }
+      // Output for a card that was already settled empty. A successful /compact answers
+      // a full three minutes later, with nothing between the invocation and the answer
+      // but the compaction itself — and the answer carries no <command-name>, so with
+      // the card gone it became a second, nameless card reading "/" over "Compacted".
+      else if (this.lastCmd && this.lastCmd !== this.pendingCmd &&
+               this.lastCmd.command && this.lastCmd.command.noOutput && !entry.command.name) {
+        const q = this.lastCmd;
+        q.command = Object.assign({}, entry.command, { name: q.command.name, args: q.command.args });
+        if (this.messages.some(x => x.id === q.id)) {
+          this.emit('message', { message: q, replaced: true });
+          return;
         }
-        this.attribution.splice(i, 1);
+      }
+      else if (this.pendingCmd) {
+        const p = this.pendingCmd;
+        this.pendingCmd = null;
+        p.command = Object.assign({}, entry.command, {
+          name: entry.command.name || p.command.name,
+          args: entry.command.args || p.command.args,
+        });
+        p.by = p.by || entry.by;
+        const at0 = this.messages.findIndex(x => x.id === p.id);
+        if (at0 >= 0) { this.emit('message', { message: p, replaced: true }); return; }
       }
     }
+    // Anything else arriving while an invocation is unanswered settles it.
+    else this.settlePendingCmd();
     // The replay of a turn we submitted: reattach who typed it. Matching on text
     // is enough — the child preserves content verbatim and submissions are FIFO.
-    // A command's echo is not a turn somebody typed, and its attribution was already
-    // claimed above — falling through here would shift a SECOND entry off the FIFO and
-    // hand the next real turn the wrong name.
+    // A command's echo is not a turn somebody typed, and slash commands no longer enter
+    // the FIFO at all — falling through here would shift a real turn's entry off it and
+    // hand that turn's name to a command.
     if (role === 'user' && m.isReplay && !entry.command) {
       const i = this.attribution.findIndex(a => a.text != null && a.text === msg.content);
       if (i >= 0) { entry.by = this.attribution[i].label; this.attribution.splice(i, 1); }
@@ -757,7 +1094,9 @@ class Session {
     const e = m.event || {};
     if (e.type === 'message_start') {
       this.flushDelta();
-      this.state.status = 'busy';
+      // A turn can also begin without passing through submit — a session resumed with
+      // one already in flight, a hook that prompts. The child answering is proof enough.
+      this.beginTurn();
       this._streamMsgId = (e.message && e.message.id) || null;
       return this.emit('turn_start', { messageId: this._streamMsgId, parentToolUseId: m.parent_tool_use_id || null });
     }
@@ -876,9 +1215,20 @@ class Mux {
     return hits.length === 1 ? hits[0] : null;
   }
   list() {
-    return [...this.sessions.values()].map(s => ({
-      ...s.state, clients: s.clients.size, pending: s.pending.size, messages: s.messages.length,
-    }));
+    // stats is dropped: it is a whole transcript's breakdown per row, wanted by the one
+    // client that opens a session and by nothing that merely lists them.
+    return [...this.sessions.values()].map(s => {
+      const { stats, ...state } = s.state;
+      return { ...state, clients: s.clients.size, pending: s.pending.size, messages: s.messages.length };
+    });
+  }
+
+  // The pids of the TERMINAL clients attached to a session — what ccbb web needs to find
+  // the tmux pane a `ccbb attach` is sitting in. Browsers have no pid to give.
+  tuiPids(sessionId) {
+    const s = this.get(sessionId);
+    if (!s) return [];
+    return [...s.clients].filter(c => c.kind === 'tui' && c.pid).map(c => Number(c.pid));
   }
 
   // subUrl is the request path with the host's /mux prefix already stripped. Passed
@@ -938,6 +1288,10 @@ class Mux {
       id: uuid(),
       label: url.searchParams.get('label') || 'anon',
       kind: url.searchParams.get('kind') || 'unknown',
+      // A terminal client reports its own pid so the web UI can find the tmux pane it
+      // is sitting in — that pane is where "$>" for a mux session should land. Absent
+      // for a browser, which has no process on this host to find.
+      pid: Number(url.searchParams.get('pid')) || null,
       session: null,
       send: obj => { if (ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); } catch {} } },
     };
@@ -949,7 +1303,8 @@ class Mux {
     // Attach eagerly when the URL names a session, so a client can be a one-liner.
     const want = url.searchParams.get('session');
     if (want) this.onClientOp(client, { op: 'attach', sessionId: want,
-      sinceSeq: url.searchParams.has('since') ? Number(url.searchParams.get('since')) : undefined });
+      sinceSeq: url.searchParams.has('since') ? Number(url.searchParams.get('since')) : undefined,
+      epoch: url.searchParams.get('epoch') || undefined });
   }
 
   onClientOp(client, m) {
@@ -961,7 +1316,7 @@ class Mux {
       if (m.label) client.label = m.label;
       if (m.kind) client.kind = m.kind;
       client.session = s;
-      return s.attach(client, m.sinceSeq);
+      return s.attach(client, m.sinceSeq, m.epoch);
     }
     if (m.op === 'list') return reply({ sessions: this.list() });
     if (m.op === 'new') { const s = this.create(m.options || {}); return reply({ session: s.state }); }
@@ -1152,4 +1507,5 @@ async function runMuxLs() {
 }
 
 module.exports = { runNew, runStop, runMuxLs, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
+  TURN_VERBS, SPIN_VERBS, SPIN_FRAMES,
   muxAddress, MUX_DIR };

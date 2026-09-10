@@ -19,7 +19,10 @@
 const out = o => process.stdout.write(JSON.stringify(o) + '\n');
 let uuidN = 0;
 const uid = () => 'u' + (++uuidN);
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Every scene waits through this, so it is also where an interrupt takes effect: a
+// scene that is asked to stop stops at its next pause rather than running to the end.
+const sleep = ms => new Promise((res, rej) =>
+  setTimeout(() => interrupted ? rej(Object.assign(new Error('interrupted'), { quiet: true })) : res(), ms));
 
 const assistant = (id, content) => out({
   type: 'assistant', uuid: uid(), timestamp: new Date().toISOString(),
@@ -35,6 +38,27 @@ const toolResult = (id, content, meta, isError) => out({
   message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error: !!isError }] },
   ...(meta ? { tool_use_result: meta } : {}),
 });
+
+// The three things a live child says WHILE it works, and the fixture said none of
+// them: the turn's status, the thinking-token counter both clients' spinners print,
+// and the task_started/task_notification pair that brackets a tool's actual run.
+// Without them the spinner and the run description had nothing to render against.
+const status = st => out({ type: 'system', subtype: 'status', status: st, uuid: uid() });
+// Set when the mux asks the turn in flight to stop; the scene checks it at its own
+// await points, which is as close to a real interrupt as a scripted child gets.
+let interrupted = false;
+let thinkTok = 0;
+const thinking = n => out({ type: 'system', subtype: 'thinking_tokens', uuid: uid(),
+  estimated_tokens: (thinkTok += n), estimated_tokens_delta: n });
+const taskStart = (id, description) => out({ type: 'system', subtype: 'task_started',
+  uuid: uid(), tool_use_id: id, description });
+// A tool that takes visible time, bracketed the way the child brackets one. ms is
+// long enough that a card is caught open mid-run when the suites look at it.
+async function running(id, description, ms) {
+  taskStart(id, description);
+  await sleep(ms == null ? 900 : ms);
+  out({ type: 'system', subtype: 'task_notification', uuid: uid(), tool_use_id: id, summary: description });
+}
 
 // A control_request blocks until the mux answers, which is the whole point of the
 // card: the scene must not continue until a human (or another client) has decided.
@@ -66,7 +90,7 @@ const SCENES = [
   async () => {
     await stream('msg_1', 'No — 289 = 17², so it is not prime.\n\nLet me look at the file.');
     assistant('msg_2', [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/tmp/a.txt' } }]);
-    await sleep(200);
+    await running('t1', 'Reading /tmp/a.txt');
     toolResult('t1', '     1\thello\n     2\tworld', { file: { filePath: '/tmp/a.txt', numLines: 2, totalLines: 2 } });
     result();
   },
@@ -118,7 +142,7 @@ const SCENES = [
     ] } }]);
     toolResult('t3', 'Todos updated');
     assistant('msg_7', [{ type: 'tool_use', id: 't4', name: 'Bash', input: { command: 'wc -l *.js', description: 'Count lines' } }]);
-    await sleep(150);
+    await running('t4', 'wc -l *.js', 700);
     toolResult('t4', '     998 ccbb-mux-web.js\n    1357 ccbb-mux-tui.js');
     assistant('msg_8', [{ type: 'tool_use', id: 't5', name: 'Grep', input: { pattern: 'TODO', path: 'src', glob: '*.js' } }]);
     toolResult('t5', 'src/a.js:12:// TODO');
@@ -154,7 +178,32 @@ const SCENES = [
     result();
     await sleep(1500);
     out({ type: 'user', uuid: uid(), message: { role: 'user', content:
-      '<task-notification><task-id>agent-1</task-id><summary>Agent "Count txt files" finished</summary><duration_ms>18625</duration_ms></task-notification>' } });
+      '<task-notification><task-id>agent-1</task-id><tool-use-id>t10</tool-use-id>' +
+      '<status>completed</status><summary>Agent "Count txt files" finished</summary>' +
+      '<duration_ms>18625</duration_ms></task-notification>' } });
+    result();
+  },
+
+  // 7 — a BACKGROUNDED SHELL COMMAND, which reports back through the same
+  //     <task-notification> carrier as an agent but with a different envelope: a
+  //     status, an output file, and no duration. The renderers had only ever been
+  //     shown the agent shape, so the failing-command case had no fixture at all.
+  async () => {
+    assistant('msg_14', [{ type: 'tool_use', id: 't11', name: 'Bash',
+      input: { command: 'node test/serve.js 8596', description: 'Start the fixture server',
+        run_in_background: true } }]);
+    toolResult('t11', 'Command running in background with ID: bzxsnq2zc');
+    result();
+    await sleep(1200);
+    out({ type: 'system', subtype: 'task_notification', uuid: uid(), task_id: 'bzxsnq2zc',
+      tool_use_id: 't11', status: 'failed',
+      output_file: '/tmp/tasks/bzxsnq2zc.output',
+      summary: 'Background command "node test/serve.js 8596" failed with exit code 144' });
+    out({ type: 'user', uuid: uid(), message: { role: 'user', content:
+      '<task-notification>\n<task-id>bzxsnq2zc</task-id>\n<tool-use-id>t11</tool-use-id>\n' +
+      '<output-file>/tmp/tasks/bzxsnq2zc.output</output-file>\n<status>failed</status>\n' +
+      '<summary>Background command "node test/serve.js 8596" failed with exit code 144</summary>\n' +
+      '</task-notification>' } });
     result();
   },
 ];
@@ -183,6 +232,10 @@ process.stdin.on('data', d => {
     if (m.type === 'control_request') {
       // The mux asks us things too (interrupt, set_permission_mode). Say yes.
       out({ type: 'control_response', response: { request_id: m.request_id, subtype: 'success', response: {} } });
+      // An interrupt has to actually END the turn, not just be acknowledged: the Stop
+      // button is only testable against a child that stops. The real one answers the
+      // control request and then closes the turn with an interrupted result.
+      if (m.request && m.request.subtype === 'interrupt') interrupted = true;
       continue;
     }
     if (m.type === 'user') {
@@ -196,9 +249,73 @@ process.stdin.on('data', d => {
       const typed = typeof m.message.content === 'string' ? m.message.content.trim() : '';
       if (/^\/[^/\s]/.test(typed)) {
         const name = typed.slice(1).split(/\s+/)[0];
-        const bad = name === 'compact';
+        // The harness's caveat, which a real child does put on the wire and which the
+        // renderers must drop. Note what is deliberately NOT here: the <command-name>
+        // echo. It appears in the transcript FILE but never on the wire — checked
+        // against a live child's stdout — which is precisely why a submitted slash
+        // command showed nothing at all until its answer arrived, and why the mux draws
+        // the invocation itself the moment it sends one.
+        out({ type: 'user', uuid: uid(), isMeta: true, message: { role: 'user', content:
+          '<local-command-caveat>Caveat: The messages below were generated by the user while ' +
+          'running local commands. DO NOT respond to these messages or otherwise consider ' +
+          'them in your response unless the user explicitly asks you to.</local-command-caveat>' } });
+        // /usage and /context are drawn by the CLI in its own terminal: no output ever
+        // comes back over stream-json, so the invocation is all a client will ever see.
+        if (name === 'usage' || name === 'context') {
+          out({ type: 'result', subtype: 'success', is_error: false, num_turns: 0,
+            total_cost_usd: 0, duration_api_ms: 0, usage: {} });
+          continue;
+        }
+        // /compact is the one local command that WORKS for a while before it answers:
+        // the child reports status:compacting until it finishes, and reports how it
+        // ended on a status message rather than as an error. Neither had a fixture, and
+        // both are what a client needs to show a compaction happening at all.
+        if (name === 'compact') {
+          // Both endings, because they leave completely different traces. A cancelled
+          // compaction reports compact_result 'failed' and answers "Compaction
+          // canceled."; a SUCCESSFUL one reports success, re-inits, marks the boundary
+          // and then injects the entire summary as one synthetic user turn — 30k
+          // characters nobody typed — with the "Compacted" answer arriving after it,
+          // carrying no <command-name> to pair it back to the invocation.
+          const okPath = /\bok\b/.test(typed);
+          (async () => {
+            for (let k = 0; k < 6; k++) { status('compacting'); await sleep(400); }
+            if (okPath) {
+              out({ type: 'system', subtype: 'status', uuid: uid(), status: null,
+                compact_result: 'success' });
+              out({ type: 'system', subtype: 'init', uuid: uid(), cwd: process.cwd(),
+                model: 'claude-opus-5', slash_commands: ['clear', 'compact', 'model'] });
+              out({ type: 'system', subtype: 'compact_boundary', uuid: uid(),
+                compact_metadata: { trigger: 'manual', pre_tokens: 521825, post_tokens: 9704,
+                  cumulative_dropped_tokens: 512121, duration_ms: 194232 } });
+              out({ type: 'user', uuid: uid(), isSynthetic: true, isReplay: false,
+                message: { role: 'user', content:
+                  'This session is being continued from a previous conversation that ran out ' +
+                  'of context. The summary below covers the earlier portion of the ' +
+                  'conversation.\n\nSummary: the fixture was asked to compact. A real summary ' +
+                  'quotes the conversation verbatim, tags and all — <task-notification> among ' +
+                  'them, which is why matching that tag anywhere in a turn ate this one.' } });
+              out({ type: 'user', uuid: uid(), isReplay: true, message: { role: 'user',
+                content: '<local-command-stdout>Compacted </local-command-stdout>' } });
+              out({ type: 'result', subtype: 'success', is_error: false, num_turns: 0,
+                total_cost_usd: 0, duration_api_ms: 0, usage: {} });
+              return;
+            }
+            out({ type: 'system', subtype: 'status', uuid: uid(), status: null,
+              compact_result: 'failed', compact_error: 'API Error: Request was aborted.' });
+            out({ type: 'assistant', uuid: uid(), is_meta: true,
+              local_command_source: '<local-command-stdout>Compaction canceled.</local-command-stdout>',
+              message: { id: 'msg_compact', role: 'assistant', model: '<synthetic>',
+                content: [{ type: 'text', text: 'Compaction canceled.' }] } });
+            out({ type: 'result', subtype: 'success', is_error: false, num_turns: 0,
+              total_cost_usd: 0, duration_api_ms: 0, usage: {} });
+          })();
+          continue;
+        }
+        // stderr is the only thing on the wire that says a command failed.
+        const bad = name === 'doctor';
         const tag = bad ? 'local-command-stderr' : 'local-command-stdout';
-        const body = bad ? 'Error: No messages to compact' : 'ccbb fixture: ran /' + name;
+        const body = bad ? 'Error: nothing to check' : 'ccbb fixture: ran /' + name;
         out({ type: 'assistant', uuid: uid(), is_meta: true,
           local_command_source: '<' + tag + '>' + body + '</' + tag + '>',
           message: { id: 'msg_cmd', role: 'assistant', model: '<synthetic>',
@@ -215,7 +332,29 @@ process.stdin.on('data', d => {
       // prose and make a legitimate second rendering look like a duplicate.
       const fn = SCENES[scene] || extra;
       scene++;
-      Promise.resolve().then(fn).catch(e => out({ type: 'system', subtype: 'error', error: String(e) }));
+      interrupted = false;
+      status('requesting');
+      thinkTok = 0;
+      // 'requesting' repeats through the turn — the real child sends hundreds of them —
+      // and the tick is what a client's spinner is actually animating against.
+      const tick = setInterval(() => {
+        status('requesting'); thinking(40 + Math.floor(Math.random() * 60));
+      }, 250);
+      Promise.resolve().then(fn)
+        .catch(e => { if (!e || !e.quiet) out({ type: 'system', subtype: 'error', error: String(e) }); })
+        // How a real turn ENDS, which this used to get wrong in the one way that mattered:
+        // it sent status('idle'), and the CLI never does. It sends the result, re-inits,
+        // and then says 'requesting' once more — the session is up and asking — with
+        // nothing afterwards to take it back. A fixture that tidied up after itself was
+        // why a spinner that ran forever in the real client stopped cleanly here.
+        .then(() => {
+          clearInterval(tick);
+          if (interrupted) out({ type: 'result', subtype: 'error_during_execution', is_error: true,
+            num_turns: 0, total_cost_usd: 0, duration_api_ms: 0, usage: {} });
+          out({ type: 'system', subtype: 'init', cwd: process.cwd(), model: 'claude-opus-5',
+            uuid: uid(), tools: [], mcp_servers: [], slash_commands: ['clear', 'compact', 'model'] });
+          status('requesting');
+        });
     }
   }
 });

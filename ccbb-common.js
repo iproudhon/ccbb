@@ -1101,7 +1101,15 @@ function parentMap() {
 // Find the tmux pane hosting a running session by climbing each backing pid's ancestry
 // until we hit a pane's root pid. Returns { pane, pid } or null.
 function paneForSession(sessionId) {
-  const pids = livePidsForSession(sessionId);
+  return paneForPids(livePidsForSession(sessionId));
+}
+
+// The pane a set of pids is running in, if any. Split out of paneForSession because a
+// mux session's terminal target is found the same way from a different set of pids —
+// the TUI clients attached to it — and walking the process tree twice in two places is
+// how the two answers start to disagree.
+function paneForPids(pids) {
+  pids = pids instanceof Set ? pids : new Set(pids || []);
   if (!pids.size) return null;
   let paneLines;
   try { paneLines = tmux(['list-panes', '-a', '-F', '#{pane_pid} #{pane_id}']); }
@@ -1889,7 +1897,7 @@ module.exports = {
   // liveness + mutation
   pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
-  tmux, paneForSession, panesForLiveSessions, isCcbbGroupSession, injectToPane,
+  tmux, paneForSession, paneForPids, panesForLiveSessions, isCcbbGroupSession, injectToPane,
   transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow,
   getSubagentHistory, getSessionInfo,
   startTail, stopTail, watchSessionChanges,

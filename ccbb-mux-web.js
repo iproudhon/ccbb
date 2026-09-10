@@ -130,13 +130,44 @@ const APP_CSS = `
    with a gutter down the right-hand side. */
 .muxv .mx-wrap { max-width: 772px; margin: 0 auto; padding: 0 16px; }
 .muxv .thinking { color: var(--vscode-descriptionForeground); font-style: italic; }
+/* A <task-notification> line. Transcript-sized, not footnote-sized: a backgrounded
+   command reporting a failure is news, and the bullet is the only thing that says
+   which way it went. */
+.muxv .task-note { display: flex; gap: 8px; align-items: baseline; margin: 10px 0;
+  width: 100%; max-width: 740px; line-height: 1.6; }
+.muxv .task-note .bul { flex: 0 0 auto; color: var(--vscode-charts-green); }
+.muxv .task-note.err .bul, .muxv .task-note.err .note-text { color: var(--vscode-charts-red); }
+.muxv .task-note .dur { color: var(--vscode-descriptionForeground); font-size: 12px; }
+.muxv .cseam { display: flex; align-items: center; gap: 10px; margin: 14px 0; }
+.muxv .cseam::before, .muxv .cseam::after { content: ''; flex: 1 1 auto;
+  border-top: 1px solid var(--vscode-panel-border); }
+.muxv .cseam-lab { flex: 0 0 auto; background: none; border: 0; padding: 0; cursor: pointer;
+  font: inherit; font-size: 12px; color: var(--vscode-descriptionForeground); }
+.muxv .cseam-lab:hover { color: var(--vscode-foreground); }
+.muxv .cseam-sum { white-space: pre-wrap; font-size: 12px; margin-bottom: 12px;
+  color: var(--vscode-descriptionForeground); }
+/* ccbb's stylesheet tints running/done/error; "background" is this client's own. */
+.muxv .tool-status.background { background: var(--vscode-textBlockQuote-background);
+  color: var(--vscode-descriptionForeground); }
 .muxv .meta { color: var(--vscode-descriptionForeground); font-size: 12px; }
 /* A subagent's own turns. The plugin hides these outright; ccbb nests them, the
    way the terminal client draws them under a rule. */
-.muxv .nested { margin-left: 14px; padding-left: 12px; border-left: 2px solid var(--vscode-panel-border); }
+/* width:auto, because ccbb's .msg is width:100% and a percentage width does not know
+   about the 26px of margin and padding this rule adds — on a phone that was four pixels
+   of horizontal scroll on the whole transcript. */
+.muxv .nested { margin-left: 14px; padding-left: 12px; border-left: 2px solid var(--vscode-panel-border); width: auto; }
 .muxv .tool-hdr .secondary { color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family);
   font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .muxv .tool-hdr .who { color: var(--vscode-descriptionForeground); font-size: 11px; }
+/* The header is one line and three things want it: the argument on the left, the
+   outcome on the right. Both may shrink; the tool's NAME may not, because a header
+   that has ellipsized its own name says nothing at all. */
+.muxv .tool-hdr .secondary { flex: 0 1 auto; min-width: 0; }
+.muxv .tool-hdr .tool-meta { min-width: 0; }
+.muxv .tool-sum { flex: 0 1 auto; min-width: 0; font-size: 11.5px;
+  font-family: var(--vscode-editor-font-family); color: var(--vscode-descriptionForeground);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.muxv .tool-sum.err { color: var(--vscode-charts-red); }
 .muxv .tool-body { padding: 0 10px 9px; font-family: var(--vscode-editor-font-family); font-size: 12.5px; }
 .muxv .tool-body pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .muxv .tool-body .row { display: grid; grid-template-columns: 26px 1fr; gap: 6px; margin: 4px 0; }
@@ -153,7 +184,14 @@ const APP_CSS = `
 .muxv .todos li.active { color: var(--ccbb-accent); font-weight: 600; }
 
 /* ── cards ──────────────────────────────────────────────────────────────── */
-.muxv .mx-cards { flex: 0 0 auto; max-height: 55%; overflow-y: auto; }
+/* The spinner. Its own row, not a card: it is transient state, so it sits between the
+   transcript and whatever is asking for an answer, and disappears with the turn. */
+.muxv .mx-busy { flex: 0 0 auto; display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 16px 8px; font-size: 12.5px; color: var(--vscode-descriptionForeground); }
+.muxv .mx-busy .mx-spin { color: var(--ccbb-accent); font-size: 13px; }
+/* Inside .mx-log now, so it neither scrolls nor sizes itself — the transcript does
+   both for it. The bottom padding is what keeps a card clear of the composer. */
+.muxv .mx-cards { padding-bottom: 6px; }
 .muxv .card { border: 1px solid var(--ccbb-accent); border-radius: 8px; margin: 8px 0;
   background: var(--vscode-sideBar-background); overflow: hidden; }
 .muxv .card .head { padding: 9px 12px 4px; font-weight: 600; }
@@ -246,10 +284,12 @@ body > .muxv { flex: 1 1 auto; min-height: 0; }
 // Two house rules, both inherited from ccbb-web.js: this is a template literal, so
 // every backslash is doubled and there are no ${...} or backticks in the client
 // source (BT below is how the markdown renderer gets one).
-const APP_JS = `
+const APP_JS_SRC = `
 (function () {
 'use strict';
 var BT = String.fromCharCode(96), BT3 = BT + BT + BT;
+// Handed in from ccbb-mux.js at assembly time — see the replace() under APP_JS.
+var SPIN_VERBS = __SPIN_VERBS__, SPIN_FRAMES = __SPIN_FRAMES__;
 
 // The shell, built here rather than shipped as HTML: ccbb-web.js would otherwise
 // carry a second copy of this markup, and the ids it used to have cannot survive
@@ -269,8 +309,18 @@ function shell(bar) {
       '<button class="mx-stop" title="interrupt (Esc)">Stop</button>' +
       '<a class="mx-up" href="/">sessions</a>' +
     '</div>' : '') +
-    '<div class="mx-log"><div class="mx-wrap"></div></div>' +
-    '<div class="mx-cards"><div class="mx-wrap"></div></div>' +
+    // The cards live INSIDE the log, after the messages, rather than in a pane of their
+    // own beneath it. A permission or a question belongs where it happened — that is
+    // where the CLI and the plugin put it — and a second scroll region under the first
+    // meant the transcript and the thing asking you about it scrolled independently,
+    // so reading the tool call a card was about moved the card off screen.
+    '<div class="mx-log"><div class="mx-wrap"></div>' +
+      '<div class="mx-cards"><div class="mx-wrap"></div></div></div>' +
+    // The CLI's spinner, in its own row under the log rather than as the log's last
+    // child: it must not scroll away while a turn is in flight, which is the one
+    // moment it is worth having.
+    '<div class="mx-busy" hidden><span class="mx-spin"></span><span class="mx-verb"></span></div>' +
+
     // ccbb-web.js's composer, class for class, so its stylesheet dresses this one
     // and asTextarea() (hoisted into ccbb's SHARED_JS) gives the editable the three
     // textarea properties the code below talks to. The tools row is absolute and
@@ -286,6 +336,7 @@ function shell(bar) {
       '<div class="input-row">' +
         '<div class="input-box" data-ph="Message Claude\u2026  (/ for the child, // for ccbb, Ctrl+Enter to send)"></div>' +
         '<button class="send-btn" title="' + SEND_TIP + '">&#8593;</button>' +
+        '<button class="stop-btn" title="Stop (Esc)" hidden><i></i></button>' +
       '</div>' +
     '</div></div>' +
     '<div class="sv-foot"><span class="sl"></span></div>';
@@ -304,6 +355,9 @@ var LABEL = opts.label || 'web';
 // chain for exactly one family of tools.
 var HAS_BAR = opts.bar !== false;
 var ON_CHROME = typeof opts.onChrome === 'function' ? opts.onChrome : null;
+// The host's header block wants the whole stats object, not the handful of numbers the
+// status line prints. Separate from onChrome because it changes on a different clock.
+var ON_STATS = typeof opts.onStats === 'function' ? opts.onStats : null;
 var ERRORS = [];
 var dead = false, reconnectTimer = null;
 // Set by wire(); called when a snapshot lands so the composer's ↑ history reaches the
@@ -448,7 +502,12 @@ var REG = {
 
   Artifact: { header: function (i) { return ['Artifact', i.file_path]; } },
   Bash: {
-    header: function (i) { return ['Bash', i.description || '']; },
+    // The description first — it is the one line written to say what the call is FOR —
+    // and the command itself when there is none. Claude Code always has something here
+    // (it titles the card Bash(<command>)); this used to fall back to an empty string,
+    // so every Bash call the model described in no words at all was a card labelled
+    // "Bash" and nothing else.
+    header: function (i) { return ['Bash', i.description || firstLine(i.command)]; },
     body: function (i, result, meta, isError) {
       var f = document.createDocumentFragment();
       if (i.command) f.appendChild(row('$', pre(i.command)));
@@ -457,11 +516,11 @@ var REG = {
       return f;
     },
   },
-  PowerShell: { header: function (i) { return ['PowerShell', i.description || '']; } },
+  PowerShell: { header: function (i) { return ['PowerShell', i.description || firstLine(i.command)]; } },
   TaskOutput: { header: function (i) { return ['TaskOutput', i.task_id ? 'task: "' + i.task_id + '"' : '']; } },
   Agent: {
     // Task is aliased to Agent by the registry lookup, exactly as the plugin does.
-    header: function (i) { return ['Agent:', i.description || '']; },
+    header: function (i) { return ['Agent:', i.description || i.subagent_type || firstLine(i.prompt)]; },
     body: function (i, result, meta, isError) {
       var f = document.createDocumentFragment();
       if (i.prompt) f.appendChild(row('IN', pre(i.prompt)));
@@ -495,11 +554,11 @@ var REG = {
       else if (i.offset !== undefined) extra = ' (from line ' + (i.offset + 1) + ')';
       return ['Read', base(i.file_path) + extra];
     },
+    // The line count moved to the header (toolSummary), so the body is the FILE now.
+    // It used to be the count and nothing else, which made opening a Read card show
+    // you the one thing the collapsed card was already telling you.
     body: function (i, result, meta, isError) {
-      if (isError) return outBlock(result, true);
-      var n = meta && meta.file && meta.file.numLines;
-      if (n == null) { var t = txt(result); n = t ? t.split('\\n').filter(function (x) { return x.trim(); }).length : 0; }
-      return el('div', 'meta', 'Read ' + n + ' line' + (n === 1 ? '' : 's'));
+      return outBlock(result, isError);
     },
   },
   ReadCoalesced: { header: function (i) { return ['Read', base(i.file_path)]; } },
@@ -585,7 +644,10 @@ function rendererFor(name) {
     var tool = rest.split('__').slice(1).join('__');
     return { header: function (i) { return [server + ' [' + tool + ']', mcpHint(i)]; } };
   }
-  return { header: function () { return [name, '']; } };
+  // Named by the tool and by whatever argument identifies the call. A bare tool name
+  // says which tool ran and nothing about what it was asked to do, and half the cards in
+  // a long session are tools with no renderer of their own.
+  return { header: function (i) { return [name, mcpHint(i) || firstLine(i && (i.description || i.path || i.file_path || i.query || i.prompt))]; } };
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────
@@ -604,6 +666,11 @@ var S = {
   // closed itself because the socket blinked would be the reconnect making itself
   // felt in the one place it should not.
   open: {}, cmds: [],
+  // Which cards the reader has actually clicked. A card follows its RUN by default —
+  // open while the tool works, shut once it lands, which is where the CLI's attention
+  // is — and only stops following it once somebody says otherwise. Without this the
+  // two rules fight: an expansion made mid-run would snap shut on the result.
+  touched: {},
 };
 var nodes = {}, REV = 0;
 
@@ -633,7 +700,16 @@ function provisional(apiId, parent) {
 
 function reset(snap) {
   S.seq = snap.seq || 0;
+  // Whose count that seq is. Sent back on the next reconnect so the mux can tell a
+  // resume that continues THIS session process from one that would splice a new
+  // process's events onto a dead one's transcript.
+  S.epoch = snap.epoch || null;
   S.info = snap.state || {};
+  if (ON_STATS && S.info.stats) ON_STATS(S.info.stats);
+  // Attaching to a session that is already working: the spinner starts from the mux's
+  // own turn clock, not from the moment this page opened.
+  setBusy(S.info.status === 'busy');
+  if (S.info.turnStartedAt) turnStart = S.info.turnStartedAt;
   S.msgs = []; S.byId = {}; S.tools = {}; S.stream = {}; S.final = {};
   (snap.messages || []).forEach(function (m) { upsert(m); });
   S.pending = {};
@@ -700,9 +776,17 @@ function apply(ev) {
       // 'started' is the clock's zero. It used to be cleared again on 'finished',
       // which threw away the only start time there is — a finished card could never
       // say how long it took, which is the one thing .tool-time exists to show.
-      if (ev.phase === 'started') tr.block.runAt = Date.now();
-      else tr.block.endAt = Date.now();
-      tr.block.runDesc = ev.description || '';
+      if (ev.phase === 'started') { tr.block.runAt = Date.now(); tr.block.runDesc = ev.description || ''; }
+      else {
+        // A BACKGROUNDED tool answered its tool_result the moment it was launched and
+        // has been settled for minutes; its notification is not the end of a call that
+        // was still open. Stamping endAt again turned a 200ms Bash into "312.0s" —
+        // .tool-time measures the call, and the call ended when the result landed.
+        if (tr.block.status === 'running') { tr.block.endAt = Date.now(); tr.block.runDesc = ev.description || ''; }
+        // What the background run finally did, which is the outcome the card should
+        // show in place of the "done" it earned by launching successfully.
+        else tr.block.bg = { status: ev.status || 'completed', description: ev.description || '' };
+      }
       bump(tr.msg);
       return paintAll();
     }
@@ -733,12 +817,38 @@ function apply(ev) {
       return paintCards();
 
     case 'status':
-      S.info.status = ev.status === 'requesting' ? 'busy' : ev.status;
+      // The mux normalizes this to busy/idle and names what the session is DOING
+      // separately — 'requesting' for a turn, 'compacting' for a compaction. The word
+      // used to land in status itself, where 'compacting' matched neither branch: no
+      // spinner, no dot, no sign the session was working at all.
+      S.info.status = ev.status;
+      S.info.activity = ev.activity || null;
+      S.info.turnStartedAt = ev.turnStartedAt || null;
       if (ev.exit) S.info.exit = ev.exit;
+      setBusy(S.info.status === 'busy');
       return paintChrome();
+
+    // A compaction that ended. Success is visible on its own (the context figure in the
+    // footer drops); a failure said nothing anywhere, which is how a compaction aborted
+    // one second in looked exactly like one that never started.
+    case 'compact_done':
+      if (ev.result !== 'success') {
+        S.msgs.push(noticeEntry('Compaction ' + (ev.result || 'failed') +
+          (ev.error ? ' \u2014 ' + ev.error : ''), true));
+        paintAll();
+      }
+      return;
+
+    // The counter the CLI prints beside its spinner. The mux coalesces the child's
+    // events down to a few a second before any of this is reached.
+    case 'thinking_tokens':
+      S.info.outTokens = ev.tokens || 0;
+      return paintBusy();
 
     case 'result': {
       S.info.status = 'idle';
+      S.info.activity = null;
+      setBusy(false);
       if (ev.costUsd) S.info.cost = (S.info.cost || 0) + ev.costUsd;
       // Context is what the last API call actually carried, which is input plus what
       // it read from cache — the same figure ccbb web's own footer shows, computed
@@ -758,20 +868,38 @@ function apply(ev) {
     // The event is {permissionMode, by} — NOT {mode}. Reading ev.mode left the
     // selector on 'default' after a plan accept, which looks exactly like the
     // accept not having taken.
+    // The transcript's own numbers, recomputed by the mux after each turn. They REPLACE
+    // the provisional ones above rather than adding to them — same source as ccbb's
+    // session page, so the footer here and the header block there agree.
+    case 'stats': {
+      S.info.stats = ev.stats || S.info.stats;
+      ['title', 'cost', 'tokens', 'turns', 'subTurns', 'contextTokens', 'contextPeak',
+       'contextMax', 'contextPostCompact'].forEach(function (k) {
+        if (ev[k] != null) S.info[k] = ev[k];
+      });
+      if (ON_STATS) ON_STATS(S.info.stats);
+      return paintChrome();
+    }
     case 'mode':   S.info.permissionMode = ev.permissionMode; return paintChrome();
     case 'model':  S.info.model = ev.model; return paintChrome();
     case 'commands': S.info.commands = ev.commands || []; return;
     case 'submitted':
       if (!ev.accepted) note('submission refused — the child is not accepting input');
       return;
-    case 'interrupted': note('interrupted by ' + (ev.by || 'someone')); return;
+    // In the transcript, not only in the status line's transient note: an interrupt is
+    // what ends a turn or aborts a compaction, and a 20-second note at the far right of
+    // a footer is not where you look for the reason something stopped.
+    case 'interrupted':
+      note('interrupted by ' + (ev.by || 'someone'));
+      S.msgs.push(noticeEntry('Interrupted by ' + (ev.by || 'someone'), true));
+      return paintAll();
     case 'auth':
       // A credential refresh mid-turn is indistinguishable from a hang unless the
       // UI says so — the reason the mux forwards auth_status at all.
       S.info.auth = ev.body;
       return paintChrome();
     case 'retry':  note('retrying the API call'); return paintChrome();
-    case 'rate_limit': note('rate limited'); return paintChrome();
+    case 'rate_limit': note('rate limited', true); return paintChrome();
     case 'stderr': note(String(ev.text || '').trim()); return;
     case 'hook': case 'goal': case 'autocompact': case 'system': case 'unknown': case 'turn_start':
       return;
@@ -779,9 +907,12 @@ function apply(ev) {
   }
 }
 
-function note(text) {
+// pinned means the note outranks whatever transient thing happened after it. Only rate
+// limiting qualifies: it is the one note that explains a session sitting still, and it
+// was being pushed out of the line by the retry message it causes.
+function note(text, pinned) {
   if (!text) return;
-  S.notes.push({ text: text, at: Date.now() });
+  S.notes.push({ text: text, at: Date.now(), pinned: !!pinned });
   if (S.notes.length > 5) S.notes.shift();
   paintChrome();
 }
@@ -809,18 +940,37 @@ function toolNode(b) {
   tw.innerHTML = '&#9654;';
   hdr.appendChild(tw);
   hdr.appendChild(el('span', 'tool-name', head[0]));
-  if (head[1]) hdr.appendChild(el('span', 'secondary', head[1]));
+  // While the tool RUNS the child's own one-line description of the run is the most
+  // informative thing there is about it (the tool_use input is what the model asked
+  // for; runDesc is what is actually happening), so it takes the secondary slot and
+  // the argument stands down. It used to sit in a RUN row inside the body, where a
+  // collapsed card hid it exactly while it mattered.
+  var sec = (b.status === 'running' && b.runDesc) ? b.runDesc : head[1];
+  if (sec) hdr.appendChild(el('span', 'secondary', sec));
   var meta = el('div', 'tool-meta');
+  // What the call actually did, on the header, the way the CLI writes it under a
+  // finished tool ("Read 12 lines", "+18 -4", "3 matches"). A collapsed card said only
+  // that something had finished; the outcome was a click away for every one of them.
+  var sum = toolSummary(b, input, isError);
+  if (sum) meta.appendChild(el('span', 'tool-sum' + (isError ? ' err' : ''), sum));
   var ela = elapsed(b);
   if (ela) meta.appendChild(el('span', 'tool-time', ela));
   // The word, not just the pill's tint: a colour alone is invisible to a reader who
   // cannot separate the hues, and "running" is the state somebody is waiting on.
+  // "background" is a fourth state, not a shade of done: the call succeeded, the WORK
+  // has not finished, and until its task_notification lands there is nothing to report.
+  // Once it does, the card takes the background run's outcome rather than the launch's.
   var st = b.status === 'running' ? 'running' : isError ? 'error' : 'done';
+  if (isBackgrounded(b)) {
+    st = !b.bg ? 'background'
+      : (b.bg.status === 'failed' || b.bg.status === 'error') ? 'error' : 'done';
+  }
   meta.appendChild(el('span', 'tool-status ' + st, st));
   hdr.appendChild(meta);
   hdr.addEventListener('click', function () {
     toggleTool(hdr);
     S.open[b.id] = body.classList.contains('open');
+    S.touched[b.id] = true;
   });
   d.appendChild(hdr);
 
@@ -833,13 +983,97 @@ function toolNode(b) {
     var o = outBlock(b.result, isError);
     if (o) body.appendChild(row('OUT', o));
   }
-  if (b.status === 'running' && b.runDesc) body.appendChild(row('RUN', el('div', 'meta', b.runDesc)));
   // Always appended, even empty: toggleTool() reaches the body through the header's
   // nextElementSibling, and a card without one is a header that cannot open.
   if (!body.firstChild) body.appendChild(el('div', 'meta', b.status === 'running' ? 'running\u2026' : '(no output)'));
   d.appendChild(body);
-  if (S.open[b.id]) { body.classList.add('open'); tw.innerHTML = '&#9660;'; }
+  // Open while it runs, shut when it lands — unless the reader has taken the card over.
+  var open = S.touched[b.id] ? !!S.open[b.id] : b.status === 'running';
+  if (open) { body.classList.add('open'); tw.innerHTML = '&#9660;'; }
   return d;
+}
+
+// The line the CLI prints under a settled tool call. Per-renderer where the tool has a
+// natural unit (lines read, hunks written, matches found) and the result's own first
+// line otherwise, which is what the CLI falls back to as well. Nothing while it runs:
+// the status pill already says running, and a summary of a result that does not exist
+// yet would only be a guess.
+var SUM_MAX = 60;
+function clip(s) {
+  s = String(s == null ? '' : s).replace(/\\s+/g, ' ').trim();
+  return s.length > SUM_MAX ? s.slice(0, SUM_MAX - 1) + '\u2026' : s;
+}
+function firstLine(v) {
+  var t = txt(v).split('\\n');
+  for (var i = 0; i < t.length; i++) if (t[i].trim()) return clip(t[i]);
+  return '';
+}
+function countLines(v) {
+  return txt(v).split('\\n').filter(function (x) { return x.trim(); }).length;
+}
+// Launched, not finished. Two carriers say so: an async agent's own result metadata,
+// and the sentence a backgrounded Bash answers with. DERIVED rather than stamped on the
+// block when the result lands, because a client that attaches later is handed the mux's
+// normalized messages and never sees that moment — the two must read the same block the
+// same way or a reattach quietly changes what the card says.
+function isBackgrounded(b) {
+  return !!(b.resultMeta && b.resultMeta.isAsync) ||
+    /^Command running in background/.test(txt(b.result));
+}
+function toolSummary(b, input, isError) {
+  if (b.status === 'running') return '';
+  // A backgrounded call's summary is the news it eventually sent back, not the
+  // "Command running in background with ID: bzxsnq2zc" it answered with at launch.
+  if (isBackgrounded(b)) return b.bg ? clip(b.bg.description) : 'running in background\u2026';
+  if (isError) return firstLine(b.result) || 'failed';
+  var meta = b.resultMeta || {};
+  var name = b.name === 'Task' ? 'Agent' : b.name;
+  switch (name) {
+    case 'Read': {
+      var n = meta.file && meta.file.numLines != null ? meta.file.numLines : countLines(b.result);
+      return n + ' line' + (n === 1 ? '' : 's');
+    }
+    case 'Write': case 'Edit': case 'NotebookEdit': {
+      var add = 0, del = 0;
+      (meta.structuredPatch || []).forEach(function (h) {
+        (h.lines || []).forEach(function (l) {
+          if (l.charAt(0) === '+') add++; else if (l.charAt(0) === '-') del++;
+        });
+      });
+      if (add || del) return '+' + add + ' \u2212' + del;
+      return name === 'Write' ? countLines(input.content) + ' lines' : '';
+    }
+    case 'Grep': case 'Search': {
+      // The tool answers in one of three shapes depending on output_mode; counting the
+      // non-empty lines is the one reading that is right for all of them.
+      var t = txt(b.result);
+      if (/^No (matches|files) found/i.test(t.trim())) return 'no matches';
+      var n = countLines(t);
+      return n + ' match' + (n === 1 ? '' : 'es');
+    }
+    case 'Glob': {
+      var t2 = txt(b.result);
+      if (/^No files found/i.test(t2.trim())) return 'no files';
+      var g = countLines(t2);
+      return g + ' path' + (g === 1 ? '' : 's');
+    }
+    case 'TodoWrite': {
+      var todos = input.todos || [];
+      var done = todos.filter(function (t3) { return t3.status === 'completed'; }).length;
+      return done + '/' + todos.length + ' done';
+    }
+    // A shell command's output is not a summary of itself. One line is worth showing —
+    // that is the whole answer — but the first line of forty is a fragment ("PID STARTED
+    // ELAPSED CMD", "{", "8"), which is worse than saying how much there is.
+    case 'Bash': case 'PowerShell': {
+      var n2 = countLines(b.result);
+      return n2 <= 1 ? firstLine(b.result) : n2 + ' lines';
+    }
+    // These render their whole point in the body; a one-line echo of it on the header
+    // would be the same words twice.
+    case 'ExitPlanMode': case 'AskUserQuestion': case 'Skill': return '';
+    default: return firstLine(b.result);
+  }
 }
 
 // How long the tool took, for .tool-time. Only the child's task_started /
@@ -853,19 +1087,39 @@ function elapsed(b) {
   return ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's';
 }
 
-// A backgrounded agent reports back as an ordinary user message carrying the whole
-// <task-notification> envelope. Rendering it verbatim leaks harness plumbing into
-// the transcript, which is exactly the leak the terminal client had to fix; both
-// renderers now collapse it to the one line the CLI shows. Elapsed time is
-// TRUNCATED, not rounded — 18625ms reads 18s.
+// Backgrounded work — an agent, or a shell command started with run_in_background —
+// reports back as an ordinary user message carrying the whole <task-notification>
+// envelope. Rendering it verbatim leaks harness plumbing into the transcript, which is
+// the leak the terminal client had to fix too.
+//
+// It is drawn the way the CLI draws it: the bullet, then the summary, at the size of
+// everything else in the transcript. It used to be a .meta line — 12px, grey, no
+// spacing, wedged under the card above it — which reads as a footnote, and a background
+// command reporting that it FAILED is not a footnote. The envelope's <status> says which
+// way it went, and the bullet carries that.
+// Elapsed time is TRUNCATED, not rounded — 18625ms reads 18s.
 function taskNotice(text) {
   var grab = function (re) { var m = re.exec(text); return m ? m[1] : null; };
-  var summary = (grab(/<summary>([\\s\\S]*?)<\\/summary>/) || 'Agent finished').trim();
+  var summary = (grab(/<summary>([\\s\\S]*?)<\\/summary>/) || 'Task finished').trim();
   var ms = Number(grab(/<duration_ms>(\\d+)<\\/duration_ms>/) || 0);
-  var d = el('div', 'meta');
-  d.textContent = '\u23fa ' + summary + (ms ? ' \u00b7 ' + Math.floor(ms / 1000) + 's' : '');
+  var status = (grab(/<status>([\\s\\S]*?)<\\/status>/) || '').trim();
+  var bad = status === 'failed' || status === 'error' || /failed/.test(summary);
+  var d = el('div', 'task-note' + (bad ? ' err' : ''));
+  d.appendChild(el('span', 'bul', '⏺'));
+  var body = el('span', 'note-text', summary);
+  if (ms) body.appendChild(el('span', 'dur', ' · ' + Math.floor(ms / 1000) + 's'));
+  d.appendChild(body);
   return d;
 }
+// A line the CLIENT puts in the transcript — an interrupt, a failed compaction. Shaped
+// like a message so it takes its place in the flow and survives a repaint, and rendered
+// by the same .task-note the child's own notifications use, because to a reader they are
+// the same kind of thing: something happened to this session that nobody typed.
+var NOTICE_SEQ = 0;
+function noticeEntry(text, bad) {
+  return { id: 'notice-' + (++NOTICE_SEQ), _rev: ++REV, role: 'notice', notice: { text: text, bad: !!bad } };
+}
+
 // The child injects this paragraph as the tool result when a permission is
 // denied. It is coaching aimed at the model, not at the person who just clicked
 // No, and echoing it back reads as the model scolding them.
@@ -882,7 +1136,11 @@ function cmdNode(c) {
   var tw = el('span', 'tool-toggle');
   tw.innerHTML = '&#9654;';
   hdr.appendChild(tw);
-  hdr.appendChild(el('span', 'tool-name', (c.local ? '//' : '/') + (c.name || '') + (c.args ? ' ' + c.args : '')));
+  // Output whose invocation this client never saw — attaching to a session mid-command,
+  // most often — has no name to print, and a bare "/" is not a command anybody typed.
+  hdr.appendChild(el('span', 'tool-name', c.name
+    ? (c.local ? '//' : '/') + c.name + (c.args ? ' ' + c.args : '')
+    : 'local command'));
   // Only when it was somebody else: your own label beside every command you ran is
   // noise, and the terminal client makes the same distinction.
   if (c.by && c.by !== LABEL) hdr.appendChild(el('span', 'who', c.by));
@@ -890,7 +1148,8 @@ function cmdNode(c) {
   // ccbb has three pills — running, done, error. A command that worked says "ok"
   // rather than "done" because that is the word the state list asked for; the class
   // stays 'done' so it is ccbb's pill and not a fourth colour invented here.
-  meta.appendChild(el('span', 'tool-status ' + (c.state === 'ok' ? 'done' : c.state), c.state));
+  var word = c.noOutput ? 'local' : c.state;
+  meta.appendChild(el('span', 'tool-status ' + (c.state === 'ok' ? 'done' : c.state), word));
   hdr.appendChild(meta);
   hdr.addEventListener('click', function () {
     toggleTool(hdr);
@@ -904,7 +1163,8 @@ function cmdNode(c) {
   // only carrier, and the words are all still here.
   var t = String(c.text == null ? '' : c.text).replace(/\\u001b\\[[0-9;]*[A-Za-z]/g, '');
   if (t.trim()) body.appendChild(pre(t.replace(/\\s+$/, '')));
-  else body.appendChild(el('div', 'meta', c.state === 'running' ? 'running\u2026' : '(no output)'));
+  else body.appendChild(el('div', 'meta', c.state === 'running' ? 'running\u2026'
+    : c.noOutput ? 'ran in the terminal \u2014 its output is not on the wire' : '(no output)'));
   d.appendChild(body);
   if (S.open[key]) { body.classList.add('open'); tw.innerHTML = '&#9660;'; }
   return d;
@@ -919,6 +1179,35 @@ function msgNode(m) {
   // message when it succeeds and as a replayed USER message after /compact, and
   // neither is a turn anybody said. Rendering it as one is what produced
   // "<local-command-stdout>Compacted </local-command-stdout>" in a speech bubble.
+  if (m.notice) {
+    var nd = el('div', 'task-note' + (m.notice.bad ? ' err' : ''));
+    nd.appendChild(el('span', 'bul', '⏺'));
+    nd.appendChild(el('span', 'note-text', m.notice.text));
+    wrap.appendChild(nd);
+    return wrap;
+  }
+  // The seam a compaction leaves. The summary behind it is the whole conversation and
+  // nobody typed it, so it reads as a rule across the transcript with the numbers on it
+  // — what went in, what came out, how long it took — and the text folded away behind a
+  // click for when you want to see what was kept.
+  if (m.compact) {
+    var k = m.compact;
+    var bits = [k.trigger === 'auto' ? 'auto' : 'manual'];
+    if (k.preTokens) bits.push(fmtTokShort(k.preTokens) + ' \u2192 ' + fmtTokShort(k.postTokens) + ' tokens');
+    if (k.durationMs) bits.push(Math.round(k.durationMs / 1000) + 's');
+    var seam = el('div', 'cseam');
+    var lab = el('button', 'cseam-lab', 'compacted \u00b7 ' + bits.join(' \u00b7 '));
+    var sum = el('div', 'cseam-sum');
+    sum.hidden = true;
+    (m.blocks || []).forEach(function (blk) {
+      if (blk && blk.type === 'text') sum.appendChild(document.createTextNode(blk.text || ''));
+    });
+    lab.onclick = function () { sum.hidden = !sum.hidden; };
+    seam.appendChild(lab);
+    wrap.appendChild(seam);
+    wrap.appendChild(sum);
+    return wrap;
+  }
   if (m.command) {
     var c = m.command;
     wrap.appendChild(cmdNode({ id: m.id, name: c.name || '', args: c.args || '', by: m.by || '',
@@ -927,12 +1216,21 @@ function msgNode(m) {
       // stderr is the ONLY thing on the wire that says a command failed.
       state: c.kind === 'running' || c.kind === 'run' ? 'running'
         : c.stream === 'stderr' ? 'error' : 'ok',
+      // A command the CLI answers in its OWN terminal (/usage, /context and their kind)
+      // sends nothing back over stream-json. The mux settles the card when the next
+      // message arrives and says so here, rather than leaving it spinning for output
+      // that will never come.
+      noOutput: !!c.noOutput,
       text: c.text || '' }));
     return wrap;
   }
   if (m.role === 'user') {
     var whole = (m.blocks || []).map(function (b) { return b && b.type === 'text' ? b.text || '' : ''; }).join('');
-    if (whole.indexOf('<task-notification>') >= 0) { wrap.appendChild(taskNotice(whole)); return wrap; }
+    // Anchored: a notification IS the message. Matching the tag anywhere in the text
+    // swallowed any turn that quoted it — a 30k-character compaction summary of a
+    // conversation about this very code rendered as the two words "Task finished".
+    if (/^<task-notification>[\\s\\S]*<\\/task-notification>$/.test(whole.trim())) {
+      wrap.appendChild(taskNotice(whole)); return wrap; }
     if (REJECTED.test(whole)) {
       wrap.appendChild(el('div', 'meta', 'Interrupted \u00b7 What should Claude do instead?'));
       return wrap;
@@ -1018,15 +1316,137 @@ function scrollDown() {
   l.scrollTop = l.scrollHeight;
 }
 
+// ── The spinner ────────────────────────────────────────────────────────────
+// "\u273b Mulling\u2026 (12s \u00b7 \u2193 1.2k tokens)" — the CLI's own line, from the CLI's own
+// vocabulary (SPIN_VERBS/SPIN_FRAMES, handed in from ccbb-mux.js so the terminal
+// client and this one spin on one list). The verb turns over every four seconds and
+// the frame at 8Hz, both keyed off wall-clock rather than a counter, so two clients
+// watching one session animate together.
+var busyTimer = null, turnStart = 0;
+function setBusy(busy) {
+  if (busy && !busyTimer) {
+    turnStart = Date.now();
+    busyTimer = setInterval(paintBusy, 120);
+  }
+  if (!busy && busyTimer) { clearInterval(busyTimer); busyTimer = null; }
+  paintBusy();
+}
+// The spinner's animation must follow the STATE, never the arrival of an event. It used
+// to start on a status message and stop on another, which worked only because the child
+// repeated 'requesting' several times a second — remove that flood (the mux dedupes it
+// now) or attach to a turn already in flight, and the row would sit there frozen on the
+// first verb it ever painted, at 0s, for the rest of the turn. Called from paintChrome,
+// which every event reaches.
+function syncBusy() {
+  // Same test paintBusy paints from, so the timer and the row can never disagree — a
+  // page with no socket cannot know a session is working, and must not animate as if it did.
+  var want = (S.info || {}).status === 'busy' && !!(WS && WS.readyState === 1);
+  if (want !== !!busyTimer) setBusy(want);
+}
+function paintBusy() {
+  var row = Q('.mx-busy');
+  if (!row) return;
+  // A spinner says the session is working RIGHT NOW, which a page with no socket
+  // cannot know. Left running while the connection is gone it ticks on forever with
+  // whatever verb the session had when the wire went quiet.
+  var busy = (S.info || {}).status === 'busy' && !!(WS && WS.readyState === 1);
+  row.hidden = !busy;
+  // Stop replaces send for as long as the turn runs. Before the composer's own control
+  // said so, interrupting meant knowing about Esc or finding the button in the bar the
+  // phone does not draw.
+  var sb = Q('.send-btn'), kb = Q('.stop-btn');
+  if (sb) sb.hidden = busy;
+  if (kb) kb.hidden = !busy;
+  if (!busy) return;
+  var t = Date.now();
+  // The mux's own turn clock wins: this page may have opened halfway through the turn.
+  var started = (S.info || {}).turnStartedAt || turnStart;
+  var secs = started ? Math.max(0, Math.round((t - started) / 1000)) : 0;
+  row.querySelector('.mx-spin').textContent = SPIN_FRAMES[Math.floor(t / 120) % SPIN_FRAMES.length];
+  var tok = (S.info || {}).outTokens;
+  // The whimsical verbs are for an ordinary turn, where the CLI has nothing better to
+  // say. When the child DOES name what it is doing — compacting, most of all, which
+  // takes half a minute and used to look like a hung session — that word wins.
+  var act = (S.info || {}).activity;
+  var verb = (act && act !== 'requesting')
+    ? act.charAt(0).toUpperCase() + act.slice(1)
+    : SPIN_VERBS[Math.floor(t / 4000) % SPIN_VERBS.length];
+  row.querySelector('.mx-verb').textContent =
+    verb + '\u2026 (' + secs + 's' +
+    (tok ? ' \u00b7 \u2193 ' + fmtTokShort(tok) + ' tokens' : '') + ')';
+}
+
+// One name for this session, everywhere it is drawn. The transcript's title is what
+// ccbb's session list shows and what every non-mux session page shows; the mux's label
+// is an ADDRESS (the name ccbb attach takes), and it stood in as the page's heading
+// only because the title was not on the wire. It is now, so the label is not a name
+// anything displays — it is only the fallback for a session too new to have a title.
+function sessionName(i) {
+  return (i && (i.title || i.label)) || SESSION.slice(0, 8);
+}
+
+// The shrink ladder's rungs, from ccbb's SHARED_JS. A host that did not include that
+// file still gets a footer — one that never shrinks, which is what it did before.
+var LVL = (typeof FOOT_LVL_CTX_LABEL === 'number')
+  ? { pct: FOOT_LVL_PCT, clients: FOOT_LVL_CLIENTS, ctx: FOOT_LVL_CTX_LABEL }
+  : { pct: 99, clients: 99, ctx: 99 };
+
+// The status line, in ccbb web's own shape: money first, then turns, then context as
+// current/peak. What is mux-specific — who else is attached, a credential refresh, the
+// exit code, the last transient note — goes to the right, out of the way of the numbers
+// people actually scan for. lvl is the shrink level fitFoot is trying; see the ladder in
+// ccbb web's SHARED_JS, which both footers share so they give up detail in one order.
+function footHtml(i, lvl) {
+  var money = '<b>$' + Number(i.cost || 0).toFixed(2) + '</b>';
+  // The plan windows, as ccbb's own pills. On a Claude.ai plan the dollars are notional
+  // list price and these are the figure that actually runs out, so a status line without
+  // them is missing the number people are really watching. footWin/subWinTitle come from
+  // ccbb's SHARED_JS — the pill is one object, drawn by one function, in both clients.
+  var pills = SUB && SUB.windows && typeof footWin === 'function'
+    ? (function () {
+        var w = SUB.windows, p = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
+        return p ? '<span class="fwins" title="' + esc(subWinTitle(SUB)) + '">' + p + '</span>' : '';
+      })()
+    : '';
+  var turns = '<span><b>' + (i.turns || 0) + '</b>' +
+    (i.subTurns ? '<span class="sl-sub">+' + i.subTurns + '</span>' : '') + '</span>';
+  var ctxStr = '';
+  if (i.contextTokens) {
+    // Only a peak the session has actually been above is worth a slot: at the high-water
+    // mark "45K/45K" is the same number twice, crowding out figures that differ.
+    var peak = (i.contextPeak || 0) > i.contextTokens ? i.contextPeak : 0;
+    var ctxCost = i.stats && i.stats.context ? i.stats.context.cost : null;
+    ctxStr = '<span class="sl-ctx">' + (lvl >= LVL.ctx ? '' : 'ctx:') +
+      (i.contextPostCompact ? '~' : '') +
+      '<b>' + fmtTokShort(i.contextTokens) + '</b>' + (peak ? '/' + fmtTokShort(peak) : '') +
+      (ctxCost != null ? '/$' + Number(ctxCost).toFixed(2) : '') + '</span>';
+  }
+  var right = [];
+  // "2 controllers" spelled out is four times the width of the fact it carries, and the
+  // fact is only ever a small number of people.
+  if (S.clients.length > 1 && lvl < LVL.clients) right.push(S.clients.length + 'x');
+  if (i.auth && i.auth.isAuthenticating) right.push('refreshing credentials\u2026');
+  if (i.exit) right.push('exited (' + (i.exit.code == null ? i.exit.signal : i.exit.code) + ')');
+  var fresh = S.notes.filter(function (n) { return Date.now() - n.at < 20000; });
+  var pin = fresh.filter(function (n) { return n.pinned; }).pop();
+  var last = fresh[fresh.length - 1];
+  if (pin) right.push(pin.text);
+  if (last && last !== pin) right.push(last.text);
+  return [money, pills, turns, ctxStr,
+    right.length ? '<span class="sl-note">' + esc(right.join(' \u00b7 ')) + '</span>' : ''
+  ].filter(Boolean).join('');
+}
+
 function paintChrome() {
   var i = S.info || {};
   var connected = !!(WS && WS.readyState === 1);
+  syncBusy();
   // Guarded, not assumed: mounted inside ccbb web the bar belongs to the host view,
   // so none of these elements exist. Unguarded this threw on the first paint and
   // took the whole transcript with it.
   var bar = Q('.mx-bar');
   if (bar) {
-    bar.querySelector('.label').textContent = i.label || SESSION.slice(0, 8);
+    bar.querySelector('.label').textContent = sessionName(i);
     bar.querySelector('.cwd').textContent = i.cwd || '';
     var dot = bar.querySelector('.dot');
     dot.className = 'dot ' + (connected ? (i.status || 'idle') : 'gone');
@@ -1035,45 +1455,17 @@ function paintChrome() {
   var mode = Q('.mx-mode');
   if (mode && mode.value !== (i.permissionMode || 'default')) mode.value = i.permissionMode || 'default';
 
-  // The status line, in ccbb web's own shape: money first, then turns, then context
-  // as current/peak. What is mux-specific — who else is attached, a credential
-  // refresh, the exit code, the last transient note — goes to the right, out of the
-  // way of the numbers people actually scan for.
-  var money = '<b>$' + Number(i.cost || 0).toFixed(2) + '</b>';
-  // The plan windows, as ccbb's own pills. On a Claude.ai plan the dollars are notional
-  // list price and these are the figure that actually runs out, so a status line without
-  // them is missing the number people are really watching. footWin/subWinTitle come from
-  // ccbb's SHARED_JS — the pill is one object, drawn by one function, in both clients.
-  var pills = SUB && SUB.windows && typeof footWin === 'function'
-    ? (function () {
-        var w = SUB.windows, p = footWin('5h', w.fiveHour) + footWin('7d', w.sevenDay);
-        return p ? '<span class="fwins" title="' + esc(subWinTitle(SUB)) + '">' + p + '</span>' : '';
-      })()
-    : '';
-  var turns = '<span><b>' + (i.turns || 0) + '</b></span>';
-  var ctxStr = '';
-  if (i.contextTokens) {
-    var peak = Math.max(i.contextPeak || 0, i.contextTokens);
-    ctxStr = '<span class="sl-ctx">ctx:<b>' + fmtTokShort(i.contextTokens) + '</b>/' +
-      fmtTokShort(peak) + '</span>';
-  }
-  var right = [];
-  if (S.clients.length > 1) right.push(S.clients.length + ' controllers');
-  if (i.auth && i.auth.isAuthenticating) right.push('refreshing credentials\u2026');
-  if (i.exit) right.push('exited (' + (i.exit.code == null ? i.exit.signal : i.exit.code) + ')');
-  var last = S.notes[S.notes.length - 1];
-  if (last && Date.now() - last.at < 20000) right.push(last.text);
-  Q('.sv-foot .sl').innerHTML = [money, pills, turns, ctxStr,
-    right.length ? '<span class="sl-note">' + esc(right.join(' \u00b7 ')) + '</span>' : ''
-  ].filter(Boolean).join('');
+  var sl = Q('.sv-foot .sl');
+  if (sl && typeof fitFoot === 'function') fitFoot(sl, function (lvl) { sl.innerHTML = footHtml(i, lvl); });
+  else if (sl) sl.innerHTML = footHtml(i, 0);
   // Pushed OUT through one callback rather than letting the host reach into this
   // instance for it. One seam to keep correct, and the standalone page just does
   // not pass onChrome.
   if (ON_CHROME) ON_CHROME({
-    label: i.label || SESSION.slice(0, 8), cwd: i.cwd || '',
-    status: connected ? (i.status || 'idle') : 'gone',
+    title: sessionName(i), label: i.label || '', cwd: i.cwd || '',
+    status: connected ? (i.status || 'idle') : 'gone', activity: i.activity || null,
     permissionMode: i.permissionMode || 'default',
-    connected: connected, clients: S.clients.slice(), info: i,
+    connected: connected, clients: S.clients.slice(), info: i, stats: i.stats || null,
   });
 }
 
@@ -1241,22 +1633,29 @@ function connect() {
     '&label=' + encodeURIComponent(LABEL) + '&kind=web';
   // sinceSeq is what makes a backgrounded phone cheap to bring back: the mux
   // replays only what was missed, or falls back to a snapshot if the ring moved on.
-  if (S.seq) u += '&since=' + S.seq;
+  if (S.seq && S.epoch) u += '&since=' + S.seq + '&epoch=' + encodeURIComponent(S.epoch);
   if (TOKEN) u += '&token=' + encodeURIComponent(TOKEN);
   var ws = new WebSocket(u);
   WS = ws;
-  ws.onopen = function () { retry = 0; paintChrome(); };
+  ws.onopen = function () { retry = 0; paintChrome(); paintBusy(); };
   ws.onmessage = function (e) {
     var m;
     try { m = JSON.parse(e.data); } catch (err) { return; }
     if (m.op === 'snapshot') return reset(m);
-    if (m.op === 'resumed') { S.seq = m.from || S.seq; return paintChrome(); }
+    if (m.op === 'resumed') {
+      // A resume that hands back a seq BEHIND this page's own means the mux restarted
+      // under us: our transcript is from a process that no longer exists. Ask for a
+      // snapshot outright rather than sit on it.
+      if (m.seq != null && m.seq < S.seq) { S.seq = 0; send({ op: 'snapshot' }); return; }
+      S.epoch = m.epoch || S.epoch;
+      S.seq = m.from || S.seq; return paintChrome();
+    }
     if (m.op === 'presence') { S.clients = m.clients || []; return paintChrome(); }
     if (m.op === 'ack') { if (m.error) note(m.error); return; }
     if (m.op === 'event') return apply(m);
   };
   ws.onclose = function () {
-    WS = null; paintChrome();
+    WS = null; paintChrome(); paintBusy();
     if (dead) return;
     retry = Math.min(retry + 1, 6);
     reconnectTimer = setTimeout(connect, 250 * retry * retry);
@@ -1449,6 +1848,11 @@ function wire() {
   });
   var stopBtn = Q('.mx-stop');
   if (stopBtn) stopBtn.addEventListener('click', function () { send({ op: 'interrupt' }); });
+  var killBtn = Q('.stop-btn');
+  if (killBtn) killBtn.addEventListener('click', function () { send({ op: 'interrupt' }); });
+  // A pane dragged narrower changes what fits with no session event behind it, and
+  // nothing else would repaint the row.
+  if (typeof onFootResize === 'function') onFootResize(Q('.sv-foot .sl'), paintChrome);
   connect();
   loadSub();
   input.focus();
@@ -1477,6 +1881,7 @@ var handle = {
     if (o && o.closeSession) send({ op: 'close' });
     dead = true;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (busyTimer) { clearInterval(busyTimer); busyTimer = null; }
     document.removeEventListener('visibilitychange', onVisible);
     if (WS) { try { WS.onclose = null; WS.close(); } catch (e) {} WS = null; }
     root.innerHTML = '';
@@ -1487,6 +1892,13 @@ return handle;
 };
 })();
 `;
+
+// The CLI's spinner vocabulary, baked in at assembly time. ccbb-mux.js owns the lists —
+// the terminal client reads them straight out of the same export — so the two clients
+// cannot spin on different words, and neither file has to be edited twice to add one.
+const APP_JS = APP_JS_SRC
+  .replace('__SPIN_VERBS__', () => JSON.stringify(require('./ccbb-mux').SPIN_VERBS))
+  .replace('__SPIN_FRAMES__', () => JSON.stringify(require('./ccbb-mux').SPIN_FRAMES));
 
 // The standalone page. A thin caller of the factory — it parses the session out of
 // its own URL, mounts one view, and republishes that view's debug handle as
@@ -1619,7 +2031,7 @@ function muxRows(mux) {
   if (!mux) return [];
   return mux.list().map(x => ({
     sessionId: x.id,
-    title: x.label || '',
+    title: x.title || x.label || '',
     live: x.status !== 'exited',
     liveStatus: x.status || null,
     projectPath: x.cwd || '',

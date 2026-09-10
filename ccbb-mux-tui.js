@@ -408,13 +408,10 @@ function renderPlan(plan, width) {
 }
 
 // The CLI closes a turn with one of a rotating set of whimsical past-tense verbs
-// ("✻ Baked for 9s · done 2:04 PM"). The exact list is not published; these are
-// the ones the capture turned up, cycled rather than randomized so a replay of
-// the same transcript renders the same way twice.
-const TURN_VERBS = ['Baked', 'Worked', 'Crunched', 'Cogitated', 'Meandered', 'Puzzled', 'Mustered', 'Simmered', 'Percolated', 'Noodled', 'Pondered'];
-// The spinner's present-tense counterparts, cycled while a turn is in flight.
-const SPIN_VERBS = ['Meandering', 'Puzzling', 'Mustering', 'Simmering', 'Percolating', 'Noodling', 'Pondering', 'Baking'];
-const SPIN_FRAMES = ['✽', '✻', '✳', '✶', '✷', '✵'];
+// ("✻ Baked for 9s · done 2:04 PM"), and spins on their present-tense counterparts.
+// Both lists — and the frames — live in ccbb-mux.js now: the web client draws the same
+// spinner, and a vocabulary kept in two files is a vocabulary that diverges.
+const { TURN_VERBS, SPIN_VERBS, SPIN_FRAMES } = require('./ccbb-mux');
 
 const ALT_ON = '\x1b[?1049h', ALT_OFF = '\x1b[?1049l';
 const HIDE = '\x1b[?25l', SHOW = '\x1b[?25h';
@@ -512,7 +509,9 @@ async function runAttach(argv) {
   }
   if (!sessionId) { console.error('ccbb: attach --url needs a session id'); process.exit(1); }
   const tok = common.peerToken ? common.peerToken() : null;
-  const qs = new URLSearchParams({ session: sessionId, label, kind: 'tui' });
+  // pid: this process is in a tmux pane more often than not, and telling the mux which
+  // process we are is what lets ccbb web's "$>" open THAT pane instead of a fresh one.
+  const qs = new URLSearchParams({ session: sessionId, label, kind: 'tui', pid: String(process.pid) });
   if (tok) qs.set('token', tok);
 
   const WebSocket = require('ws');
@@ -782,7 +781,12 @@ class TuiClient {
   spinnerLine() {
     const t = Date.now();
     const secs = this.turnStart ? Math.round((t - this.turnStart) / 1000) : 0;
-    const verb = SPIN_VERBS[Math.floor(t / 4000) % SPIN_VERBS.length];
+    // What the child says it is doing beats a whimsical verb — 'Compacting' above all,
+    // which runs for half a minute and otherwise looks like a stalled session.
+    const act = this.state.activity;
+    const verb = (act && act !== 'requesting')
+      ? act.charAt(0).toUpperCase() + act.slice(1)
+      : SPIN_VERBS[Math.floor(t / 4000) % SPIN_VERBS.length];
     const frame = SPIN_FRAMES[Math.floor(t / 120) % SPIN_FRAMES.length];
     const tok = this.state.outTokens ? ` · ↓ ${this.state.outTokens} tokens` : '';
     return A.yellow(frame) + A.gray(` ${verb}… (${secs}s${tok})`) +
@@ -1096,7 +1100,15 @@ class TuiClient {
   onMessage(m) {
     if (m.seq) this.seq = m.seq;
     if (m.op === 'snapshot') return this.onSnapshot(m);
-    if (m.op === 'resumed')  return this.out(A.gray(`— resumed from #${m.from} —`));
+    if (m.op === 'resumed') {
+      // Behind our own seq: the mux restarted and this transcript belongs to a dead
+      // process. Re-attach with no sinceSeq to get a snapshot instead of drifting.
+      if (m.seq != null && m.seq < this.seq) {
+        this.seq = 0;
+        return this.send({ op: 'snapshot' });
+      }
+      return this.out(A.gray(`— resumed from #${m.from} —`));
+    }
     if (m.op === 'presence') { this.peers = m.clients; return this.drawPrompt(); }
     if (m.op === 'ack') { if (m.error) this.out(A.red('! ' + m.error)); return; }
     if (m.op !== 'event') return;
@@ -1107,7 +1119,7 @@ class TuiClient {
     this.state = m.state || {};
     this.statusLine.update(this.state, this.lastUsage);
     this.peers = m.clients || [];
-    this.out(A.gray(`— ${this.state.label || this.state.id} · ${this.state.cwd} · ${this.state.messages || (m.messages || []).length} messages —`));
+    this.out(A.gray(`— ${this.state.title || this.state.label || this.state.id} · ${this.state.cwd} · ${this.state.messages || (m.messages || []).length} messages —`));
     // An exited session stays in the mux so its transcript stays readable, and a name
     // still resolves to it once nothing live holds that name — so `ccbb attach api`
     // can land on a dead session. It renders, it accepts typing, and nothing answers.
@@ -1182,6 +1194,7 @@ class TuiClient {
       }
       case 'result': {
         this.endStream();
+        this.state.activity = null;
         this.setBusy(false);
         if (e.costUsd != null) this.state.cost = (this.state.cost || 0) + e.costUsd;
         this.state.turns = (this.state.turns || 0) + 1;
@@ -1231,14 +1244,23 @@ class TuiClient {
       case 'model': this.state.model = e.model;
         this.statusLine.update(this.state, this.lastUsage);
         return this.out(A.gray(`  model → ${e.model} (${e.by})`));
-      case 'status': this.setBusy(e.status === 'busy'); return;
+      case 'status': this.state.activity = e.activity || null; this.setBusy(e.status === 'busy'); return;
+      case 'compact_done':
+        if (e.result === 'success') return this.out(A.gray('\n  — compacted —'));
+        return this.out(A.red(`\n  — compaction ${e.result || 'failed'}${e.error ? ': ' + e.error : ''} —`));
+      // The counter the spinner has always wanted to print and never had: the mux
+      // coalesces the child's thinking-token events and forwards the running total.
+      case 'thinking_tokens': this.state.outTokens = e.tokens || 0; return;
       case 'auth':  return this.out(A.yellow(`  auth: ${e.body && e.body.status || 'refreshing credentials…'}`));
       case 'retry': return this.out(A.yellow(`  retrying (${e.body && e.body.error}) attempt ${e.body && e.body.attempt}`));
       case 'hook':  return;                       // too chatty for the terminal; the web UI shows these
       case 'system':
         if (e.subtype === 'compact_boundary') {
           const md = (e.body && e.body.compact_metadata) || {};
-          return this.out(A.gray(`\n  ── compacted (${md.trigger || 'manual'}${md.pre_tokens ? ', was ' + Math.round(md.pre_tokens / 1000) + 'k' : ''}) ──`));
+          const span = md.pre_tokens
+            ? `, ${Math.round(md.pre_tokens / 1000)}k → ${Math.round((md.post_tokens || 0) / 1000)}k` : '';
+          const took = md.duration_ms ? `, ${Math.round(md.duration_ms / 1000)}s` : '';
+          return this.out(A.gray(`\n  ── compacted (${md.trigger || 'manual'}${span}${took}) ──`));
         }
         return;
       case 'stderr': return this.out(A.red('  ' + String(e.text).trimEnd()));
@@ -1277,6 +1299,10 @@ class TuiClient {
     // message when it succeeds and as a replayed USER message after /compact, and
     // neither is a turn anybody said.
     if (msg.command) return this.renderCommand(msg);
+    // The compaction summary — the whole conversation as one synthetic turn. The
+    // boundary line above it already said what happened; the text itself is 30k
+    // characters of recap nobody typed.
+    if (msg.compact) return;
     if (msg.role === 'user') {
       if (msg.isMeta || msg.isSynthetic) return;
       const text = msg.blocks.filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -1284,7 +1310,9 @@ class TuiClient {
       // A backgrounded agent reports back as a user message carrying the whole
       // task-notification envelope. Echoing that verbatim is the same leak the
       // launch metadata was; the CLI shows one line and so do we.
-      if (text.includes('<task-notification>')) return this.agentFinished(text);
+      // Anchored: the notification IS the message. A turn that merely quotes the tag
+      // is a person talking, and printing it as "Task finished" ate the whole turn.
+      if (/^<task-notification>[\s\S]*<\/task-notification>$/.test(text.trim())) return this.agentFinished(text);
       const who = msg.by && msg.by !== this.label ? A.magenta(` (${msg.by})`) : '';
       return this.out('\n' + A.gray('❯ ') + A.bold(wrap(text, w - 2, 0).replace(/\n/g, '\n  ')) + who);
     }
@@ -1317,13 +1345,20 @@ class TuiClient {
   }
 
   // "⏺ Agent "Count txt files" finished · 18s", and the agent leaves the footer.
+  // A <task-notification> — from an agent, or from a shell command started in the
+  // background. The envelope's <status> is what tells the two outcomes apart, and it
+  // was being ignored: a background command that FAILED printed the same green bullet
+  // as one that succeeded.
   agentFinished(text) {
     const grab = re => (re.exec(text) || [])[1];
-    const summary = (grab(/<summary>([\s\S]*?)<\/summary>/) || 'Agent finished').trim();
+    const summary = (grab(/<summary>([\s\S]*?)<\/summary>/) || 'Task finished').trim();
     const ms = Number(grab(/<duration_ms>(\d+)<\/duration_ms>/) || 0);
+    const status = (grab(/<status>([\s\S]*?)<\/status>/) || '').trim();
     const id = grab(/<task-id>([\s\S]*?)<\/task-id>/);
     if (id) this.agents.delete(id.trim());
-    this.out('\n' + DOT.done + ' ' + A.bold(summary) + (ms ? A.gray(` · ${Math.floor(ms / 1000)}s`) : ''));
+    const bad = status === 'failed' || status === 'error' || /failed/.test(summary);
+    this.out('\n' + (bad ? DOT.error : DOT.done) + ' ' +
+      (bad ? A.red(summary) : A.bold(summary)) + (ms ? A.gray(` · ${Math.floor(ms / 1000)}s`) : ''));
   }
 
   // The elbow body for a settled tool, or null when nothing should be drawn.

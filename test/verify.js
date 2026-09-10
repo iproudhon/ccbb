@@ -277,7 +277,14 @@ async function main() {
   const cm = cs.messages[cs.messages.length - 1];
   check('a synthetic command result is tagged as command output',
     !!(cm && cm.command && cm.command.kind === 'out'), JSON.stringify(cm && cm.command));
-  check('and it is not left looking like ordinary assistant prose', cm.isMeta === true);
+  // One card, not two: the answer folds into the invocation the mux drew when the
+  // command was submitted, so what is left is that card — a command entry — and not a
+  // synthetic assistant turn sitting under an invocation still saying "running".
+  check('and it is not left looking like ordinary assistant prose',
+    cm.role === 'user' && cm.isSynthetic === true && cm.command.kind === 'out');
+  check('the answer folded into the invocation instead of making a second card',
+    cs.messages.filter(x => x.command).length === 1,
+    String(cs.messages.filter(x => x.command).length));
   check('the command name is recovered from what was submitted',
     cm.command.name === 'cost', String(cm.command.name));
   check('and so is who ran it', cm.by === 'tester', String(cm.by));

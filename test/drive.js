@@ -15,7 +15,7 @@ const port = process.argv[2], sid = process.argv[3], mode = process.argv[4] || '
 // a driver with no token is refused rather than merely unlucky.
 const common = require('../ccbb-common');
 const token = process.argv[5] || (common.peerToken ? common.peerToken() : '') || '';
-const TURNS = ['is 289 prime?', 'fix the typo', 'ask me something', 'show me the tools', 'plan it', 'run an agent'];
+const TURNS = ['is 289 prime?', 'fix the typo', 'ask me something', 'show me the tools', 'plan it', 'run an agent', 'start the server'];
 const STOP_AT = mode === 'hold' ? 2 : mode === 'plan' ? 5 : mode === 'one' ? 1 : TURNS.length;
 
 // /mux/mux: the outer /mux is ccbb web's prefix for the multiplexer, the inner one is
