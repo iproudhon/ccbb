@@ -219,6 +219,27 @@ const APP_CSS = `
   font-family: var(--vscode-editor-font-family); font-size: 12px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .muxv .tool-hdr .who { color: var(--vscode-descriptionForeground); font-size: 11px; }
+/* Dimmed rather than hidden-until-hover: this view is also read on a phone, where there
+   is no hover and a button that only appears on one is a button that does not exist. */
+.muxv .tool-hdr .tool-btns { flex: 0 0 auto; display: inline-flex; gap: 0; opacity: .35; }
+.muxv .tool-hdr .tool-btns .flw-btn { padding: 2px 5px; font-size: 12px; }
+.muxv .tool-hdr:hover .tool-btns, .muxv .tool-hdr .tool-btns:hover { opacity: 1; }
+/* Typed output on a card: the panel's renderer inside the card's body. The body keeps
+   its own padding, so the renderer's is dropped; a long result scrolls inside a cap
+   rather than pushing the whole transcript. */
+.muxv .tool-body.cmd-out { max-height: 45vh; overflow: auto; }
+.muxv .tool-body > .cmd-content { padding: 0; overflow: visible; }
+/* The card is the box. A second bordered, padded box inside it is a frame around a
+   frame, so the output sits flat on the card. */
+.muxv .tool-body > .cmd-content pre { border: none; background: none; border-radius: 0; padding: 0; margin: 0; }
+.muxv .tool-body > .cmd-content.md { padding: 2px 0 0; }
+.muxv .tool-body > .cmd-content.html { height: 360px; }
+/* Maximized: the card leaves the transcript and takes the viewport, the way the
+   docked panel does. */
+.muxv .tool-card.max { position: fixed; inset: 0; z-index: 50; margin: 0; border-radius: 0;
+  max-width: none; width: auto; display: flex; flex-direction: column; background: var(--bg); }
+.muxv .tool-card.max .tool-body { flex: 1 1 auto; max-height: none; min-height: 0; overflow: auto; display: block; }
+.muxv .tool-card.max .tool-body > .cmd-content.html { height: 100%; }
 /* Own line rather than ccbb's .msg-label, which is uppercase and letterspaced for a
    role ("YOU"). This is a person's name, and shouting it would be wrong. */
 .muxv .msg .by { font-size: 11px; color: var(--vscode-descriptionForeground); }
@@ -350,6 +371,8 @@ var BASE = opts.base || '';
 var SESSION = opts.session || '';
 var TOKEN = opts.token || '';
 var LABEL = opts.label || 'web';
+// The ccbb server this session lives on, for titling output that leaves the view.
+var MACHINE = opts.machine || '';
 // HAS_BAR, not CHROME — the renderer below already binds CHROME to the
 // mcp__claude-in-chrome__ tool prefix, and shadowing it would break the fallback
 // chain for exactly one family of tools.
@@ -935,6 +958,7 @@ function toolNode(b) {
   // '.msg.hist .msg-body, .tool-card.hist' — the card is named on its own, so a class
   // left on the wrapper dims the prose and leaves the cards at full strength.
   var d = el('div', 'tool-card' + (b.hist ? ' hist' : ''));
+  d.dataset.tid = b.id;                          // refold() matches old card to new by this
   var hdr = el('div', 'tool-hdr');
   var tw = el('span', 'tool-toggle');
   tw.innerHTML = '&#9654;';
@@ -1132,6 +1156,7 @@ var REJECTED = /^The user (doesn't want to proceed with this tool use|doesn't wa
 function cmdNode(c) {
   var key = 'cmd:' + (c.id || c.name);
   var d = el('div', 'tool-card');
+  d.dataset.tid = key;
   var hdr = el('div', 'tool-hdr');
   var tw = el('span', 'tool-toggle');
   tw.innerHTML = '&#9654;';
@@ -1144,6 +1169,35 @@ function cmdNode(c) {
   // Only when it was somebody else: your own label beside every command you ran is
   // noise, and the terminal client makes the same distinction.
   if (c.by && c.by !== LABEL) hdr.appendChild(el('span', 'who', c.by));
+  // The docked panel's controls, on the card: minimize (the title bar alone), maximize
+  // (the card takes the viewport), and detach (a window of its own, so a long //ihtml
+  // report or a wall of //sh output stays up while the transcript scrolls underneath).
+  var label = (c.local ? '//' : '/') + (c.name || 'command') + (c.args ? ' ' + c.args : '');
+  var out = c.out || { kind: c.html ? 'html' : 'console', content: c.text || '' };
+  if (c.state !== 'running') {
+    var btns = el('span', 'tool-btns');
+    btns.innerHTML = '<button class="flw-btn" data-c="min" title="Minimize">&#8211;</button>'+
+      '<button class="flw-btn" data-c="max" title="Maximize">&#9633;</button>'+
+      '<button class="flw-btn" data-c="pop" title="Detach to a floating window">&#10697;</button>';
+    btns.addEventListener('click', function (e) {
+      var b = e.target.closest('.flw-btn');
+      if (!b) return;
+      e.stopPropagation();
+      if (b.dataset.c === 'pop') {
+        floatWin((MACHINE ? MACHINE + ' ' : '') + sessionName(S.info) + ': ' + label,
+          function (host) { host.appendChild(renderCmdOutput(out)); }, root);
+      } else if (b.dataset.c === 'max') {
+        var on = !d.classList.contains('max');
+        d.classList.toggle('max', on);
+        b.innerHTML = on ? '&#10064;' : '&#9633;'; b.title = on ? 'Restore' : 'Maximize';
+        if (on && !body.classList.contains('open')) { body.classList.add('open'); tw.innerHTML = '&#9660;'; S.open[key] = true; }
+      } else {
+        d.classList.remove('max');
+        if (body.classList.contains('open')) { toggleTool(hdr); S.open[key] = false; }
+      }
+    });
+    hdr.appendChild(btns);
+  }
   var meta = el('div', 'tool-meta');
   // ccbb has three pills — running, done, error. A command that worked says "ok"
   // rather than "done" because that is the word the state list asked for; the class
@@ -1162,7 +1216,10 @@ function cmdNode(c) {
   // escape bytes. Nothing is lost that a reader could have used: the colour was the
   // only carrier, and the words are all still here.
   var t = String(c.text == null ? '' : c.text).replace(/\\u001b\\[[0-9;]*[A-Za-z]/g, '');
-  if (t.trim()) body.appendChild(pre(t.replace(/\\s+$/, '')));
+  // A ccbb // command came back typed — markdown, source, a document — and is drawn by
+  // the same renderer as the docked panel. The child's own /commands are plain text.
+  if (c.out && c.state !== 'running') { body.className += ' cmd-out'; body.appendChild(renderCmdOutput(c.out)); }
+  else if (t.trim()) body.appendChild(pre(t.replace(/\\s+$/, '')));
   else body.appendChild(el('div', 'meta', c.state === 'running' ? 'running\u2026'
     : c.noOutput ? 'ran in the terminal \u2014 its output is not on the wire' : '(no output)'));
   d.appendChild(body);
@@ -1221,6 +1278,7 @@ function msgNode(m) {
       // message arrives and says so here, rather than leaving it spinning for output
       // that will never come.
       noOutput: !!c.noOutput,
+      out: c.out || null,
       text: c.text || '' }));
     return wrap;
   }
@@ -1271,12 +1329,35 @@ function msgNode(m) {
 function displayList() {
   var extra = [];
   for (var k in S.stream) extra.push(S.stream[k]);
-  // ccbb's own // commands, which the child never sees and the mux never stores.
-  // They ride at the end rather than in transcript order because they have no place
-  // in it: they are this page talking to this server, not part of the conversation.
-  // They also survive reset(), so a reconnect does not silently swallow the answer
-  // you just asked for.
-  return S.msgs.concat(extra).concat(S.cmds);
+  // ccbb's own // commands, which the child never sees and the mux never stores. Each
+  // one is pinned to the message that was last on screen when it was run, so it stays
+  // where you ran it: parked at the end, every later turn slid in above them and the
+  // transcript read as if the model had answered a command it never saw. One with no
+  // message before it leads; one whose anchor is gone (a /clear, a shorter snapshot)
+  // trails. They survive reset() either way, so a reconnect does not swallow an answer.
+  // One run while a reply was still streaming is pinned to the reply's API id (the
+  // only id it has before it lands), so it follows the whole reply once every piece
+  // of it has arrived: text and tool calls from one API message land as several
+  // entries sharing that id, and the command belongs after the last of them, not
+  // between them — which is where it went when it was pinned to whatever was last
+  // FINISHED, with the words the reader had just watched sliding in underneath it.
+  var byAfter = {}, lead = [], orphan = [], hold = null, heldApi = null;
+  S.cmds.forEach(function (c) {
+    if (!c.after) lead.push(c);
+    else (byAfter[c.after] = byAfter[c.after] || []).push(c);
+  });
+  var out = lead;
+  function flush() { if (hold) { out = out.concat(hold); hold = null; heldApi = null; } }
+  S.msgs.concat(extra).forEach(function (m) {
+    if (hold && m.apiId !== heldApi) flush();
+    out.push(m);
+    if (byAfter[m.id]) { out = out.concat(byAfter[m.id]); delete byAfter[m.id]; }
+    var ak = m.apiId ? 'api:' + m.apiId : null;
+    if (ak && byAfter[ak]) { hold = (hold || []).concat(byAfter[ak]); heldApi = m.apiId; delete byAfter[ak]; }
+  });
+  flush();
+  for (var id in byAfter) orphan = orphan.concat(byAfter[id]);
+  return out.concat(orphan);
 }
 
 function paintAll() {
@@ -1290,7 +1371,7 @@ function paintAll() {
       var made = msgNode(m);
       if (!made) { if (n && n.parentNode) n.parentNode.removeChild(n); delete nodes[m.id]; return; }
       made._rev = m._rev;
-      if (n && n.parentNode) host.replaceChild(made, n); else host.appendChild(made);
+      if (n && n.parentNode) { host.replaceChild(made, n); refold(n, made); } else host.appendChild(made);
       nodes[m.id] = made;
       n = made;
     }
@@ -1305,6 +1386,32 @@ function paintAll() {
   });
   if (atBottom) scrollDown();
   paintChrome();
+}
+
+// A card is rebuilt from scratch on every change to its message, and a rebuilt card
+// starts in whatever fold state the model says — open while it runs, shut once it lands.
+// So the moment a tool finished, a card the reader was looking into snapped shut in one
+// frame and everything under it jumped up. The same fold the reader would have made by
+// clicking slides; this makes the one the code makes slide too: the fresh card is put
+// back into the state the old one showed, then toggled the way a click would be.
+function refold(oldNode, newNode) {
+  var was = {};
+  var olds = oldNode.querySelectorAll('.tool-card[data-tid]');
+  for (var i = 0; i < olds.length; i++) {
+    var ob = olds[i].querySelector('.tool-body');
+    if (ob) was[olds[i].dataset.tid] = ob.classList.contains('open');
+  }
+  var news = newNode.querySelectorAll('.tool-card[data-tid]');
+  for (var j = 0; j < news.length; j++) {
+    var card = news[j], tid = card.dataset.tid;
+    if (!(tid in was)) continue;
+    var hdr = card.querySelector('.tool-hdr'), body = hdr && hdr.nextElementSibling;
+    if (!body || !body.classList.contains('tool-body')) continue;
+    var open = body.classList.contains('open');
+    if (was[tid] === open) continue;
+    body.classList.toggle('open', was[tid]);
+    toggleTool(hdr);
+  }
 }
 
 function nearBottom() {
@@ -1698,7 +1805,14 @@ function runLocal(raw) {
   // Everything the renderer needs lives inside .command, exactly as it does for a
   // command the child answered — one shape, one renderer, and no second path that
   // can be styled differently by accident.
-  var entry = { id: 'local-' + (++CMD_SEQ), _rev: ++REV,
+  // Anchored to a message the mux numbered, not a page-local notice: a notice's id is
+  // reissued after a reconnect, and a card pinned to one would drift.
+  // A reply still streaming is the last thing on screen, so the card goes under it —
+  // by API id, since the streamed entry is replaced by the real message when it lands.
+  var after = null, sk = Object.keys(S.stream);
+  if (sk.length) after = 'api:' + S.stream[sk[sk.length - 1]].apiId;
+  for (var i = S.msgs.length - 1; i >= 0 && !after; i--) if (S.msgs[i].role !== 'notice') after = S.msgs[i].id;
+  var entry = { id: 'local-' + (++CMD_SEQ), _rev: ++REV, after: after,
     command: { kind: 'running', name: name, args: args, local: true, stream: 'stdout', text: '' } };
   // The pseudo-message the transcript renders. It is its own shape rather than a
   // faked child message: nothing downstream should mistake this for something the
@@ -1716,6 +1830,8 @@ function runLocal(raw) {
       if (d && d.kind === 'clear') { S.cmds = []; nodes = {}; return paintAll(); }
       entry.command.kind = 'out';
       entry.command.stream = d && d.error ? 'stderr' : 'stdout';
+      // The whole typed result rides along: kind and lang decide how the card draws it.
+      entry.command.out = d && !d.error ? { kind: d.kind, lang: d.lang, content: d.content || '' } : null;
       entry.command.text = d && d.error ? d.error : (d && d.content) || '';
       entry._rev = ++REV;
       paintAll();
@@ -1915,6 +2031,7 @@ var view = window.createMuxView(document.getElementById('app'), {
   session: HERE[2] || '',
   token: qs.get('token') || '',
   label: qs.get('label') || 'web',
+  machine: __MACHINE__,
   bar: true,
 });
 window.ccbb = view;
@@ -1942,6 +2059,11 @@ function host() {
   try { return require('./ccbb-web'); } catch (e) { return {}; }
 }
 function hostCss() { return host().APP_CSS || ''; }
+// The ccbb server's name, for titling output that leaves the page. The mux has no
+// identity of its own; standalone it borrows ccbb's, and without that it is nameless.
+function machineName() {
+  try { return require('./ccbb-common').serverIdentity().name || ''; } catch (e) { return ''; }
+}
 function hostJs() { return host().SHARED_JS || ''; }
 
 // The standalone page: the shell the factory mounts into, plus the two
@@ -1953,6 +2075,9 @@ const APP_HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
 <title>ccbb mux</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
 <style>__CCBB_CSS__</style>
 <style>__APP_CSS__</style>
 <style>__PAGE_CSS__</style>
@@ -1996,7 +2121,9 @@ function mount(mux) {
   const pageHtml = () => page || (page = APP_HTML
     .replace('__CCBB_CSS__', () => hostCss()).replace('__SHARED_JS__', () => hostJs())
     .replace('__APP_CSS__', () => APP_CSS).replace('__PAGE_CSS__', () => PAGE_CSS)
-    .replace('__APP_JS__', () => APP_JS).replace('__BOOT_JS__', () => BOOT_JS));
+    .replace('__APP_JS__', () => APP_JS).replace('__BOOT_JS__', () => BOOT_JS)
+    // After BOOT_JS is in, since that is where the placeholder lives.
+    .replace('__MACHINE__', () => JSON.stringify(machineName())));
   // subPath is the path with the host's prefix already stripped. Standalone there is
   // no prefix and req.url is the whole of it; under ccbb web it is /mux/... and only
   // the caller knows how much to remove.

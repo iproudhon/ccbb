@@ -123,6 +123,14 @@ function runCommand(sessionId, name, args, cwd) {
   const content = out.replace(/\s+$/, '') || '(no output)';
   const result = { title: `//${name}${args.trim() ? ' ' + args.trim() : ''}`, content, cwd: baseCwd };
 
+  // A document, not text: hand it back whole for the client to frame. A failed command
+  // has a shell error where the markup should be, and framing that renders it as a blank
+  // page — so it comes back as an error instead.
+  if ((spec.kind || 'console') === 'html') {
+    if (r.status !== 0) return { error: content, cwd: baseCwd };
+    result.kind = 'html';
+    return result;
+  }
   if ((spec.kind || 'console') === 'source') {
     const fname = args.trim().split(/\s+/).pop() || '';
     const ext = path.extname(fname).slice(1).toLowerCase();
@@ -502,6 +510,159 @@ function toggleTool(hdr) {
   if (toggle) toggle.innerHTML = open?'&#9660;':'&#9654;';
   slideOpen(body, open, function (o) { body.classList.toggle('open', o); });
 }
+
+// ── HTML output ──────────────────────────────────────────────────────────────
+// //ihtml hands back a whole document, so it renders in a frame of its own rather than
+// being pasted into this page. srcdoc WITHOUT allow-same-origin puts it on a null
+// origin: its own scripts run, so a generated report or a chart works, but it cannot
+// reach ccbb's DOM, its cookies, or the token this page holds.
+function htmlFrame(src, height) {
+  var f = document.createElement('iframe');
+  f.className = 'html-frame';
+  f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-modals');
+  f.setAttribute('referrerpolicy', 'no-referrer');
+  if (height) f.style.height = height;
+  f.srcdoc = String(src == null ? '' : src);
+  return f;
+}
+
+// ── Command output ───────────────────────────────────────────────────────────
+// One renderer for what a // command hands back, wherever it lands: the docked panel,
+// a transcript card, a floating window. Returns a fresh .cmd-content element the
+// caller places; the kind decides the drawing — a document gets a frame, markdown gets
+// marked, source gets highlight.js — and a page without those libraries falls back to
+// text rather than to nothing.
+function cmdEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function renderCmdOutput(d) {
+  var node = document.createElement('div');
+  d = d || {};
+  if (d.error) {
+    node.className = 'cmd-content';
+    node.innerHTML = '<pre style="color:#cf222e">' + cmdEsc(d.error) + '</pre>';
+  } else if (d.kind === 'html') {
+    node.className = 'cmd-content html';
+    node.appendChild(htmlFrame(d.content || ''));
+  } else if (d.kind === 'markdown' && window.marked) {
+    node.className = 'cmd-content md';
+    node.innerHTML = marked.parse(d.content || '');
+  } else if (d.kind === 'source' || d.kind === 'markdown') {
+    node.className = 'cmd-content code' + (d.lang === 'diff' ? ' diff' : '');
+    var code = document.createElement('code');
+    code.textContent = d.content || '';
+    if (window.hljs) {
+      try {
+        var res = d.lang ? hljs.highlight(d.content || '', { language: d.lang, ignoreIllegals: true })
+                         : hljs.highlightAuto(d.content || '');
+        code.innerHTML = res.value; code.className = 'hljs';
+      } catch (e) {}
+    }
+    var pre = document.createElement('pre'); pre.appendChild(code);
+    node.appendChild(pre);
+  } else {
+    node.className = 'cmd-content';
+    node.innerHTML = '<pre>' + cmdEsc(d.content) + '</pre>';
+  }
+  return node;
+}
+
+// ── Floating windows ─────────────────────────────────────────────────────────
+// Command output pulled out of the panel it was born in, so it can sit beside the
+// transcript instead of eating half of it. In-page rather than a real popup: one
+// window.open per output is blocked as often as it is allowed, and the phone has no
+// second window at all.
+var FLW_SEQ = 0;
+function floatWin(title, fill, host, onClose) {
+  var root = host || document.body;
+  var w = document.createElement('div');
+  w.className = 'flw';
+  // Cascade, so a second detach does not land exactly on the first.
+  var n = (FLW_SEQ++ % 6) * 26;
+  w.style.left = Math.max(8, Math.min(60 + n, window.innerWidth - 340)) + 'px';
+  w.style.top = Math.max(8, Math.min(70 + n, window.innerHeight - 200)) + 'px';
+  w.style.width = Math.max(300, Math.min(880, window.innerWidth - 100)) + 'px';
+  w.style.height = Math.max(220, Math.min(620, window.innerHeight - 160)) + 'px';
+  // The same three as the docked panel, in the same glyphs: minimize to the title bar,
+  // maximize to the viewport, and the one you are in toggles back to normal.
+  w.innerHTML = '<div class="flw-head"><span class="flw-title"></span>'+
+      '<div class="flw-btns">'+
+        '<button class="flw-btn" data-c="min" title="Minimize">&#8211;</button>'+
+        '<button class="flw-btn" data-c="max" title="Maximize">&#9633;</button>'+
+        '<button class="flw-btn" data-c="close" title="Close">&#10005;</button>'+
+      '</div>'+
+    '</div>'+
+    '<div class="flw-body"></div>'+
+    '<div class="flw-grip" title="Resize"></div>';
+  w.querySelector('.flw-title').textContent = title || '';
+  w.querySelector('.flw-head').title = title || '';
+  if (fill) fill(w.querySelector('.flw-body'));
+  function syncBtns() {
+    var mn = w.querySelector('.flw-btn[data-c="min"]'), mx = w.querySelector('.flw-btn[data-c="max"]');
+    var isMin = w.classList.contains('min'), isMax = w.classList.contains('max');
+    mn.innerHTML = isMin ? '&#9633;' : '&#8211;'; mn.title = isMin ? 'Restore' : 'Minimize';
+    mx.innerHTML = isMax ? '&#10064;' : '&#9633;'; mx.title = isMax ? 'Restore' : 'Maximize';
+  }
+  w.querySelector('.flw-btns').addEventListener('click', function (e) {
+    var b = e.target.closest('.flw-btn');
+    if (!b) return;
+    if (b.dataset.c === 'min') { w.classList.toggle('min'); w.classList.remove('max'); }
+    else if (b.dataset.c === 'max') { w.classList.toggle('max'); w.classList.remove('min'); }
+    else { if (w.parentNode) w.parentNode.removeChild(w); if (onClose) onClose(); return; }
+    syncBtns();
+  });
+  // Double-click on the title bar is the other way to maximize, as on every desktop.
+  w.querySelector('.flw-head').addEventListener('dblclick', function (e) {
+    if (e.target.closest('.flw-btn')) return;
+    w.classList.toggle('max'); w.classList.remove('min'); syncBtns();
+  });
+  flwDrag(w, w.querySelector('.flw-head'), 'move');
+  flwDrag(w, w.querySelector('.flw-grip'), 'size');
+  // Clamped on resize: a window dragged to the right edge of a wide screen is otherwise
+  // simply gone when the window narrows, with no way to get it back.
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(function () {
+      w.style.left = Math.max(0, Math.min(parseFloat(w.style.left) || 0, window.innerWidth - 60)) + 'px';
+      w.style.top = Math.max(0, Math.min(parseFloat(w.style.top) || 0, window.innerHeight - 40)) + 'px';
+    }).observe(document.documentElement);
+  }
+  root.appendChild(w);
+  return w;
+}
+// Pointer capture, not window listeners: the pointer crossing an iframe stops delivering
+// moves to this document, and a window full of foreign HTML is exactly what is being
+// dragged. The capture keeps every move on the handle.
+function flwDrag(w, handle, mode) {
+  if (!handle) return;
+  handle.addEventListener('pointerdown', function (e) {
+    if (e.target.closest && e.target.closest('.flw-btn')) return;
+    if (w.classList.contains('max') || (mode === 'size' && w.classList.contains('min'))) return;
+    e.preventDefault();
+    var r = w.getBoundingClientRect(), x0 = e.clientX, y0 = e.clientY;
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    w.classList.add('dragging');
+    function move(ev) {
+      var dx = ev.clientX - x0, dy = ev.clientY - y0;
+      if (mode === 'move') {
+        w.style.left = Math.max(0, Math.min(r.left + dx, window.innerWidth - 60)) + 'px';
+        w.style.top = Math.max(0, Math.min(r.top + dy, window.innerHeight - 40)) + 'px';
+      } else {
+        w.style.width = Math.max(260, r.width + dx) + 'px';
+        w.style.height = Math.max(140, r.height + dy) + 'px';
+      }
+    }
+    function up() {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
+      w.classList.remove('dragging');
+    }
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  });
+}
 `;
 
 // The subset of the stylesheet above that the MUX client borrows, rescoped under .muxv.
@@ -527,6 +688,8 @@ const MUX_BORROWED = [
   'input-area', 'input-inner', 'input-tools', 'input-row', 'input-box',
   'send-btn', 'stop-btn', 'hist-btn', 'exp-btn',
   'sv-foot', 'sl', 'sl-ctx', 'sl-sub', 'sl-note', 'fwins', 'fwin', 'subturns',
+  'html-frame', 'flw', 'flw-head', 'flw-title', 'flw-btns', 'flw-btn', 'flw-body', 'flw-grip',
+  'cmd-content',
 ];
 // A selector that only makes sense inside ccbb web's own page shell.
 const MUX_CSS_SKIP = /(^|[\s,])(\.ro|\.sv|\.view|\.view-body|\.hdr-stats|#views)(?![-\w])/;
@@ -863,6 +1026,9 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .cmd-box{flex:0 1 auto;min-height:0;max-height:45%;position:relative;z-index:1;
   border-top:1px solid var(--line);background:var(--bg);display:none;flex-direction:column}
 .cmd-box.show{display:flex}
+/* A document has no intrinsic height to give the box, so the box gives it one. Before
+   .min and .max on purpose: both must still win over this. */
+.cmd-box.html{flex:0 0 45%}
 /* Maximized: leave the flex flow and cover the whole window. //cat and //ll output is
    the thing you want to read, and inside one column of a split view there is no room. */
 .cmd-box.max{position:fixed;inset:0;max-height:none;z-index:50;border-top:none}
@@ -885,6 +1051,42 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .cmd-content code.hljs{background:none;padding:0;font-family:inherit}
 .cmd-content.diff .hljs-addition{background:#e6ffec;color:#1a7f37;display:inline-block;width:100%}
 .cmd-content.diff .hljs-deletion{background:#ffebe9;color:#cf222e;display:inline-block;width:100%}
+/* //ihtml output is a whole document: the panel gives it the full box and gets out of
+   the way, since its own padding and type belong to ccbb, not to the document. */
+.html-frame{display:block;width:100%;height:100%;border:none;background:#fff}
+.cmd-content.html{padding:0;overflow:hidden}
+/* ── floating window ──
+   Output detached from the panel, so it can sit beside the transcript rather than take
+   45% of it. Fixed, not absolute: it is pinned to the viewport, which is what makes it
+   usable from a view that is itself scrolling. */
+.flw{position:fixed;z-index:60;display:flex;flex-direction:column;background:var(--bg);
+  border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.22);overflow:hidden}
+.flw-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:6px 8px 6px 12px;
+  background:var(--bg-alt);border-bottom:1px solid var(--line);min-height:32px;font-size:12px;
+  color:var(--ink-soft);cursor:move;user-select:none;touch-action:none}
+.flw-title{font-family:ui-monospace,Menlo,monospace;font-weight:600;color:var(--ink);
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.flw-btns{display:flex;gap:2px;flex-shrink:0}
+.flw-btn{background:none;border:none;color:var(--ink-soft);font-size:14px;cursor:pointer;
+  line-height:1;padding:4px 8px;border-radius:6px;font-family:inherit}
+.flw-btn:hover{background:var(--line);color:var(--ink)}
+.flw-body{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column}
+.flw-body>pre{margin:0;padding:12px 14px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;
+  line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.flw-body>.cmd-content{flex:1 1 auto;min-height:0;padding:10px 12px}
+.flw-body>.cmd-content pre{border:none;background:none;border-radius:0;padding:0}
+.flw-body>.html-frame{flex:1 1 auto;min-height:0}
+.flw-grip{position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;touch-action:none;
+  background:linear-gradient(135deg,transparent 50%,var(--line) 50%)}
+/* A drag that wanders over the frame must not be eaten by the document inside it. */
+.flw.dragging .flw-body{pointer-events:none}
+/* Minimized is the title bar alone, where the window was; maximized is the viewport.
+   Both override the inline geometry a drag wrote, and both remember it for restore. */
+.flw.min{height:auto!important}
+.flw.min .flw-body,.flw.min .flw-grip{display:none}
+.flw.max{left:0!important;top:0!important;width:100vw!important;height:100vh!important;border-radius:0;border:none}
+.flw.max .flw-grip{display:none}
+.flw.max .flw-head{cursor:default}
 .input-area{border-top:1px solid var(--line);padding:10px 16px;background:var(--bg);flex-shrink:0;display:flex;flex-direction:column;align-items:center}
 .input-inner{position:relative;width:100%;max-width:740px}
 /* History and expand live ABOVE the box, and only while it has focus: at rest the composer
@@ -2452,6 +2654,7 @@ function createMuxSessionView(INFO){
     base: API + '/mux',
     session: INFO.sessionId,
     label: 'web-' + INFO.sessionId.slice(0, 4),
+    machine: SRV,
     bar: false,
     onStats: function(st){ lastStats = st; paintHead(); },
     onChrome: function(c){
@@ -2523,6 +2726,7 @@ function createSessionView(INFO){
     '<div class="cmd-box">'+
       '<div class="cmd-head"><span class="cmd-title"></span>'+
         '<div class="cmd-btns">'+
+          '<button class="cmd-btn" data-c="pop" title="Detach to a floating window">&#10697;</button>'+
           '<button class="cmd-btn" data-c="min" title="Minimize">&#8211;</button>'+
           '<button class="cmd-btn" data-c="max" title="Maximize">&#9633;</button>'+
           '<button class="cmd-btn" data-c="close" title="Close">&#10005;</button>'+
@@ -3381,42 +3585,33 @@ function createSessionView(INFO){
       body: JSON.stringify({ name: name, args: args, cwd: cmdCwd })
     }).then(function(r){ return r.json(); }).then(function(d){ showCmd(d); }).catch(function(e){ showCmd({ error:String(e) }); });
   }
+  // renderCmdOutput (SHARED_JS) draws; this places. The same output has two homes now:
+  // the docked panel, and a floating window that outlives the next command run here.
+  var lastCmd = null;
   function showCmd(d) {
     if (d && d.cwd) cmdCwd = d.cwd;
     if (d && d.kind === 'clear') { hideCmd(); return; }
-    if (d && d.error) {
-      cmdTitle.textContent = 'error';
-      cmdContent.className = 'cmd-content';
-      cmdContent.innerHTML = '<pre style="color:#cf222e">'+esc(d.error)+'</pre>';
-    } else if (d.kind === 'markdown') {
-      cmdTitle.textContent = d.title || '';
-      cmdContent.className = 'cmd-content md';
-      cmdContent.innerHTML = marked.parse(d.content || '');
-    } else if (d.kind === 'source') {
-      cmdTitle.textContent = d.title || '';
-      cmdContent.className = 'cmd-content code' + (d.lang === 'diff' ? ' diff' : '');
-      var code = document.createElement('code');
-      code.textContent = d.content || '';
-      if (window.hljs) {
-        try {
-          var res = d.lang ? hljs.highlight(d.content || '', { language: d.lang, ignoreIllegals: true })
-                           : hljs.highlightAuto(d.content || '');
-          code.innerHTML = res.value; code.className = 'hljs';
-        } catch(e) {}
-      }
-      var pre = document.createElement('pre'); pre.appendChild(code);
-      cmdContent.innerHTML = ''; cmdContent.appendChild(pre);
-    } else {
-      cmdTitle.textContent = d.title || '';
-      cmdContent.className = 'cmd-content';
-      cmdContent.innerHTML = '<pre>'+esc(d.content||'')+'</pre>';
-    }
+    lastCmd = d;
+    cmdBox.classList.toggle('html', !!(d && !d.error && d.kind === 'html'));
+    cmdTitle.textContent = (d && d.error) ? 'error' : ((d && d.title) || '');
+    var fresh = renderCmdOutput(d);
+    cmdContent.replaceWith(fresh); cmdContent = fresh;
     cmdBox.classList.remove('min', 'max');   // fresh output restores the default size
     cmdBox.classList.add('show');
     syncCmdBtns();
     cmdContent.scrollTop = 0;
   }
-  function hideCmd() { cmdBox.classList.remove('show','min','max'); syncCmdBtns(); }
+  // Detach: the panel's content moves to a window of its own and the panel closes, so
+  // the transcript gets its height back and the output stays up while you keep working.
+  // Titled with where it came from — a floating window has no view around it to say.
+  function popCmd() {
+    if (!lastCmd) return;
+    var d = lastCmd;
+    var title = SRV + ' ' + (INFO.title || INFO.sessionId.slice(0, 8)) + ': ' + cmdTitle.textContent;
+    floatWin(title, function (host) { host.appendChild(renderCmdOutput(d)); });
+    hideCmd();
+  }
+  function hideCmd() { cmdBox.classList.remove('show','min','max','html'); syncCmdBtns(); }
   // Same glyph language as the view bar: hollow square to maximize, filled to come back.
   function syncCmdBtns() {
     var on = cmdBox.classList.contains('max');
@@ -3426,7 +3621,8 @@ function createSessionView(INFO){
   body.querySelector('.cmd-btns').addEventListener('click', function(e){
     var b = e.target.closest('.cmd-btn');
     if (!b) return;
-    if (b.dataset.c === 'min') { cmdBox.classList.toggle('min'); cmdBox.classList.remove('max'); }
+    if (b.dataset.c === 'pop') popCmd();
+    else if (b.dataset.c === 'min') { cmdBox.classList.toggle('min'); cmdBox.classList.remove('max'); }
     else if (b.dataset.c === 'max') { cmdBox.classList.toggle('max'); cmdBox.classList.remove('min'); }
     else hideCmd();
     syncCmdBtns();

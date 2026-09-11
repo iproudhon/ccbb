@@ -1538,7 +1538,7 @@ function openAskEntry(history) {
 
 // ── Custom "//" commands (shared primitives) ──────────────────────────────────
 // A command maps a name (invoked as "//name [args]") to a spec:
-//   { "run": "ls -CF", "kind": "console" }   kind ∈ console|markdown|source
+//   { "run": "ls -CF", "kind": "console" }   kind ∈ console|markdown|source|html
 //   run may contain "$ARGS" (the raw arg string) and "$1".."$9".
 // A few names are handled specially by callers (help/pwd/cd/clear/sh/usage/aws-*).
 const BUILTIN_COMMANDS = {
@@ -1549,6 +1549,9 @@ const BUILTIN_COMMANDS = {
   ls:    { run: 'ls -CF',    kind: 'console' },
   ll:    { run: 'ls -alF',   kind: 'console' },
   cat:   { run: 'cat $ARGS', kind: 'source' },
+  // Renders instead of prints: the file is a document, so it goes into a frame of its
+  // own rather than being syntax-highlighted as text. //cat still shows the source.
+  ihtml: { run: 'cat $ARGS', kind: 'html' },
   sh:    { kind: 'console',  builtin: 'sh' },
   usage: { kind: 'markdown', builtin: 'usage' },
 };
