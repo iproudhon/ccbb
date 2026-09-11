@@ -2633,6 +2633,7 @@ function createMuxSessionView(INFO){
     var bits = [];
     bits.push('<b>'+esc(c.connected ? (c.status || 'idle') : 'disconnected')+'</b>');
     if (c.permissionMode) bits.push('mode '+esc(c.permissionMode));
+    if (c.info && c.info.bin && c.info.bin !== 'claude') bits.push(esc(c.info.bin));
     if (c.info && c.info.model) bits.push(esc(prettyModel(c.info.model)));
     if (c.clients && c.clients.length) bits.push(c.clients.map(function(x){
       return esc(x.label)+' ('+esc(x.kind)+')'; }).join(', '));
@@ -3751,11 +3752,20 @@ function createSessionView(INFO){
   // opens: openSession dedupes on (server, id) and would otherwise just re-focus this.
   v.onResume = function(){
     if (RO) return;
+    // The mux does not pick a binary: claude / claude.pass / claude.aws are different
+    // accounts on the same host, so the choice is asked for every time and only the
+    // last answer is remembered, per browser.
+    var last = ''; try { last = localStorage.getItem('ccbb.muxBin') || ''; } catch(e) {}
+    var bin = window.prompt('Claude binary to resume with (claude, claude.pass, claude.aws, or a path)', last);
+    if (bin == null) return;
+    bin = bin.trim();
+    if (!bin) { toast('A binary is required'); return; }
+    try { localStorage.setItem('ccbb.muxBin', bin); } catch(e) {}
     var btn = el.querySelector('.vb-resume');
     if (btn) btn.disabled = true;
     fetch(API+'/mux/api/sessions', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ resume: INFO.sessionId, cwd: INFO.projectPath || undefined,
-        label: INFO.title || undefined }) })
+        label: INFO.title || undefined, bin: bin }) })
       .then(function(r){ return r.json().then(function(d){ return { code:r.status, d:d }; }); })
       .then(function(r){
         // 409 running-in-mux is not a failure: the thing the button would have made

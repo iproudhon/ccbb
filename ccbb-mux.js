@@ -88,6 +88,27 @@ function ensureDir(d) { try { fs.mkdirSync(d, { recursive: true, mode: 0o700 });
 //   --include-hook-events       hook_started / hook_progress / hook_response
 //   --forward-subagent-text     subagent text+thinking, not just tool blocks
 //   --permission-prompt-tool stdio   permissions arrive as control_request
+// Which `claude` to run is the caller's to say, every time. One host has `claude`,
+// `claude.pass` and `claude.aws` side by side — different accounts, different bills —
+// and a mux that quietly picked `claude` would start sessions on the wrong one with no
+// sign of it anywhere. Resolved here, not in spawn(): a missing binary would otherwise
+// surface as a session stuck in 'starting' with a one-line stderr nobody reads.
+function resolveBin(bin) {
+  bin = String(bin || '').trim();
+  if (!bin) { const e = new Error('no binary given — pass --bin <name|path> (claude, claude.pass, claude.aws, …)'); e.code = 'EINVAL'; throw e; }
+  const runnable = f => { try { return fs.statSync(f).isFile() && (fs.accessSync(f, fs.constants.X_OK), true); } catch { return false; } };
+  if (bin.includes('/')) {
+    const f = path.resolve(bin);
+    if (runnable(f)) return f;
+  } else {
+    for (const d of String(process.env.PATH || '').split(path.delimiter)) {
+      if (d && runnable(path.join(d, bin))) return bin;
+    }
+  }
+  const e = new Error(`binary '${bin}' not found${bin.includes('/') ? '' : ' on PATH'} or not executable`);
+  e.code = 'EINVAL'; throw e;
+}
+
 function buildArgs(opt) {
   const a = [
     '--print',
@@ -271,7 +292,7 @@ class Session {
       // depending on which screen you were looking at. Seeded to the label so a session
       // with no transcript yet is not nameless.
       title: this.label,
-      model: null, permissionMode: opt.permissionMode || null,
+      bin: opt.bin, model: null, permissionMode: opt.permissionMode || null,
       tools: [], mcpServers: [], plugins: [], commands: [], slashCommands: [],
       capabilities: [], auth: null, cost: 0, tokens: 0, turns: 0,
       contextTokens: 0, contextPeak: 0, stats: null,
@@ -353,7 +374,7 @@ class Session {
 
   spawn() {
     const args = buildArgs({ ...this.opt, sessionId: this.id });
-    this.child = spawn(this.opt.bin || 'claude', args, {
+    this.child = spawn(this.opt.bin, args, {
       cwd: this.cwd, env: childEnv(this.opt.env), stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stdout.setEncoding('utf8');
@@ -1161,6 +1182,7 @@ class Mux {
 
   create(o) {
     o = o || {};
+    o.bin = resolveBin(o.bin);
     // Resuming in place while the session is ALREADY running means two writers on one
     // transcript — the docs are explicit that the messages interleave. Forking is the
     // supported way to work from a live session, so say so rather than corrupt it.
@@ -1258,7 +1280,7 @@ class Mux {
         let o = {}; try { o = JSON.parse(body || '{}'); } catch { return send(400, { error: 'bad json' }); }
         let s;
         try { s = this.create(o); }
-        catch (e) { return send(e.code === 'EBUSY' ? 409 : 500, { error: e.message, reason: e.reason || null }); }
+        catch (e) { return send(e.code === 'EBUSY' ? 409 : e.code === 'EINVAL' ? 400 : 500, { error: e.message, reason: e.reason || null }); }
         send(200, { session: s.state });
       });
     }
@@ -1322,7 +1344,10 @@ class Mux {
       return s.attach(client, m.sinceSeq, m.epoch);
     }
     if (m.op === 'list') return reply({ sessions: this.list() });
-    if (m.op === 'new') { const s = this.create(m.options || {}); return reply({ session: s.state }); }
+    if (m.op === 'new') {
+      let s; try { s = this.create(m.options || {}); } catch (e) { return reply({ error: e.message, reason: e.reason || null }); }
+      return reply({ session: s.state });
+    }
 
     const s = client.session;
     if (!s) return reply({ error: 'not attached' });
@@ -1421,9 +1446,11 @@ async function resolveRef(ref) {
 function newHelp() {
   console.log(`ccbb new — start a Claude Code session in the mux and attach a terminal to it
 
-Usage: ccbb new [-n name] [-m model] [options]
+Usage: ccbb new -b <binary> [-n name] [-m model] [options]
 
 Options:
+  -b, --bin <binary>     REQUIRED. which Claude Code to run: a name on PATH
+                         (claude, claude.pass, claude.aws) or a full path
   -n, --name <name>      name for the session (default: this directory's basename;
                          a -2, -3 … suffix is added if that name is already running)
   -m, --model <model>    model alias or full name
@@ -1446,6 +1473,7 @@ function parseNew(args) {
     const a = args[i];
     if (a === '-h' || a === '--help') o.help = true;
     else if (a === '-C' || a === '--cwd') o.cwd = path.resolve(args[++i]);
+    else if (a === '-b' || a === '--bin') o.bin = args[++i];
     else if (a === '-m' || a === '--model') o.model = args[++i];
     else if (a === '-n' || a === '--name' || a === '--label') o.label = args[++i];
     else if (a === '--permission-mode') o.permissionMode = args[++i];
@@ -1461,6 +1489,7 @@ function parseNew(args) {
 async function runNew(args) {
   const o = parseNew(args);
   if (o.help) return newHelp();
+  if (!o.bin) { console.error('ccbb: new needs -b/--bin <binary> (claude, claude.pass, claude.aws, or a path)'); process.exit(1); }
   const detach = o.detach; delete o.detach;
   const r = await api('/api/sessions', 'POST', o);
   if (r.error) { console.error('ccbb:', r.error); process.exit(1); }
@@ -1498,13 +1527,14 @@ async function runMuxLs() {
   const w = Math.max(4, ...list.map(s => (s.label || '').length));
   // cwd last and clipped to what's left: it is the only unbounded column, and a home
   // directory deep enough to wrap takes every column above it out of alignment.
-  const left = w + 34;
+  const bw = Math.max(3, ...list.map(s => path.basename(s.bin || '').length));
+  const left = w + bw + 36;
   const room = Math.max(12, (process.stdout.columns || 80) - left);
   const clip = t => (t = String(t || '')).length <= room ? t : '…' + t.slice(t.length - room + 1);
-  console.log(`${'NAME'.padEnd(w)}  ID        STATUS    CLI  ASK  MSGS  CWD`);
+  console.log(`${'NAME'.padEnd(w)}  ID        STATUS    ${'BIN'.padEnd(bw)}  CLI  ASK  MSGS  CWD`);
   for (const s of list) {
     console.log(`${String(s.label || '').padEnd(w)}  ${s.id.slice(0, 8)}  ` +
-      `${String(s.status).padEnd(8)}  ${String(s.clients).padStart(3)}  ` +
+      `${String(s.status).padEnd(8)}  ${path.basename(s.bin || '').padEnd(bw)}  ${String(s.clients).padStart(3)}  ` +
       `${String(s.pending).padStart(3)}  ${String(s.messages).padStart(4)}  ${clip(s.cwd)}`);
   }
 }
