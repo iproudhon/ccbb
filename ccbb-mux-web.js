@@ -186,6 +186,10 @@ const APP_CSS = `
 /* ── cards ──────────────────────────────────────────────────────────────── */
 /* The spinner. Its own row, not a card: it is transient state, so it sits between the
    transcript and whatever is asking for an answer, and disappears with the turn. */
+/* [hidden] is what paintBusy toggles; a bare display:flex here outranks the UA's
+   [hidden]{display:none}, which left the row on screen, frozen at its last count, after
+   every turn. */
+.muxv .mx-busy[hidden] { display: none; }
 .muxv .mx-busy { flex: 0 0 auto; display: flex; align-items: baseline; gap: 8px;
   padding: 6px 16px 8px; font-size: 12.5px; color: var(--vscode-descriptionForeground); }
 .muxv .mx-busy .mx-spin { color: var(--ccbb-accent); font-size: 13px; }

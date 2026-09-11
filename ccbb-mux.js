@@ -1103,7 +1103,10 @@ class Session {
     if (e.type === 'content_block_start') {
       this.flushDelta();
       const cb = e.content_block || {};
-      if (cb.type === 'tool_use') this.emit('tool_pending', { name: cb.name, id: cb.id, messageId: this._streamMsgId });
+      // index and parent ride along so a client can pair the input deltas that follow
+      // (keyed by message + block index) with this call, and nest it where it belongs.
+      if (cb.type === 'tool_use') this.emit('tool_pending', { name: cb.name, id: cb.id, messageId: this._streamMsgId,
+        index: e.index, parentToolUseId: m.parent_tool_use_id || null });
       return;
     }
     if (e.type === 'content_block_stop' || e.type === 'message_stop') return this.flushDelta();

@@ -100,10 +100,23 @@ class StatusLine {
       cost: { total_cost_usd: st.cost || 0, total_duration_ms: 0, total_api_duration_ms: 0,
         total_lines_added: 0, total_lines_removed: 0 },
     };
+    // The plan's rolling windows, as Claude Code hands them to the same script: on a
+    // subscription they are the number that actually runs out, and a script that sees
+    // rate_limits switches to its subscription layout. Same reader as ccbb web's footer.
+    let sub = null;
+    try { sub = common.getSubscription(); } catch {}
+    if (sub && sub.windows) {
+      const w = k => sub.windows[k] ? { used_percentage: sub.windows[k].pct, resets_at: sub.windows[k].resetsAt } : undefined;
+      p.rate_limits = { five_hour: w('fiveHour'), seven_day: w('sevenDay') };
+    }
+    // Context: the mux's own figure first — read from the transcript, so it is right
+    // from the moment of attaching, where the last result's usage only exists once a
+    // turn has ended under this client and was 0 until then.
+    if (!usage && st.contextTokens) usage = { input_tokens: st.contextTokens, output_tokens: 0 };
     if (usage) {
-      const inTok = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) +
-        (usage.cache_creation_input_tokens || 0);
-      const size = 200000;
+      const inTok = st.contextTokens || ((usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) +
+        (usage.cache_creation_input_tokens || 0));
+      const size = st.contextMax || 200000;
       p.context_window = {
         total_input_tokens: inTok, total_output_tokens: usage.output_tokens || 0,
         context_window_size: size,
@@ -477,6 +490,7 @@ On an open card:
 
 Anywhere:
   Ctrl-O            collapse / expand the whole transcript
+  Ctrl-G            edit the line in $VISUAL / $EDITOR (vim)
   PgUp / PgDn       scroll        End       jump back to following
   Esc, Ctrl-C       interrupt the running turn (Ctrl-C twice to leave)
   //mode <m>        set permission mode      //model <m>  set model
@@ -548,6 +562,7 @@ class TuiClient {
     this.history = []; this.histAt = 0;
     this.line = ''; this.cursor = 0;
     this.toolEntries = new Map();   // tool_use id → its transcript entry
+    this.pendingByIndex = new Map(); // "apiId|block index" → entry, while its input streams
     this.agents = new Map();        // backgrounded agent id → its description
     // The user's own status line, if they configured one. Repainting on its callback
     // rather than polling it: the script is a subprocess and its latency is theirs.
@@ -746,12 +761,21 @@ class TuiClient {
     out.push(rule);
     // The input line, with the cursor tracked so paint() can place it. Long
     // input scrolls horizontally rather than growing the region.
+    // One row per line of input: a paragraph pasted or brought back from Ctrl-G's
+    // editor shows as it was written, not folded onto one row with ⏎ marks.
     const lead = '❯ ';
     const room = Math.max(8, W - lead.length);
-    const from = Math.max(0, this.cursor - room + 1);
-    out.push(A.gray(lead) + this.line.slice(from, from + room));
-    this.cursorRow = out.length - 1;
-    this.cursorCol = lead.length + (this.cursor - from);
+    const rows = this.line.split('\n');
+    let at = 0, cr = 0, cc = this.cursor;
+    for (let i = 0; i < rows.length; i++) {
+      if (this.cursor <= at + rows[i].length) { cr = i; cc = this.cursor - at; break; }
+      at += rows[i].length + 1;
+    }
+    rows.forEach((r, i) => {
+      const from = i === cr ? Math.max(0, cc - room + 1) : 0;
+      out.push((i ? A.gray('  ') : A.gray(lead)) + r.slice(from, from + room));
+      if (i === cr) { this.cursorRow = out.length - 1; this.cursorCol = lead.length + (cc - from); }
+    });
     out.push(rule);
     out.push(...this.footerLines());
     return out;
@@ -760,10 +784,19 @@ class TuiClient {
   // The spinner is the one thing that has to redraw with no event behind it, so
   // busy state owns a timer. It stops the moment the turn ends — a ticking
   // frame on an idle session is worse than no spinner at all.
+  //
+  // The timer follows the STATE, not the event that last mentioned it: a snapshot says
+  // busy too — attaching mid-turn used to paint the row once, at 0s, and leave it
+  // there, since only a status event started the clock — and the turn's own start
+  // comes from the mux, so the count means the same thing on every client.
   setBusy(busy) {
     this.state.status = busy ? 'busy' : 'idle';
+    this.syncBusy();
+  }
+  syncBusy() {
+    const busy = this.state.status === 'busy';
     if (busy && !this.spinTimer && this.tty) {
-      this.turnStart = Date.now();
+      this.turnStart = this.state.turnStartedAt || Date.now();
       this.spinTimer = setInterval(() => this.paint(), 120);
       if (this.spinTimer.unref) this.spinTimer.unref();
     }
@@ -780,7 +813,8 @@ class TuiClient {
 
   spinnerLine() {
     const t = Date.now();
-    const secs = this.turnStart ? Math.round((t - this.turnStart) / 1000) : 0;
+    const started = this.state.turnStartedAt || this.turnStart;
+    const secs = started ? Math.round((t - started) / 1000) : 0;
     // What the child says it is doing beats a whimsical verb — 'Compacting' above all,
     // which runs for half a minute and otherwise looks like a stalled session.
     const act = this.state.activity;
@@ -822,7 +856,7 @@ class TuiClient {
   paint() {
     // A capture in progress means a renderer is being replayed to collect its
     // lines; painting from inside one would recurse through cardLines().
-    if (!this.tty || this.painting || this.sink) return;
+    if (!this.tty || this.painting || this.sink || this.editing) return;
     this.painting = true;
     try {
       const H = this.height();
@@ -863,6 +897,7 @@ class TuiClient {
     if (key.ctrl && name === 'c') return this.onSigint();
     if (key.ctrl && name === 'd' && !this.line) { this.quit('detached'); return; }
     if (key.ctrl && name === 'o') { this.collapsed = !this.collapsed; return this.paint(); }
+    if (key.ctrl && name === 'g') return this.editLine();
     if (name === 'pageup')   { this.scroll += Math.max(1, this.height() - 8); return this.paint(); }
     if (name === 'pagedown') { this.scroll = Math.max(0, this.scroll - Math.max(1, this.height() - 8)); return this.paint(); }
     if (name === 'end' && !this.line) { this.scroll = 0; return this.paint(); }
@@ -987,6 +1022,33 @@ class TuiClient {
   }
 
   // ── input ────────────────────────────────────────────────────────────────
+  // Ctrl-G, as in the CLI: the line goes to $VISUAL / $EDITOR (vim failing both) and
+  // comes back as the line. The editor needs the real terminal, so the screen is
+  // handed over — cooked keys, primary buffer — and taken back when it exits; the
+  // socket stays up meanwhile, and everything it delivers waits for the repaint
+  // rather than being drawn over the editor.
+  editLine() {
+    if (!this.tty || this.editing) return;
+    const fs = require('fs'), os = require('os'), path = require('path');
+    const { spawnSync } = require('child_process');
+    const file = path.join(os.tmpdir(), `ccbb-mux-${process.pid}-${Date.now()}.md`);
+    try { fs.writeFileSync(file, this.line, { mode: 0o600 }); } catch { return; }
+    const ed = process.env.VISUAL || process.env.EDITOR || 'vim';
+    this.editing = true;
+    process.stdin.setRawMode(false); process.stdin.pause();
+    process.stdout.write(SHOW + ALT_OFF);
+    // Through the shell so an EDITOR with arguments ("code -w") works as it does anywhere.
+    const r = spawnSync(`${ed} '${file}'`, { shell: true, stdio: 'inherit' });
+    process.stdout.write(ALT_ON + HIDE);
+    process.stdin.setRawMode(true); process.stdin.resume();
+    this.editing = false;
+    if (r.status === 0) {
+      try { this.line = fs.readFileSync(file, 'utf8').replace(/\r?\n$/, ''); } catch {}
+      this.cursor = this.line.length;
+    }
+    try { fs.unlinkSync(file); } catch {}
+    this.paint();
+  }
   submitLine() {
     const t = this.line.trim();
     this.line = ''; this.cursor = 0;
@@ -1117,6 +1179,7 @@ class TuiClient {
 
   onSnapshot(m) {
     this.state = m.state || {};
+    this.syncBusy();
     this.statusLine.update(this.state, this.lastUsage);
     this.peers = m.clients || [];
     this.out(A.gray(`— ${this.state.title || this.state.label || this.state.id} · ${this.state.cwd} · ${this.state.messages || (m.messages || []).length} messages —`));
@@ -1138,6 +1201,7 @@ class TuiClient {
     switch (e.kind) {
       case 'init':
         this.state = e.state || this.state;
+        this.syncBusy();
         return this.out(A.gray(`— ${this.state.model} · ${(this.state.tools || []).length} tools · ${this.state.permissionMode || 'manual'} —`));
       case 'message': return this.renderMessage(e.message);
       case 'delta': {
@@ -1145,7 +1209,7 @@ class TuiClient {
         // in a terminal, so they're dropped rather than shown raw. The message id
         // is remembered so the final copy of the same message — which the child
         // sends in full right after — isn't printed a second time.
-        if (e.deltaKind === 'input') return;
+        if (e.deltaKind === 'input') return this.pendingInput(e);
         if (e.messageId) this.streamed.add(e.messageId);
         // A block boundary inside one message: thinking must not run straight
         // into the prose that follows it on the same line.
@@ -1244,7 +1308,18 @@ class TuiClient {
       case 'model': this.state.model = e.model;
         this.statusLine.update(this.state, this.lastUsage);
         return this.out(A.gray(`  model → ${e.model} (${e.by})`));
-      case 'status': this.state.activity = e.activity || null; this.setBusy(e.status === 'busy'); return;
+      case 'status':
+        this.state.activity = e.activity || null;
+        this.state.turnStartedAt = e.turnStartedAt || null;
+        if (e.exit) this.state.exit = e.exit;
+        return this.setBusy(e.status === 'busy');
+      // The transcript-derived figures (cost, turns, context) the web footer runs on;
+      // the status-line script gets them too, so the two agree.
+      case 'stats':
+        for (const k of ['title', 'cost', 'tokens', 'turns', 'subTurns', 'contextTokens', 'contextPeak', 'contextMax'])
+          if (e[k] != null) this.state[k] = e[k];
+        this.statusLine.update(this.state, this.lastUsage);
+        return this.paint();
       case 'compact_done':
         if (e.result === 'success') return this.out(A.gray('\n  — compacted —'));
         return this.out(A.red(`\n  — compaction ${e.result || 'failed'}${e.error ? ': ' + e.error : ''} —`));
@@ -1267,7 +1342,8 @@ class TuiClient {
       // Silent on purpose: the list feeds "/" and Tab, it isn't news.
       case 'commands': this.state.commands = e.commands || []; return;
       case 'rate_limit': case 'goal': case 'autocompact':
-      case 'turn_start': case 'tool_pending': case 'unknown':
+      case 'tool_pending': return this.pendingTool(e);
+      case 'turn_start': case 'unknown':
         return;
       default: return;
     }
@@ -1335,6 +1411,19 @@ class TuiClient {
       // view. The block is copied because tool_end mutates it in place.
       else if (b.type === 'tool_use') {
         if (!this.tty || this.sink) { this.renderToolCall(b, sub, w, gap); continue; }
+        // Already on screen from the stream (pendingTool): this is the authoritative
+        // copy of the same call, so it fills that entry in rather than adding a second.
+        // Its result may have landed first — a settled outcome is never regressed.
+        const have = b.id && this.toolEntries.get(b.id);
+        if (have) {
+          const keep = this.settled(have) ? { status: have.block.status, result: have.block.result, resultMeta: have.block.resultMeta } : {};
+          const { runAt, runDesc } = have.block;
+          have.block = { ...b, ...keep, runAt, runDesc };
+          have.sub = sub; have.w = w; have.gap = gap;
+          have.cacheKey = null; have.cached = null;
+          this.paint();
+          continue;
+        }
         const entry = { t: 'tool', block: { ...b }, sub, w, gap };
         this.entries.push(entry);
         if (b.id) this.toolEntries.set(b.id, entry);
@@ -1382,6 +1471,39 @@ class TuiClient {
   // One tool call. Most are a single line; the few whose ARGUMENTS are the thing
   // a human needs to read — a todo list, an edit, a plan — get their body drawn
   // here rather than waiting for a result that only says "done".
+  // A tool call the stream has announced but the child has not yet delivered as a
+  // message. With a real CLI the message with the tool_use block arrives when the
+  // call is over, so waiting for it meant a run showed nothing at all until "Ran 12
+  // shell commands" ticked over — the bullet goes up now, from the stream's word,
+  // and the message fills it in later (renderMessage). Its arguments arrive as JSON
+  // fragments; each is tried as a whole, then as a string cut off mid-value, so the
+  // command being typed shows as far as it has got.
+  pendingTool(e) {
+    if (!this.tty || !e.id || this.toolEntries.has(e.id)) return;
+    this.endStream();
+    const sub = this.gut(e.parentToolUseId);
+    const entry = { t: 'tool', sub, w: this.width() - 2, gap: sub ? '' : '\n',
+      block: { type: 'tool_use', id: e.id, name: e.name, input: {}, status: 'running', result: null, parentToolUseId: e.parentToolUseId || null },
+      partial: '' };
+    this.entries.push(entry);
+    this.toolEntries.set(e.id, entry);
+    if (e.messageId != null && e.index != null) this.pendingByIndex.set(`${e.messageId}|${e.index}`, entry);
+    this.paint();
+  }
+  pendingInput(e) {
+    const entry = this.pendingByIndex.get(`${e.messageId}|${e.index}`);
+    if (!entry || this.settled(entry)) return;
+    entry.partial += e.text;
+    let input = null;
+    for (const tail of ['', '"}', '}']) {
+      try { input = JSON.parse(entry.partial + tail); break; } catch {}
+    }
+    if (!input || typeof input !== 'object') return;
+    entry.block.input = input;
+    entry.cacheKey = null; entry.cached = null;
+    this.paint();
+  }
+
   renderToolCall(b, sub, w, gap) {
     const dot = DOT[b.status] || DOT.running;
     // An answered question is not shown as a tool call at all: the CLI reports

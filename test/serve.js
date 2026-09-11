@@ -12,9 +12,22 @@ const common = require('../ccbb-common');
 
 const port = Number(process.argv[2] || 8596);
 const token = common.peerToken ? common.peerToken() : null;
+// Its own config dir, not the machine's. ccbb web reads peers, the server name and the
+// mux address file from CLAUDE_CONFIG_DIR — run against the real one, this fixture dialled
+// every configured peer as a second copy of this machine (each peer dropped the real
+// link for it, the real server redialled, and they flapped until the fixture exited) and
+// overwrote ~/.claude/ccbb-mux/address, so `ccbb attach` landed on the fixture. The token
+// is carried over so the drivers in this directory, which read the real one, still get in.
+const fs = require('fs');
+const cfgDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'ccbb-fixture-'));
+fs.writeFileSync(path.join(cfgDir, 'ccbb-config.json'),
+  JSON.stringify({ server: { name: 'fixture' }, ...(token ? { peerToken: token } : {}) }), { mode: 0o600 });
 const web = spawn(process.execPath, [path.join(__dirname, '..', 'ccbb-web.js'), '-p', String(port)],
-  { stdio: 'ignore' });
-const bye = () => { try { web.kill('SIGKILL'); } catch {} };
+  { stdio: 'ignore', env: { ...process.env, CLAUDE_CONFIG_DIR: cfgDir } });
+const bye = () => {
+  try { web.kill('SIGKILL'); } catch {}
+  try { fs.rmSync(cfgDir, { recursive: true, force: true }); } catch {}
+};
 process.on('exit', bye);
 for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { bye(); process.exit(0); });
 
