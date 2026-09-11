@@ -6339,8 +6339,10 @@ function runWeb(args) {
   // In-process, so the mux can simply say when a row moved — no poll, no cache, and
   // no window where the list is up to two seconds stale. Coalesced because several
   // row-moving events land together at the end of a turn (result, then status), and
-  // each push walks every open browser's session list.
-  if (mux) {
+  // each push walks every open browser's session list. Same gate as the filesystem
+  // watcher: list pushes are opt-in, and a mux turn ending is not a reason to redraw
+  // every open list — session views get their own push; the list refreshes on demand.
+  if (mux && LIST_WATCH) {
     let pending = null;
     mux.onChange = () => {
       if (pending) return;
