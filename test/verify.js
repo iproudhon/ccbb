@@ -762,7 +762,7 @@ function seedHistoryChecks() {
   try {
     const wired = new Mux({});
     live = wired.create({ bin: path.join(__dirname, 'fake-claude.js'), cwd: '/tmp',
-      resume: 'some-id', label: 'resumed' });
+      resume: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', label: 'resumed' });
     made.push(live.id);
   } catch (e) {} finally { common.findSessionJsonl = orig; }
   check('creating a session with --resume seeds it',

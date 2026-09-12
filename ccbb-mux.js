@@ -386,6 +386,11 @@ class Session {
     this.child.on('exit', (code, sig) => {
       this.state.status = 'exited';
       this.state.exit = { code, signal: sig };
+      // A child that dies before saying anything usually was not Claude Code at all
+      // (-b named the wrong binary) or rejected its arguments. Say so; an empty log
+      // stuck at 'exited' says nothing.
+      if (code && !this.messages.length && !this.state.model)
+        this.emit('stderr', { text: `child exited (code ${code}) before its first message — is '${this.opt.bin}' a Claude Code binary?` });
       this._statusLine = 'exited';   // keep the deduper in step with the one status it does not send
       this.emit('status', { status: 'exited', exit: this.state.exit });
       this.refreshStats(300);
@@ -1194,6 +1199,13 @@ class Mux {
       this.codexCreates.set(key, creating); return creating;
     }
     o.bin = resolveBin(o.bin);
+    // The resume ref becomes the session id verbatim, so anything but a full id — a
+    // short id, a name — would mint a session named after it and hand the child a
+    // --resume it cannot honour. Refuse it here, where every producer passes through.
+    if (o.resume && !UUID_RE.test(String(o.resume))) {
+      const e = new Error(`resume needs a full session id, not '${o.resume}'`);
+      e.code = 'EINVAL'; throw e;
+    }
     // Resuming in place while the session is ALREADY running means two writers on one
     // transcript — the docs are explicit that the messages interleave. Forking is the
     // supported way to work from a live session, so say so rather than corrupt it.
@@ -1485,7 +1497,7 @@ Options:
   -m, --model <model>    model alias or full name
   -C, --cwd <dir>        working directory for the session (default: here)
   --permission-mode <m>  manual | auto | acceptEdits | plan | dontAsk | bypassPermissions
-  --resume <id>          resume Claude, or attach a loaded Codex thread
+  --resume <id>          resume Claude (full id, short id or name), or attach a loaded Codex thread
   --fork                 with --resume, create a separate session/thread
   --effort <level>       low | medium | high | xhigh | max
   --add-dir <dir>        extra allowed directory (repeatable)
@@ -1514,14 +1526,37 @@ function parseNew(args) {
     else if (a === '--effort') o.effort = args[++i];
     else if (a === '--detach') o.detach = true;
     else if (a === '--add-dir') o.addDir.push(path.resolve(args[++i]));
+    // A typo here used to fall through silently — `--agentt codex` ran the Claude path
+    // with whatever -b named, and the failure surfaced as a session that never started.
+    else return { error: a.startsWith('-') ? `unknown option '${a}'` : `unexpected argument '${a}'` };
   }
+  for (const k of ['cwd', 'bin', 'model', 'label', 'permissionMode', 'agent', 'resume', 'effort'])
+    if (k in o && (o[k] == null || String(o[k]).startsWith('-'))) return { error: `option for ${k} is missing its value` };
   return o;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// `--resume ab5b010c` deserves the same short-id and name resolution `attach` and
+// `stop` already have. Live mux rows first, then the transcripts on disk.
+async function resolveResume(ref) {
+  if (UUID_RE.test(ref)) return ref;
+  const r = await api('/api/sessions');
+  const hit = pickSession((r.sessions || []).filter(s => (s.agent || 'claude') === 'claude'), ref);
+  if (!hit.error) return hit.id;
+  const ids = [...common.sessionPathIndex(true).keys()].filter(id => id.startsWith(ref));
+  if (ids.length === 1) return ids[0];
+  console.error('ccbb:', ids.length ? `'${ref}' matches ${ids.length} sessions` : `no session named '${ref}'`);
+  process.exit(1);
 }
 
 async function runNew(args) {
   const o = parseNew(args);
+  if (o.error) { console.error('ccbb:', o.error, '— see `ccbb new -h`'); process.exit(1); }
   if (o.help) return newHelp();
   if (o.agent !== 'codex' && !o.bin) { console.error('ccbb: new needs -b/--bin <binary> (claude, claude.pass, claude.aws, or a path)'); process.exit(1); }
+  if (o.agent === 'codex' && o.bin) { console.error('ccbb: -b/--bin is for Claude; Codex runs through its app-server'); process.exit(1); }
+  if (o.agent !== 'codex' && o.resume) o.resume = await resolveResume(o.resume.trim());
   const detach = o.detach; delete o.detach;
   const r = await api('/api/sessions', 'POST', o);
   if (r.error) { console.error('ccbb:', r.error); process.exit(1); }
