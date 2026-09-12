@@ -262,15 +262,11 @@ body.has-max .panel:not(.max){display:none}
 .panel:not(.menu) .subhead{display:none}
 .pbtn.pdots{font-size:18px}
 .panel.menu .pbtn.pdots{color:var(--accent)}
-/* Colour is what the session is doing, shape is how you reach it — the same mark ccbb
-   web's list and session page draw. Colour rides on the color property so the dot and
-   the mux's M share one palette and only the shape branches. */
-.dot{flex-shrink:0;width:9px;height:9px;border-radius:50%;background:currentColor;color:var(--ink-faint)}
+/* Activity color shows working, waiting, or inactive; logos identify the agent. */
+.dot{flex-shrink:0;width:14px;height:14px;border-radius:50%;background:currentColor;color:#57606a}
 .dot.live{color:var(--ok);animation:pulse 2s infinite}
 .dot.idle{color:#d4a72c;animation:none}
-.dot.mux{width:14.6px;height:9px;border-radius:0;background:none}
-.dot.mux svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;
-  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.dot svg{display:block;width:10px;height:10px;margin:2px}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .ago{font-size:11.5px;color:var(--ink-faint);flex-shrink:0}
 /* ── session list ── */
@@ -975,6 +971,18 @@ function createListPanel(){
   var srvEl = body.querySelector('[data-r="srv"]');
   var scopeEl = body.querySelector('[data-r="scope"]');
   var rowsEl = body.querySelector('[data-r="rows"]');
+  if (!RO) {
+    var newCodex=el('button','pbtn');newCodex.textContent='+ Codex';newCodex.title='New Codex session';
+    newCodex.onclick=function(){
+      var dialog=document.createElement('dialog');dialog.innerHTML='<form><h3>Codex session</h3><p><input name="cwd" placeholder="Working directory (optional)"></p><p><input name="resume" placeholder="Loaded thread ID (optional)"></p><p class="error"></p><button>Open</button> <button type="button">Cancel</button></form>';
+      document.body.appendChild(dialog);dialog.showModal();dialog.querySelector('button[type=button]').onclick=function(){dialog.remove();};
+      dialog.querySelector('form').onsubmit=async function(e){e.preventDefault();var f=e.target;f.querySelector('button').disabled=true;
+        try{var r=await fetch('/mux/api/sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:'codex',cwd:f.elements.cwd.value||undefined,resume:f.elements.resume.value||undefined})});var d=await r.json();if(!r.ok)throw new Error(d.error);dialog.remove();openMuxSession(d.session.id,null);}
+        catch(err){f.querySelector('.error').textContent=err.message;f.querySelector('button').disabled=false;}
+      };
+    };head.appendChild(newCodex);
+  }
+
   var totEl = body.querySelector('[data-r="tot"]');
 
   var sessions = [], servers = [{ name:SELF.name, self:true, status:'up' }], errors = [];
@@ -1023,13 +1031,12 @@ function createListPanel(){
       rowsEl.innerHTML = errors.length ? '' : '<div class="lmsg">'+(waiting ? 'Loading…' : 'No sessions yet.')+'</div>';
     } else {
       rowsEl.innerHTML = sessions.map(function(s){
-        // Green working, amber alive and waiting, grey gone — and an M rather than a dot
-        // when the session is driven over the mux, which used to need a tag of its own.
+        // Green working, amber waiting, gray inactive; logos identify Codex and Claude mux.
         var live = s.live ? (s.liveStatus === 'idle' ? ' idle' : ' live') : '';
         return '<div class="srow" data-sid="'+esc(s.sessionId)+'" data-srv="'+esc(s.server||'')+'"'+
             (s.mux ? ' data-mux="1"' : '')+'>'+
           '<div class="r1">'+
-            '<span class="dot'+live+(s.mux ? ' mux' : '')+'">'+(s.mux ? MUX_GLYPH : '')+'</span>'+
+            '<span class="dot'+live+(s.mux ? ' mux' : '')+'">'+activityGlyph(s.agent, s.mux)+'</span>'+
             '<span class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</span>'+
             '<span class="stitle">'+esc(s.title || '(untitled)')+'</span>'+
             '<span class="stime">'+esc(rel(s.lastActivity || s.startedAt))+'</span>'+
@@ -1339,6 +1346,7 @@ function createListPanel(){
 // needs — status, the working directory, who else is attached — comes up through onChrome
 // and lands in the subhead behind ⋮.
 function openMuxSession(sid, server){
+  try { sid = decodeURIComponent(sid); } catch(e) {}
   var existing = panels.filter(function(p){ return p.kind==='mux' && p.sessionId===sid && (p.server||null)===(server||null); })[0];
   if (existing) { setState(existing, 'exp'); return existing; }
   var p = createMuxPanel(sid, server || null);
@@ -1348,7 +1356,7 @@ function openMuxSession(sid, server){
   return p;
 }
 
-function createMuxPanel(sid, server){
+function createMuxPanel(sid, server, snapshot){
   var p = { kind:'mux', sessionId:sid, server:server, state:'min' };
   var API = apiBase(server);
   var SRV = server || SELF.name;
@@ -1356,14 +1364,14 @@ function createMuxPanel(sid, server){
   p.el = root;
 
   var head = el('div','phead',
-    '<span class="dot mux" data-r="dot" title="Driven over the mux protocol, not a tmux pane">'+MUX_GLYPH+'</span>'+
+    '<span class="dot mux" data-r="dot" title="Driven over the mux protocol, not a tmux pane">'+activityGlyph(sid.indexOf('codex:') === 0 ? 'codex' : 'claude', !snapshot)+'</span>'+
     '<span class="srv'+(isLocal(server)?' local':'')+'">'+esc(SRV)+'</span>'+
-    '<span class="ptitle" data-r="title">'+esc(sid.slice(0,8))+'</span>');
+    '<span class="ptitle" data-r="title">'+esc(shortSessionId(sid))+'</span>');
   head.appendChild(headButtons([
     { k:'max', html:ICON.max, title:'Maximize' },
     { k:'term', html:ICON.term, title:'Terminal' },
     { k:'close', html:ICON.close, title:'Close' },
-  ].filter(function(b){ return !(RO && b.k === 'term'); }), true));
+  ].filter(function(b){ return !((RO || snapshot) && b.k === 'term'); }), true));
   root.appendChild(head);
 
   var body = el('div','pbody',
@@ -1377,21 +1385,43 @@ function createMuxPanel(sid, server){
 
   var dotEl = head.querySelector('[data-r="dot"]');
   var titleEl = head.querySelector('[data-r="title"]');
+  if (!RO) titleEl.addEventListener('click', function(e){
+    e.stopPropagation();
+    if (head.querySelector('.rename')) return;
+    var input = el('input', 'ask-text rename');
+    input.value = titleEl.textContent;
+    titleEl.hidden = true; titleEl.after(input); input.focus(); input.select();
+    var finished = false;
+    function finish(save){
+      if (finished) return; finished = true;
+      var name = input.value.trim(); input.remove(); titleEl.hidden = false;
+      if (!save || !name) return;
+      fetch(API + '/api/session/' + sid, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title:name})})
+        .then(async function(r){var d=await r.json();if(!r.ok)throw new Error(d.error || 'Rename failed');titleEl.textContent=name;if(snapshot)snapshot.state.title=name;})
+        .catch(function(err){toast(err.message);});
+    }
+    input.addEventListener('click', function(e){e.stopPropagation();});
+    input.addEventListener('blur', function(){finish(true);});
+    input.addEventListener('keydown', function(e){if(e.key==='Enter'){e.preventDefault();finish(true);}else if(e.key==='Escape')finish(false);});
+  });
   var dirEl = body.querySelector('[data-r="dir"]');
   var whenEl = body.querySelector('[data-r="when"]');
 
   var client = window.createMuxView(host, {
     base: API + '/mux',
+    snapshot: snapshot || null,
+    historyTail: 10,
     session: sid,
-    label: 'phone-' + sid.slice(0, 4),
+    label: 'phone-' + shortSessionId(sid),
     bar: false,
     onChrome: function(c){
-      titleEl.textContent = c.title || sid.slice(0,8);
+      titleEl.textContent = c.title || shortSessionId(sid);
       dirEl.textContent = ltr(c.cwd || '');
       // 'exited' is the case the desktop used to miss too: the child is gone but the
       // socket is not, and "connected" alone painted a finished session green.
-      var alive = c.connected && c.status !== 'exited' && c.status !== 'gone';
-      dotEl.className = 'dot mux' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
+      var alive = c.live;
+      dotEl.innerHTML = activityGlyph(c.info && c.info.agent, !snapshot);
+      dotEl.className = 'dot' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
       var bits = [c.connected ? (c.status || 'idle') : 'disconnected'];
       if (c.permissionMode) bits.push('mode ' + c.permissionMode);
       if (c.info && c.info.model) bits.push(prettyModel(c.info.model));
@@ -1422,6 +1452,7 @@ function createMuxPanel(sid, server){
     else if (k === 'term') openTerminal(server, sid);
     else if (k === 'close') removePanel(p);
   });
+  p.onShow = function(){ client.onVisible(); };
   p.onState = function(){
     var mx = head.querySelector('[data-k="max"]');
     mx.innerHTML = p.state === 'max' ? ICON.restore : ICON.max;
@@ -1439,6 +1470,13 @@ function createMuxPanel(sid, server){
 
 // ── session panel ─────────────────────────────────────────────────────────────
 function openSession(sid, server){
+  try { sid = decodeURIComponent(sid); } catch(e) {}
+  if (sid.indexOf('codex:') === 0) {
+    fetch(apiBase(server)+'/api/codex/history/'+encodeURIComponent(sid.slice(6))).then(function(r){return r.json();}).then(function(snap){
+      if(snap.error)throw new Error(snap.error);
+      var panel=createMuxPanel(sid,server||null,snap); addPanel(panel); setState(panel,'exp');
+    }).catch(function(e){toast(e.message);}); return;
+  }
   var existing = panels.filter(function(p){ return p.kind==='session' && p.sessionId===sid && (p.server||null)===(server||null); })[0];
   if (existing) { setState(existing, 'exp'); return existing; }
   var p = createSessionPanel(sid, server || null);

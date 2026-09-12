@@ -55,7 +55,7 @@ const { spawn } = require('child_process');
 const common = require('./ccbb-common');
 const { CLAUDE_DIR } = common;
 
-const MUX_DIR = path.join(CLAUDE_DIR, 'ccbb-mux');       // logs + the daemon's address file
+const MUX_DIR = path.join(process.env.CCBB_HOME || CLAUDE_DIR, 'ccbb-mux');       // logs + the daemon's address file
 // 8590/8592 are already spoken for by `ccbb web` and the peer ssh forwards.
 const DELTA_COALESCE_MS = 50;      // token deltas are batched to this cadence per client
 const LOG_RING = 5000;             // client events kept in memory for sinceSeq replay
@@ -306,12 +306,14 @@ class Session {
     this._statusLine = null;          // last status line emitted, for the deduper below
 
     ensureDir(MUX_DIR);
-    this.rawLog = fs.createWriteStream(path.join(MUX_DIR, this.id + '.ndjson'), { flags: 'a' });
+    if (opt.agent !== 'codex') this.rawLog = fs.createWriteStream(path.join(MUX_DIR, this.id + '.ndjson'), { flags: 'a' });
     // BEFORE spawn, deliberately: resuming in place the child appends to this very
     // file, so reading it afterwards races its own writes and replays turns it just
     // made. A fork reads the parent's file, which is exactly what it branched from.
-    if (opt.resume) this.seedHistory(opt.resume);
-    this.spawn();
+    if (!opt.agent || opt.agent === 'claude') {
+      if (opt.resume) this.seedHistory(opt.resume);
+      this.spawn();
+    }
   }
 
   // What --resume does NOT give back. In print/stream-json the child replays nothing:
@@ -1160,6 +1162,7 @@ class Mux {
     this.token = common.peerToken ? common.peerToken() : null;
     // Optional: a mux with no UI file still serves its API and sockets.
     try { this.ui = require('./ccbb-mux-web').mount(this); } catch (e) { this.ui = null; }
+    this.ready = new Promise(resolve => setImmediate(resolve)).then(() => require('./ccbb-codex-session').restore(this)).catch(() => {});
   }
 
   // Shut every child down. ccbb web owns real `claude` processes now, where the
@@ -1182,6 +1185,14 @@ class Mux {
 
   create(o) {
     o = o || {};
+    if (o.agent && !['claude', 'codex'].includes(o.agent)) throw new Error('Unknown agent');
+    if (o.agent === 'codex') {
+      if (!this.codexCreates) this.codexCreates = new Map();
+      const key = o.resume && !o.fork ? o.resume.replace(/^codex:/, '') : uuid();
+      if (this.codexCreates.has(key)) return this.codexCreates.get(key);
+      const creating = require('./ccbb-codex-session').createCodexSession(this, o).finally(() => this.codexCreates.delete(key));
+      this.codexCreates.set(key, creating); return creating;
+    }
     o.bin = resolveBin(o.bin);
     // Resuming in place while the session is ALREADY running means two writers on one
     // transcript — the docs are explicit that the messages interleave. Forking is the
@@ -1230,13 +1241,14 @@ class Mux {
   // unambiguous by construction, but `ccbb stop foo` quietly hitting `foo-bar` is a
   // footgun with no undo.
   get(ref) {
+    try { ref = decodeURIComponent(ref); } catch {}
     if (!ref) return null;
     if (this.sessions.has(ref)) return this.sessions.get(ref);
     const all = [...this.sessions.values()];
     const live = all.filter(s => s.state.status !== 'exited');
     const named = live.find(s => s.label === ref) || all.find(s => s.label === ref);
     if (named) return named;
-    const hits = all.filter(s => s.id.startsWith(ref));
+    const hits = all.filter(s => s.id.startsWith(ref) || (s.state.nativeId && s.state.nativeId.startsWith(ref)));
     return hits.length === 1 ? hits[0] : null;
   }
   list() {
@@ -1272,14 +1284,25 @@ class Mux {
     const url = new URL(subUrl || req.url, 'http://x');
     const p = url.pathname;
 
+    if (p === '/api/codex/loaded' && req.method === 'GET') {
+      (async () => {
+        const { CodexSocket, endpoint, loadedThreads } = require('./ccbb-codex-session');
+        const rpc = await new CodexSocket(await endpoint()).connect();
+        try {
+          const ids = await loadedThreads(rpc), threads = [];
+          for (const id of ids) { try { const r=await rpc.request('thread/read',{threadId:id}); threads.push({id,title:r.thread.name || r.thread.preview || id,cwd:r.thread.cwd}); } catch {} }
+          send(200,{threads,endpoint:rpc.endpoint});
+        } finally {rpc.close();}
+      })().catch(e=>send(503,{error:e.message})); return;
+    }
     if (p === '/api/sessions' && req.method === 'GET') return send(200, { sessions: this.list() });
     if (p === '/api/sessions' && req.method === 'POST') {
       let body = '';
       req.on('data', d => { body += d; if (body.length > 1e6) req.destroy(); });
-      return req.on('end', () => {
+      return req.on('end', async () => {
         let o = {}; try { o = JSON.parse(body || '{}'); } catch { return send(400, { error: 'bad json' }); }
         let s;
-        try { s = this.create(o); }
+        try { s = await this.create(o); }
         catch (e) { return send(e.code === 'EBUSY' ? 409 : e.code === 'EINVAL' ? 400 : 500, { error: e.message, reason: e.reason || null }); }
         send(200, { session: s.state });
       });
@@ -1287,9 +1310,10 @@ class Mux {
     const mStop = /^\/api\/sessions\/([^/]+)\/stop$/.exec(p);
     if (mStop && req.method === 'POST') {
       const s = this.get(mStop[1]); if (!s) return send(404, { error: 'no such session' });
+      if (s.agent === 'codex') require('./ccbb-codex-session').forget(s.nativeId);
       s.stop(url.searchParams.get('force') === '1').then(() => {
         this.sessions.delete(s.id); send(200, { ok: true });
-      });
+      }).catch(e => send(409, { error: e.message }));
       return;
     }
     const mGet = /^\/api\/sessions\/([^/]+)$/.exec(p);
@@ -1322,7 +1346,8 @@ class Mux {
     };
     ws.on('message', raw => {
       let m; try { m = JSON.parse(raw); } catch { return; }
-      this.onClientOp(client, m);
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      this.onClientOp(client, m).catch(e => client.send({ op: 'ack', id: m.id, error: e.message }));
     });
     ws.on('close', () => { if (client.session) client.session.detach(client); });
     // Attach eagerly when the URL names a session, so a client can be a one-liner.
@@ -1332,7 +1357,7 @@ class Mux {
       epoch: url.searchParams.get('epoch') || undefined });
   }
 
-  onClientOp(client, m) {
+  async onClientOp(client, m) {
     const reply = (o) => client.send({ op: 'ack', id: m.id, ...o });
     if (m.op === 'attach') {
       const s = this.get(m.sessionId);
@@ -1345,30 +1370,30 @@ class Mux {
     }
     if (m.op === 'list') return reply({ sessions: this.list() });
     if (m.op === 'new') {
-      let s; try { s = this.create(m.options || {}); } catch (e) { return reply({ error: e.message, reason: e.reason || null }); }
+      let s; try { s = await this.create(m.options || {}); } catch (e) { return reply({ error: e.message, reason: e.reason || null }); }
       return reply({ session: s.state });
     }
 
     const s = client.session;
     if (!s) return reply({ error: 'not attached' });
     switch (m.op) {
-      case 'submit':   return reply({ ok: s.submit(m.text, m.content, client.label) });
+      case 'submit':   return reply({ ok: await s.submit(m.text, m.content, client.label) });
       case 'answer': {
         // One entry point for all three request kinds so a client never has to
         // know the CLI's response envelopes.
         const p = s.pending.get(m.requestId);
         if (!p) return reply({ error: 'unknown or already answered' });
-        if (p.requestKind === 'question') return reply(s.answerQuestion(m.requestId, m.picks || {}, client.label));
+        if (p.requestKind === 'question') return reply(await s.answerQuestion(m.requestId, m.picks || {}, client.label));
         if (p.requestKind === 'permission') {
-          const r = s.answerPermission(m.requestId, m.allow !== false, m, client.label);
+          const r = await s.answerPermission(m.requestId, m.allow !== false, m, client.label);
           // Accepting a plan is two actions, not one — the VS Code plugin allows
           // the ExitPlanMode tool and THEN switches the session to acceptEdits.
           // Doing only the first leaves the next edit prompting again, which
           // reads as the accept not having taken.
-          if (r.ok && m.planMode) s.setPermissionMode(m.planMode, client.label);
+          if (r.ok && m.planMode && s.state.agent !== 'codex') await s.setPermissionMode(m.planMode, client.label);
           return reply(r);
         }
-        return reply(s.answerRequest(m.requestId, m.payload || { behavior: 'cancelled' }, client.label));
+        return reply(await s.answerRequest(m.requestId, m.payload || { behavior: 'cancelled' }, client.label));
       }
       // The last client leaving BY CHOICE ends the session. Deliberately not wired to
       // the socket's close event: the web client reconnects, so a dropped socket empties
@@ -1379,14 +1404,17 @@ class Mux {
       case 'close': {
         s.detach(client);
         client.session = null;
-        const last = s.clients.size === 0;
+        const last = s.clients.size === 0 && s.state.agent !== 'codex';
         reply({ ok: true, stopped: last });
         if (last) s.stop(false).then(() => { this.sessions.delete(s.id); this.notifyChange(); }, () => {});
         return;
       }
-      case 'interrupt': s.interrupt(client.label); return reply({ ok: true });
-      case 'set_mode':  s.setPermissionMode(m.mode, client.label); return reply({ ok: true });
-      case 'set_model': s.setModel(m.model, client.label); return reply({ ok: true });
+      case 'interrupt': await s.interrupt(client.label); return reply({ ok: true });
+      case 'set_mode':  await s.setPermissionMode(m.mode, client.label); return reply({ ok: true });
+      case 'set_model': await s.setModel(m.model, client.label); return reply({ ok: true });
+      case 'steer': return reply({ ok: await s.steer(m.text, client.label) });
+      case 'rename': await s.rename(m.title); return reply({ ok: true });
+      case 'compact': await s.compact(); return reply({ ok: true });
       case 'snapshot':  return client.send(s.snapshot());
       case 'ping':      return reply({ pong: true });
       default:          return reply({ error: 'unknown op ' + m.op });
@@ -1429,7 +1457,7 @@ function pickSession(list, ref) {
   if (byId) return byId;
   const named = live.find(s => s.label === ref) || list.find(s => s.label === ref);
   if (named) return named;
-  const hits = list.filter(s => s.id.startsWith(ref));
+  const hits = list.filter(s => s.id.startsWith(ref) || (s.nativeId && s.nativeId.startsWith(ref)));
   if (hits.length === 1) return hits[0];
   return { error: hits.length ? `'${ref}' matches ${hits.length} sessions` : `no session named '${ref}'` };
 }
@@ -1444,27 +1472,30 @@ async function resolveRef(ref) {
 
 // ── ccbb new / stop / ls --mux ───────────────────────────────────────────────
 function newHelp() {
-  console.log(`ccbb new — start a Claude Code session in the mux and attach a terminal to it
+  console.log(`ccbb new — start a Claude Code or Codex session in the mux and attach a terminal to it
 
-Usage: ccbb new -b <binary> [-n name] [-m model] [options]
+Usage: ccbb new [--agent codex | -b <claude-binary>] [-n name] [options]
 
 Options:
-  -b, --bin <binary>     REQUIRED. which Claude Code to run: a name on PATH
+  --agent <agent>       claude (default) | codex
+  -b, --bin <binary>     Required for Claude. which Claude Code to run: a name on PATH
                          (claude, claude.pass, claude.aws) or a full path
   -n, --name <name>      name for the session (default: this directory's basename;
                          a -2, -3 … suffix is added if that name is already running)
   -m, --model <model>    model alias or full name
   -C, --cwd <dir>        working directory for the session (default: here)
   --permission-mode <m>  manual | auto | acceptEdits | plan | dontAsk | bypassPermissions
-  --resume <id>          resume an existing Claude Code session, in place
-  --fork                 with --resume, branch instead of continuing in place
+  --resume <id>          resume Claude, or attach a loaded Codex thread
+  --fork                 with --resume, create a separate session/thread
   --effort <level>       low | medium | high | xhigh | max
   --add-dir <dir>        extra allowed directory (repeatable)
   --detach               create the session but do not attach a terminal
 
 The session runs inside \`ccbb web\` — start that first. It shows up in the web UI as a
 tab and in \`ccbb ls --mux\`; the terminal here is just one more attached client, so
-closing it leaves the session running.`);
+closing it leaves the session running.
+Codex uses CCBB_CODEX_ENDPOINT or a persistent local app-server. A saved Codex thread
+with unknown ownership cannot be resumed in place. Codex stop detaches CCBB only.`);
 }
 
 function parseNew(args) {
@@ -1477,6 +1508,7 @@ function parseNew(args) {
     else if (a === '-m' || a === '--model') o.model = args[++i];
     else if (a === '-n' || a === '--name' || a === '--label') o.label = args[++i];
     else if (a === '--permission-mode') o.permissionMode = args[++i];
+    else if (a === '--agent') o.agent = args[++i];
     else if (a === '--resume') o.resume = args[++i];
     else if (a === '--fork') o.fork = true;
     else if (a === '--effort') o.effort = args[++i];
@@ -1489,7 +1521,7 @@ function parseNew(args) {
 async function runNew(args) {
   const o = parseNew(args);
   if (o.help) return newHelp();
-  if (!o.bin) { console.error('ccbb: new needs -b/--bin <binary> (claude, claude.pass, claude.aws, or a path)'); process.exit(1); }
+  if (o.agent !== 'codex' && !o.bin) { console.error('ccbb: new needs -b/--bin <binary> (claude, claude.pass, claude.aws, or a path)'); process.exit(1); }
   const detach = o.detach; delete o.detach;
   const r = await api('/api/sessions', 'POST', o);
   if (r.error) { console.error('ccbb:', r.error); process.exit(1); }
@@ -1520,9 +1552,9 @@ interrupt-and-drain and closes the child's stdin immediately.`);
 // transcripts — but not the things that are only true of a running child: its status,
 // how many clients are attached, and whether it is blocked on a request nobody has
 // answered. Those are what this view is for.
-async function runMuxLs() {
+async function runMuxLs(agent = 'all') {
   const r = await api('/api/sessions');
-  const list = r.sessions || [];
+  const list = (r.sessions || []).filter(s => agent === 'all' || (s.agent || 'claude') === agent);
   if (!list.length) return console.log('No mux sessions. Start one with `ccbb new`.');
   const w = Math.max(4, ...list.map(s => (s.label || '').length));
   // cwd last and clipped to what's left: it is the only unbounded column, and a home
@@ -1533,7 +1565,7 @@ async function runMuxLs() {
   const clip = t => (t = String(t || '')).length <= room ? t : '…' + t.slice(t.length - room + 1);
   console.log(`${'NAME'.padEnd(w)}  ID        STATUS    ${'BIN'.padEnd(bw)}  CLI  ASK  MSGS  CWD`);
   for (const s of list) {
-    console.log(`${String(s.label || '').padEnd(w)}  ${s.id.slice(0, 8)}  ` +
+    console.log(`${String(s.label || '').padEnd(w)}  ${(s.nativeId || s.id).slice(0, 8)}  ` +
       `${String(s.status).padEnd(8)}  ${path.basename(s.bin || '').padEnd(bw)}  ${String(s.clients).padStart(3)}  ` +
       `${String(s.pending).padStart(3)}  ${String(s.messages).padStart(4)}  ${clip(s.cwd)}`);
   }

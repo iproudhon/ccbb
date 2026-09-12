@@ -1,7 +1,7 @@
 {
   "name": "ccbb",
   "version": "0.1.4",
-  "description": "Browser, multiplexer, and live remote for your Claude Code sessions — terminal, web, Webex, and Confluence front-ends.",
+  "description": "Browser and multiplexer for Claude Code and Codex sessions",
   "keywords": [
     "claude",
     "claude-code",
@@ -19,6 +19,7 @@
   "files": [
     "ccbb.js",
     "ccbb-common.js",
+    "ccbb-agent-codex.js",
     "ccbb-mux.js",
     "ccbb-mux-tui.js",
     "ccbb-mux-web.js",
@@ -28,7 +29,8 @@
     "ccbb-webex.js",
     "ccbb-confluence.js",
     "ccbb-embed.js",
-    "LICENSE"
+    "LICENSE",
+    "ccbb-codex-session.js"
   ],
   "engines": {
     "node": ">=18"

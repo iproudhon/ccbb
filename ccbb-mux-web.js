@@ -113,10 +113,11 @@ const APP_CSS = `
 .muxv .mx-bar .label { font-weight: 600; font-size: 13px; }
 .muxv .mx-bar .cwd { color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .muxv .mx-bar .spacer { flex: 1 1 auto; }
-.muxv .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); flex: 0 0 auto; display: inline-block; }
-.muxv .dot.idle { background: var(--vscode-charts-green); }
-.muxv .dot.busy { background: var(--vscode-charts-yellow); animation: mx-pulse 1.1s ease-in-out infinite; }
-.muxv .dot.exited, .muxv .dot.gone { background: var(--vscode-charts-red); }
+.muxv .dot { width: 14px; height: 14px; border-radius: 50%; background: #57606a; flex: 0 0 auto; display: inline-block; }
+.muxv .dot svg { display:block; width:10px; height:10px; margin:2px; }
+.muxv .dot.idle { background: #d4a72c; }
+.muxv .dot.busy { background: #2da44e; animation: mx-pulse 1.1s ease-in-out infinite; }
+.muxv .dot.exited, .muxv .dot.gone { background: #57606a; }
 /* mx-pulse, not pulse: ccbb-web.js defines its own @keyframes pulse, and keyframe
    names are global no matter how well the rules that use them are scoped. */
 @keyframes mx-pulse { 50% { opacity: .3; } }
@@ -386,7 +387,7 @@ var ON_CHROME = typeof opts.onChrome === 'function' ? opts.onChrome : null;
 // status line prints. Separate from onChrome because it changes on a different clock.
 var ON_STATS = typeof opts.onStats === 'function' ? opts.onStats : null;
 var ERRORS = [];
-var dead = false, reconnectTimer = null;
+var dead = false, reconnectTimer = null, activityTimer = null;
 // Set by wire(); called when a snapshot lands so the composer's ↑ history reaches the
 // turns that were sent before this page existed.
 var ON_HISTORY = null;
@@ -525,6 +526,8 @@ function outBlock(result, isError) {
 var REG = {
   // hidden: the plugin renders nothing for these at all.
   AgentOutputTool: { hidden: true },
+  'Codex command': { header: function(i){return ['Command',firstLine(i.command)];}, body:function(i,result){var f=document.createDocumentFragment();f.appendChild(pre(i.command||''));if(result)f.appendChild(outBlock(result,false));return f;} },
+  'Codex file changes': { header:function(i){return ['File changes',(i.changes||[]).map(function(c){return base(c.path);}).join(', ')];}, body:function(i,result){return pre(result||JSON.stringify(i,null,2));} },
   ToolSearch: { hidden: true, header: function (i) { return ['Search tools', i && i.query ? '"' + i.query + '"' : '"…"']; } },
 
   Artifact: { header: function (i) { return ['Artifact', i.file_path]; } },
@@ -700,6 +703,40 @@ var S = {
   touched: {},
 };
 var nodes = {}, REV = 0;
+var historyStart = null, historyExpanded = false;
+var following = true, scrollFrame = null, logObserver = null, gapObserver = null;
+var historyHead = 5, historyTail = opts.historyTail || 25;
+function historyWindow(list) {
+  if (historyExpanded || list.length <= historyHead + historyTail) return list;
+  var from = list.findIndex(function(m){return m.id === historyStart;});
+  if (from < 0) { from = Math.max(historyHead, list.length - historyTail); historyStart = list[from].id; }
+  if (from <= historyHead) return list;
+  return list.slice(0, historyHead).concat([{id:'ccbb:history-gap', _rev:from, historyGap:from-historyHead}],list.slice(from));
+}
+function loadOlder(all) {
+  var log = Q('.mx-log'), oldHeight = log.scrollHeight, oldTop = log.scrollTop;
+  var list = displayList(), from = list.findIndex(function(m){return m.id === historyStart;});
+  if (from <= historyHead) return;
+  following = false;
+  from = all ? historyHead : Math.max(historyHead, from - 25);
+  historyStart = list[from].id; historyExpanded = from === historyHead;
+  paintAll();
+  log.scrollTop = oldTop + log.scrollHeight - oldHeight;
+}
+function historyGapNode(m) {
+  var gap = el('div', 'hist-gap');
+  gap.innerHTML = '<span>'+m.historyGap+' earlier messages</span> <button>Show '+Math.min(25,m.historyGap)+' more</button> <button>Show all</button>';
+  var buttons = gap.querySelectorAll('button');
+  buttons[0].onclick = function(){loadOlder(false);};
+  buttons[1].onclick = function(){loadOlder(true);};
+  if (gapObserver) gapObserver.observe(gap);
+  return gap;
+}
+function pinBottom() {
+  if (dead || !following || scrollFrame != null) return;
+  scrollFrame = requestAnimationFrame(function(){scrollFrame=null;if(!dead && following)scrollDown();});
+}
+
 
 function bump(m) { m._rev = ++REV; }
 function indexTools(m) {
@@ -743,6 +780,7 @@ function reset(snap) {
   (snap.pending || []).forEach(function (p) { S.pending[p.requestId] = p; });
   S.clients = snap.clients || [];
   nodes = {};
+  if (gapObserver) gapObserver.disconnect();
   Q('.mx-log').firstChild.innerHTML = '';
   // The transcript IS the prompt history, so ↑ reaches past this page's own turns to
   // whatever was sent before it existed. Re-seeded on every snapshot rather than
@@ -1366,13 +1404,14 @@ function displayList() {
 
 function paintAll() {
   var host = Q('.mx-log').firstChild;
-  var list = displayList();
-  var atBottom = nearBottom();
+  var list = historyWindow(displayList());
+  var atBottom = following;
   var prev = null;
   list.forEach(function (m) {
     var n = nodes[m.id];
     if (!n || n._rev !== m._rev) {
-      var made = msgNode(m);
+      if (n && m.historyGap && gapObserver) gapObserver.unobserve(n);
+      var made = m.historyGap ? historyGapNode(m) : msgNode(m);
       if (!made) { if (n && n.parentNode) n.parentNode.removeChild(n); delete nodes[m.id]; return; }
       made._rev = m._rev;
       if (n && n.parentNode) { host.replaceChild(made, n); refold(n, made); } else host.appendChild(made);
@@ -1386,9 +1425,9 @@ function paintAll() {
   var live = {};
   list.forEach(function (m) { live[m.id] = 1; });
   Object.keys(nodes).forEach(function (id) {
-    if (!live[id]) { if (nodes[id].parentNode) nodes[id].parentNode.removeChild(nodes[id]); delete nodes[id]; }
+    if (!live[id]) { if (gapObserver) gapObserver.unobserve(nodes[id]); if (nodes[id].parentNode) nodes[id].parentNode.removeChild(nodes[id]); delete nodes[id]; }
   });
-  if (atBottom) scrollDown();
+  if (atBottom) { scrollDown(); pinBottom(); }
   paintChrome();
 }
 
@@ -1493,7 +1532,7 @@ function paintBusy() {
 // only because the title was not on the wire. It is now, so the label is not a name
 // anything displays — it is only the fallback for a session too new to have a title.
 function sessionName(i) {
-  return (i && (i.title || i.label)) || SESSION.slice(0, 8);
+  return (i && (i.title || i.label)) || shortSessionId(SESSION);
 }
 
 // The shrink ladder's rungs, from ccbb's SHARED_JS. A host that did not include that
@@ -1508,12 +1547,12 @@ var LVL = (typeof FOOT_LVL_CTX_LABEL === 'number')
 // people actually scan for. lvl is the shrink level fitFoot is trying; see the ladder in
 // ccbb web's SHARED_JS, which both footers share so they give up detail in one order.
 function footHtml(i, lvl) {
-  var money = '<b>$' + Number(i.cost || 0).toFixed(2) + '</b>';
+  var money = i.cost == null ? '<b>cost: —</b>' : '<b>' + (i.agent === 'codex' ? '~' : '') + '$' + Number(i.cost).toFixed(2) + '</b>';
   // The plan windows, as ccbb's own pills. On a Claude.ai plan the dollars are notional
   // list price and these are the figure that actually runs out, so a status line without
   // them is missing the number people are really watching. footWin/subWinTitle come from
   // ccbb's SHARED_JS — the pill is one object, drawn by one function, in both clients.
-  var pills = SUB && SUB.windows && typeof footWin === 'function'
+  var pills = i.agent !== 'codex' && SUB && SUB.windows && typeof footWin === 'function'
     ? (function () {
         var w = SUB.windows, p = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
         return p ? '<span class="fwins" title="' + esc(subWinTitle(SUB)) + '">' + p + '</span>' : '';
@@ -1543,14 +1582,16 @@ function footHtml(i, lvl) {
   var last = fresh[fresh.length - 1];
   if (pin) right.push(pin.text);
   if (last && last !== pin) right.push(last.text);
-  return [money, pills, turns, ctxStr,
+  return [i.agent === 'codex' ? '<span>Codex · '+esc(i.model || '')+'</span>' : '', money, pills, turns, ctxStr,
     right.length ? '<span class="sl-note">' + esc(right.join(' \u00b7 ')) + '</span>' : ''
   ].filter(Boolean).join('');
 }
 
 function paintChrome() {
   var i = S.info || {};
-  var connected = !!(WS && WS.readyState === 1);
+  var connected = !!opts.snapshot || !!(WS && WS.readyState === 1);
+  var live = opts.snapshot ? !!i.live : connected && !['exited','gone','disconnected'].includes(i.status);
+  var activityStatus = opts.snapshot ? (i.liveStatus || 'gone') : (i.status || 'idle');
   syncBusy();
   // Guarded, not assumed: mounted inside ccbb web the bar belongs to the host view,
   // so none of these elements exist. Unguarded this threw on the first paint and
@@ -1558,12 +1599,33 @@ function paintChrome() {
   var bar = Q('.mx-bar');
   if (bar) {
     bar.querySelector('.label').textContent = sessionName(i);
+    bar.querySelector('.label').title = i.agent === 'codex' ? 'Click to rename' : '';
+    bar.querySelector('.label').style.cursor = i.agent === 'codex' ? 'text' : '';
     bar.querySelector('.cwd').textContent = i.cwd || '';
     var dot = bar.querySelector('.dot');
-    dot.className = 'dot ' + (connected ? (i.status || 'idle') : 'gone');
+    dot.innerHTML = activityGlyph(i.agent, !opts.snapshot);
+    dot.className = 'dot ' + (live ? (activityStatus === 'idle' ? 'idle' : 'busy') : 'gone');
     dot.title = connected ? (i.status || '') : 'disconnected';
   }
+  var reconnect = Q('.codex-reconnect');
+  if (i.agent === 'codex' && i.status === 'disconnected' && !opts.snapshot) {
+    if (!reconnect) {
+      reconnect = el('button', 'codex-reconnect', 'Reconnect Codex');
+      Q('.sv-foot').appendChild(reconnect);
+      reconnect.onclick = function () {
+        reconnect.disabled = true;
+        fetch(BASE + '/api/sessions', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ agent: 'codex', resume: SESSION })
+        }).then(function (r) { return r.json(); })
+          .then(function (d) { if (d.error) throw new Error(d.error); })
+          .catch(function (e) { note(e.message); reconnect.disabled = false; });
+      };
+    }
+  } else if (reconnect) reconnect.remove();
   var mode = Q('.mx-mode');
+  if (mode) mode.hidden = i.agent === 'codex';
+  if (i.agent === 'codex') { var inp = Q('.input-box'); if (inp) inp.dataset.ph = 'Message Codex… (Ctrl+Enter to send; queued while busy; /steer to interrupt direction)'; }
   if (mode && mode.value !== (i.permissionMode || 'default')) mode.value = i.permissionMode || 'default';
 
   var sl = Q('.sv-foot .sl');
@@ -1574,8 +1636,8 @@ function paintChrome() {
   // not pass onChrome.
   if (ON_CHROME) ON_CHROME({
     title: sessionName(i), label: i.label || '', cwd: i.cwd || '',
-    status: connected ? (i.status || 'idle') : 'gone', activity: i.activity || null,
-    permissionMode: i.permissionMode || 'default',
+    live: live, status: live ? activityStatus : 'gone', activity: i.activity || null,
+    permissionMode: i.agent === 'codex' ? null : (i.permissionMode || 'default'),
     connected: connected, clients: S.clients.slice(), info: i, stats: i.stats || null,
   });
 }
@@ -1602,6 +1664,18 @@ function permissionCard(p) {
   else detail.appendChild(pre(JSON.stringify(input, null, 2)));
   c.appendChild(detail);
 
+  if (p.payload.codexDecisions && p.payload.codexDecisions.length) {
+    var choices = el('div', 'buttons');
+    p.payload.codexDecisions.forEach(function(decision){
+      var names = {accept:'Allow once',acceptForSession:'Allow for session',decline:'Deny',cancel:'Cancel turn'};
+      var label = typeof decision === 'string' ? names[decision] || decision :
+        decision.acceptWithExecpolicyAmendment ? 'Allow and save command rule' : 'Allow proposed network rule';
+      var button = el('button', decision === 'accept' ? 'primary' : '', label);
+      button.onclick = function(){send({op:'answer',requestId:p.requestId,decision:decision,allow:decision !== 'decline' && decision !== 'cancel'});};
+      choices.appendChild(button);
+    });
+    c.appendChild(choices); return c;
+  }
   var suggestions = p.payload.permission_suggestions || p.payload.permissionSuggestions;
   var bs = el('div', 'buttons');
   var yes = el('button', 'primary', isPlan ? 'Yes, and auto-accept' : 'Yes');
@@ -1635,16 +1709,16 @@ function questionCard(p) {
   var input = p.payload.input || {};
   var qs2 = input.questions || [];
   var picks = {};
-  qs2.forEach(function (q) { picks[q.question] = { set: {}, other: '' }; });
+  qs2.forEach(function (q) { picks[q.id || q.question] = { set: {}, other: '' }; });
   var tab = 0;
 
   var c = el('div', 'card');
-  c.appendChild(el('div', 'head', 'Claude has a question'));
+  c.appendChild(el('div', 'head', S.info.agent === 'codex' ? 'Codex has a question' : 'Claude has a question'));
   var tabs = el('div', 'qtabs'), body = el('div', 'qbody');
   var submit = el('button', 'primary', 'Submit answers');
 
   function chosen(q) {
-    var st = picks[q.question];
+    var st = picks[q.id || q.question];
     var out = Object.keys(st.set).filter(function (k) { return st.set[k]; });
     // An "Other" pick is REPLACED by the typed text, not accompanied by it.
     var i = out.indexOf('__other__');
@@ -1663,10 +1737,10 @@ function questionCard(p) {
       var inp = document.createElement('input');
       inp.type = multi ? 'checkbox' : 'radio';
       inp.name = 'q' + tab;
-      inp.checked = !!picks[q.question].set[o.label];
+      inp.checked = !!picks[q.id || q.question].set[o.label];
       inp.onchange = function () {
-        if (!multi) picks[q.question].set = {};
-        picks[q.question].set[o.label] = inp.checked;
+        if (!multi) picks[q.id || q.question].set = {};
+        picks[q.id || q.question].set[o.label] = inp.checked;
         drawBody(); redraw();
       };
       lab.appendChild(inp);
@@ -1675,12 +1749,12 @@ function questionCard(p) {
       if (o.description) t.appendChild(el('div', 'desc', o.description));
       lab.appendChild(t);
       body.appendChild(lab);
-      if (o.label === '__other__' && picks[q.question].set['__other__']) {
+      if (o.label === '__other__' && picks[q.id || q.question].set['__other__']) {
         var free = document.createElement('input');
         free.type = 'text';
-        free.value = picks[q.question].other;
+        free.value = picks[q.id || q.question].other;
         free.placeholder = 'Your answer';
-        free.oninput = function () { picks[q.question].other = free.value; redraw(); };
+        free.oninput = function () { picks[q.id || q.question].other = free.value; redraw(); };
         body.appendChild(free);
         free.focus();
       }
@@ -1697,7 +1771,7 @@ function questionCard(p) {
   }
   submit.onclick = function () {
     var out = {};
-    qs2.forEach(function (q) { out[q.question] = chosen(q); });
+    qs2.forEach(function (q) { out[q.id || q.question] = chosen(q); });
     send({ op: 'answer', requestId: p.requestId, picks: out });
   };
 
@@ -1709,7 +1783,51 @@ function questionCard(p) {
   return c;
 }
 
+function elicitationCard(p) {
+  var request = p.payload.codexElicitation;
+  var card = el('form', 'card');
+  card.appendChild(el('div', 'head', request.serverName + ': ' + request.message));
+  var fields = {}, schema = request.requestedSchema || {}, supported = true;
+  if (request.mode === 'url') {
+    try {
+      var url = new URL(request.url);
+      if (url.protocol === 'https:' || url.protocol === 'http:') {
+        var link = el('a', '', 'Open requested page'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; card.appendChild(link);
+      } else supported = false;
+    } catch(e) { supported = false; }
+  } else {
+    Object.keys(schema.properties || {}).forEach(function(key){
+      var spec = schema.properties[key], label = el('label', '', spec.title || key);
+      var input;
+      if (spec.enum) {
+        input = el('select'); spec.enum.forEach(function(v){var o=el('option','',String(v));o.value=String(v);input.appendChild(o);});
+      } else {
+        input = el('input');
+        input.type = spec.type === 'boolean' ? 'checkbox' : ['number','integer'].indexOf(spec.type)>=0 ? 'number' : 'text';
+        if (spec.type && ['string','boolean','number','integer'].indexOf(spec.type)<0) supported=false;
+        if (spec.minimum != null) input.min=spec.minimum;
+        if (spec.maximum != null) input.max=spec.maximum;
+        if (spec.type==='integer')input.step='1';
+      }
+      input.required = input.type !== 'checkbox' && (schema.required || []).indexOf(key)>=0;
+      label.appendChild(input); if(spec.description)label.appendChild(el('small','',spec.description));
+      card.appendChild(label); fields[key]={input:input,spec:spec};
+    });
+  }
+  var buttons=el('div','buttons');
+  if (supported) {
+    var accept=el('button','primary',request.mode==='url'?'Completed':'Submit'); accept.type='submit'; buttons.appendChild(accept);
+  } else card.appendChild(el('div','','This form requires another Codex client. You can decline or cancel here.'));
+  ['decline','cancel'].forEach(function(action){var b=el('button','',action==='decline'?'Decline':'Cancel');b.type='button';b.onclick=function(){send({op:'answer',requestId:p.requestId,payload:{action:action}});};buttons.appendChild(b);});
+  card.appendChild(buttons);
+  card.onsubmit=function(e){e.preventDefault();if(!supported || !card.reportValidity())return;var content={};
+    Object.keys(fields).forEach(function(key){var f=fields[key],v=f.input.value;if(f.spec.type==='boolean')content[key]=f.input.checked;else if(v!=='')content[key]=['number','integer'].indexOf(f.spec.type)>=0?Number(v):v;});
+    send({op:'answer',requestId:p.requestId,payload:{action:'accept',content:request.mode==='url'?null:content}});
+  };
+  return card;
+}
 function dialogCard(p) {
+  if (p.payload.codexElicitation) return elicitationCard(p);
   // Only two dialog kinds ship today, and an unhandled one is PARKED by the child
   // rather than failed — so a wrong answer is worse than none. ccbb shows it and
   // offers only cancel; a more capable client can still settle it.
@@ -1738,6 +1856,7 @@ function paintCards() {
 // ── Socket ─────────────────────────────────────────────────────────────────
 var WS = null, retry = 0;
 function connect() {
+  if (opts.snapshot) return;
   if (dead) return;
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var u = proto + '//' + location.host + BASE + '/mux?session=' + encodeURIComponent(SESSION) +
@@ -1775,7 +1894,7 @@ function connect() {
 }
 // iOS freezes timers in a backgrounded tab, so the reconnect must also be driven
 // by coming back to the foreground, not only by the socket's own close event.
-function onVisible() { if (!document.hidden && !WS && !dead) connect(); }
+function onVisible() { if (opts.snapshot) return; if (!document.hidden && !WS && !dead) connect(); }
 document.addEventListener('visibilitychange', onVisible);
 
 // ── Composer ───────────────────────────────────────────────────────────────
@@ -1961,10 +2080,33 @@ function wire() {
       send({ op: 'interrupt' });
     }
   });
+  var log = Q('.mx-log');
+  log.addEventListener('scroll', function(){if(log.clientHeight)following=nearBottom();});
+  log.addEventListener('wheel', function(e){if(e.deltaY < 0)following=false;}, {passive:true});
+  logObserver = new ResizeObserver(function(){pinBottom();});
+  logObserver.observe(log); logObserver.observe(log.firstChild);
+  gapObserver = new IntersectionObserver(function(entries){
+    if (!following && entries.some(function(e){return e.isIntersecting && e.target.isConnected;})) loadOlder(false);
+  }, {root:log});
   syncHist();
   var modeSel = Q('.mx-mode');
   if (modeSel) modeSel.addEventListener('change', function (e) {
     send({ op: 'set_mode', mode: e.target.value });
+  });
+  var titleLabel = Q('.mx-bar .label');
+  if (titleLabel) titleLabel.addEventListener('click', function(){
+    if (S.info.agent !== 'codex' || Q('.mx-title-input')) return;
+    var input = el('input', 'mx-title-input');
+    input.value = sessionName(S.info); titleLabel.hidden = true; titleLabel.after(input);
+    input.focus(); input.select();
+    var finished = false;
+    function finish(save){
+      if (finished) return; finished = true;
+      var name = input.value.trim(); input.remove(); titleLabel.hidden = false;
+      if (save && name && name !== sessionName(S.info)) send({op:'rename',title:name});
+    }
+    input.addEventListener('blur', function(){finish(true);});
+    input.addEventListener('keydown', function(e){if(e.key==='Enter'){e.preventDefault();finish(true);}else if(e.key==='Escape')finish(false);});
   });
   var stopBtn = Q('.mx-stop');
   if (stopBtn) stopBtn.addEventListener('click', function () { send({ op: 'interrupt' }); });
@@ -1973,7 +2115,23 @@ function wire() {
   // A pane dragged narrower changes what fits with no session event behind it, and
   // nothing else would repaint the row.
   if (typeof onFootResize === 'function') onFootResize(Q('.sv-foot .sl'), paintChrome);
-  connect();
+  if (opts.snapshot) {
+    reset(opts.snapshot);
+    if (S.info.agent === 'codex') {
+      var activityPending = false;
+      activityTimer = setInterval(function(){
+        if (dead || activityPending) return;
+        activityPending = true;
+        fetch(BASE.replace(/\\/mux$/, '') + '/api/codex/activity/' + encodeURIComponent(S.info.nativeId))
+          .then(function(r){if(!r.ok)throw new Error('Activity unavailable');return r.json();})
+          .then(function(activity){if(!dead){Object.assign(S.info,activity);paintChrome();}})
+          .catch(function(){})
+          .finally(function(){activityPending=false;});
+      }, 3000);
+    }
+    var compose = Q('.input-area');
+    if (compose) { compose.hidden = true; compose.style.display = 'none'; }
+  } else connect();
   loadSub();
   input.focus();
 }
@@ -1989,6 +2147,7 @@ var handle = {
   errors: ERRORS,
   state: function () { return S; },
   session: SESSION,
+  onVisible: pinBottom,
   // Closing a view must take the socket AND the reconnect timer with it. The timer
   // is the one that bites: left running it re-opens a socket for a view that no
   // longer exists, so the mux goes on counting a client nobody can see and the
@@ -2000,6 +2159,10 @@ var handle = {
   destroy: function (o) {
     if (o && o.closeSession) send({ op: 'close' });
     dead = true;
+    if (scrollFrame != null) cancelAnimationFrame(scrollFrame);
+    if (logObserver) logObserver.disconnect();
+    if (gapObserver) gapObserver.disconnect();
+    if (activityTimer) { clearInterval(activityTimer); activityTimer = null; }
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (busyTimer) { clearInterval(busyTimer); busyTimer = null; }
     document.removeEventListener('visibilitychange', onVisible);
@@ -2032,7 +2195,7 @@ var qs = new URLSearchParams(location.search);
 var HERE = location.pathname.match(/^(.*)\\/s\\/([^/]+)/) || [];
 var view = window.createMuxView(document.getElementById('app'), {
   base: HERE[1] || '',
-  session: HERE[2] || '',
+  session: decodeURIComponent(HERE[2] || ''),
   token: qs.get('token') || '',
   label: qs.get('label') || 'web',
   machine: __MACHINE__,
@@ -2102,7 +2265,7 @@ function listPage(sessions, token) {
     const bits = [s.status, s.model, `${s.messages} msg`, s.clients ? `${s.clients} client${s.clients === 1 ? '' : 's'}` : null]
       .filter(Boolean).join(' · ');
     return `<a class="row" href="s/${encodeURIComponent(s.id)}${q}">
-      <span>${esc(s.label || s.id.slice(0, 8))}</span>
+      <span>${esc(s.label || String(s.nativeId || s.id).replace(/^codex:/, '').slice(0, 8))}</span>
       <span class="id">${esc(s.cwd)}</span>
       <span style="margin-left:auto" class="id">${esc(bits)}</span></a>`;
   }).join('') : '<p class="id">No sessions. Start one with <code>ccbb new</code>.</p>';
@@ -2161,15 +2324,15 @@ function mount(mux) {
 function muxRows(mux) {
   if (!mux) return [];
   return mux.list().map(x => ({
-    sessionId: x.id,
+    sessionId: x.id, agent: x.agent || 'claude',
     title: x.title || x.label || '',
     live: x.status !== 'exited',
     liveStatus: x.status || null,
     projectPath: x.cwd || '',
     startedAt: x.startedAt || null,
     lastActivity: x.lastActivity || null,
-    totalCost: x.cost || 0,
-    totalTokens: x.tokens || 0,
+    totalCost: x.cost ?? null,
+    totalTokens: x.tokens ?? null,
     turns: x.turns || 0,
     mux: true,
     muxClients: x.clients || 0,

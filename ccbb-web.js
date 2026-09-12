@@ -293,11 +293,11 @@ function fmtCost(c){ return '$'+(c||0).toFixed(2); }
 function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s'; var m=Math.floor(s/60); if(m<60)return m+'m '+Math.round(s%60)+'s'; var h=Math.floor(m/60); if(h<24)return h+'h '+(m%60)+'m'; return Math.floor(h/24)+'d '+(h%24)+'h'; }
 function fmtPct(part,whole){ return (whole>0?(100*part/whole):0).toFixed(1)+'%'; }
 function fmtStatDate(iso){ return fd(iso); }
-// The mux's mark: /\\/\\ where a tmux session gets a dot. One string, because the list, the
-// session page and the phone all draw the same fact and a second copy is how they drift.
-// Sized and coloured entirely by CSS (stroke:currentColor), so it inherits whatever the
-// liveness palette says at that spot.
-var MUX_GLYPH = '<svg viewBox="0 0 13 8" aria-hidden="true"><path d="M1.4 7L4 1l2.5 6L9 1l2.6 6"/></svg>';
+// Agent marks from @lobehub/icons-static-svg (MIT); activity color stays on the circle.
+var OPENAI_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"></path></svg>';
+var CLAUDE_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"></path></svg>';
+function shortSessionId(id) { return String(id || '').replace(/^codex:/, '').slice(0, 8); }
+function activityGlyph(agent, mux) { return agent === 'codex' ? OPENAI_GLYPH : (mux ? CLAUDE_GLYPH : ''); }
 
 // ── subscription windows ──
 // A Claude.ai plan runs out of WINDOW, not money, so the two rolling limits travel next
@@ -810,20 +810,13 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .lv .dt{color:#57606a;font-size:12px;white-space:nowrap}
 .lv .proj{color:#8250df;font-size:12px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lv .ctx-tag{font-size:10px;color:#8c959f;margin-left:4px}
-/* The liveness mark carries two facts at once, in one glyph's worth of width. COLOUR is
-   what the session is doing — green working, amber alive and waiting, the pair the
-   phone's list has always drawn — and SHAPE is how you reach it: a dot for a tmux pane,
-   an M for the mux. The mux used to say so in a tag of its own beside every id, which
-   read as a column that existed only to be mostly empty. Colour rides on the color property so the
-   two shapes share one palette; only the shape branches. */
-.lv .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+/* Activity color shows working, waiting, or inactive; the inset mark identifies the agent. */
+.lv .live-dot{display:inline-block;width:14px;height:14px;border-radius:50%;
   background:currentColor;color:#2da44e;vertical-align:middle;
   animation:pulse 1.6s ease-in-out infinite}
 .lv .live-dot.idle{color:#d4a72c;animation:none}
-.lv .live-dot.off{background:transparent;animation:none}
-.lv .live-dot.mux{width:13px;height:8px;border-radius:0;background:none}
-.lv .live-dot.mux svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;
-  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.lv .live-dot.off{color:#57606a;animation:none}
+.lv .live-dot svg{display:block;width:10px;height:10px;margin:2px}
 /* The column holds one glyph and needs the width of one glyph: the table's usual 12px
    of side padding was three times the mark it was padding. */
 .lv #out th:first-child,.lv #out td:first-child{width:1%;padding-left:14px;padding-right:2px}
@@ -891,16 +884,12 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
    is one figure, the way the status line reads it. */
 .hdr-stats .plan-win{color:var(--ink-soft);cursor:help}
 .subturns{font-size:0.8em;color:var(--ink-faint)}
-/* Same two facts as the list's mark, drawn the same way: colour is what the session is
-   doing, shape is how you reach it. Colour rides on the color property so the dot and
-   the mux's M share one palette and only the shape branches. */
-.status-dot{width:9px;height:9px;border-radius:50%;background:currentColor;
-  color:var(--ink-faint);flex-shrink:0}
+/* Session headers use the same activity palette and agent marks as the list. */
+.status-dot{width:14px;height:14px;border-radius:50%;background:currentColor;
+  color:#57606a;flex-shrink:0}
 .status-dot.live{color:#2da44e;animation:pulse 1.6s ease-in-out infinite}
 .status-dot.idle{color:#d4a72c;animation:none}
-.status-dot.mux{width:14.6px;height:9px;border-radius:0;background:none}
-.status-dot.mux svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;
-  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.status-dot svg{display:block;width:10px;height:10px;margin:2px}
 .hdr-status{display:none;font-size:11px;color:#8a6d1a;margin-top:3px;font-variant-numeric:tabular-nums}
 .hdr-status.show{display:block}
 .hdr-status b{font-weight:600}
@@ -1667,6 +1656,7 @@ function makeViewBar(v, barMain, buttons){
   return bar;
 }
 function openSession(sid, server, mux, title){
+  try { sid = decodeURIComponent(sid); } catch(e) {}
   // A session is identified by (server, id): the same id could exist on two machines,
   // and two views of "the same" id on different servers are two different sessions.
   var srv = isLocal(server) ? null : server;
@@ -1678,6 +1668,14 @@ function openSession(sid, server, mux, title){
   }
   // A mux session has no transcript-and-pane to fetch info for; the client's own
   // snapshot carries everything the bar shows, so it opens without a round trip.
+  if (!mux && sid.indexOf('codex:') === 0) {
+    fetch(apiBase(srv)+'/api/codex/history/'+encodeURIComponent(sid.slice(6))).then(function(r){return r.json();}).then(function(snap){
+      if (snap.error) throw new Error(snap.error);
+      var cv = createMuxSessionView({sessionId:sid, server:srv, title:snap.state.title, snapshot:snap});
+      views.push(cv); viewsEl.appendChild(cv.el); relayout();
+    }).catch(function(e){toast('Codex history: '+e.message);});
+    return;
+  }
   if (mux) {
     var mv = createMuxSessionView({ sessionId: sid, server: srv, title: title || '' });
     views.push(mv);
@@ -1709,6 +1707,32 @@ function createListView(){
     '<span class="bar-title" id="barTitle"></span><span class="bar-refreshed" id="refreshed"></span>';
   barMain.querySelector('#barTitle').textContent = 'ccbb — ' + SELF.name;
   el.appendChild(makeViewBar(v, barMain, { close:false, orient:true }));
+  if (!RO) {
+    var createBtn = document.createElement('button'); createBtn.className = 'vb-btn'; createBtn.textContent = '+'; createBtn.title = 'New session'; createBtn.setAttribute('aria-label', 'New session');
+    createBtn.onclick = function(){
+      var dialog = document.createElement('dialog');
+      dialog.innerHTML = '<form><h3>Open session</h3><p><label>Agent <select name="agent"><option value="claude">Claude</option><option value="codex">Codex</option></select></label></p><p class="claude-bin"><label>Claude binary <input name="bin" placeholder="claude, claude.pass, or path"></label></p><p><label>Working directory <input name="cwd" placeholder="Server working directory"></label></p><p><label>Loaded Codex thread ID (optional) <input name="resume" list="codexLoaded" placeholder="New thread when empty"><datalist id="codexLoaded"></datalist></label></p><p><label><input type="checkbox" name="fork"> Fork into a new session</label></p><p class="error"></p><button type="submit">Open</button> <button type="button" class="cancel">Cancel</button></form>';
+      document.body.appendChild(dialog); dialog.showModal();
+      dialog.querySelector('select[name=agent]').onchange = function(){
+        dialog.querySelector('.claude-bin').hidden = this.value === 'codex';
+        if(this.value !== 'codex') return;
+        fetch('/mux/api/codex/loaded').then(function(r){return r.json();}).then(function(d){
+          var list=dialog.querySelector('datalist'); list.innerHTML='';
+          (d.threads||[]).forEach(function(t){var o=document.createElement('option');o.value=t.id;o.textContent=t.title;list.appendChild(o);});
+          if(d.error)dialog.querySelector('.error').textContent=d.error;
+        }).catch(function(e){dialog.querySelector('.error').textContent=e.message;});
+      };
+      dialog.querySelector('.cancel').onclick = function(){dialog.remove();};
+      dialog.querySelector('form').onsubmit = async function(e){
+        e.preventDefault(); var f=e.target; var b=f.querySelector('button[type=submit]'); b.disabled=true;
+        try {
+          var r=await fetch('/mux/api/sessions', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:f.elements.agent.value,bin:f.elements.agent.value==='claude'?f.elements.bin.value.trim():undefined,cwd:f.elements.cwd.value||undefined,resume:f.elements.resume.value||undefined,fork:f.elements.fork.checked})});
+          var d=await r.json(); if(!r.ok) throw new Error(d.error||'Could not open session');
+          dialog.remove(); openSession(d.session.id,null,true,d.session.title); v.refresh();
+        } catch(err){f.querySelector('.error').textContent=err.message;b.disabled=false;}
+      };
+    }; barMain.appendChild(createBtn);
+  }
   var refreshedEl = barMain.querySelector('#refreshed');
   // The chevron reflects THIS view's fold, not whether it happens to be collapsed —
   // a list hidden because a session is maximized still shows itself as unfolded.
@@ -2232,21 +2256,18 @@ function createListView(){
   // The Server column only earns its width once there IS more than one server —
   // a single-host install would just repeat its own name down every row.
   function multiServer(){ return servers.length > 1; }
-  // Green working, amber waiting, nothing at all once the session is gone; an M rather
-  // than a dot when the session is driven over the mux. Everything the tag used to say
-  // is in the tooltip, where it costs the table no width.
+  // Green working, amber waiting, gray inactive; the inset logo identifies the agent.
   function liveMark(s) {
-    if (!s.live) return '<span class="live-dot off"></span>';
     var idle = s.liveStatus === 'idle';
-    var tip = (idle ? 'Idle' : 'Working')
+    var tip = (!s.live ? 'Inactive' : idle ? 'Idle' : 'Working')
       + (s.mux ? ' — in the ccbb mux (JSON mode)'
           + (s.muxClients ? ', '+s.muxClients+' client'+(s.muxClients===1?'':'s')+' attached' : '') : '');
-    return '<span class="live-dot'+(idle?' idle':'')+(s.mux?' mux':'')+'" title="'+esc(tip)+'">'
-      + (s.mux ? MUX_GLYPH : '')
+    return '<span class="live-dot'+(!s.live?' off':idle?' idle':'')+'" title="'+esc(tip)+'">'
+      + activityGlyph(s.agent, s.mux)
       + '</span>';
   }
   function rowHtml(s) {
-    var sid = s.sessionId, sh = sid.slice(0,8);
+    var sid = s.sessionId, sh = shortSessionId(sid);
     // A read-only browser cannot drive a mux session, and /mux/* refuses it — so
     // point it at the transcript view instead of at a 403.
     var href = sessionHref(sid, s.server, s.mux && !RO);
@@ -2264,8 +2285,8 @@ function createListView(){
       + '<td>'+liveMark(s)+'</td>'
       + (multiServer() ? '<td class="srv'+(isLocal(s.server)?' local':'')+'">'+esc(s.server||SELF.name)+'</td>' : '')
       + '<td class="ttl">'+titleHtml+'</td>'
-      + '<td class="cost">'+fc(s.totalCost)+'</td>'
-      + '<td class="tok">'+ft(s.totalTokens)+'</td>'
+      + '<td class="cost">'+(s.totalCost == null ? '—' : (s.agent === 'codex' ? '~' : '')+fc(s.totalCost))+'</td>'
+      + '<td class="tok">'+(s.totalTokens == null ? '—' : ft(s.totalTokens))+'</td>'
       + '<td class="num">'+(s.turns||0)+sub+'</td>'
       + '<td class="num">'+ctxHtml+'</td>'
       + '<td class="dt">'+fd(s.lastActivity)+'</td>'
@@ -2305,7 +2326,7 @@ function createListView(){
     out.className = ''; out.innerHTML = html;
     var tc = totals.totalCost != null, tt = totals.totalTokens != null;
     body.querySelector('#foot').textContent = (tc||tt)
-      ? 'Total: '+(tc?fc(totals.totalCost):'')+(tc&&tt?' | ':'')+(tt?ft(totals.totalTokens)+' tokens':'') : '';
+      ? 'Claude total: '+(tc?fc(totals.totalCost):'')+(tc&&tt?' | ':'')+(tt?ft(totals.totalTokens)+' tokens':'') : '';
   }
   body.addEventListener('click', function(e) {
     var tbtn = e.target.closest('.chip-term[data-term]');
@@ -2586,9 +2607,9 @@ function createMuxSessionView(INFO){
 
   var barMain = document.createElement('div');
   barMain.style.cssText = 'display:flex;align-items:center;gap:10px;flex:1;min-width:0';
-  barMain.innerHTML = '<div class="status-dot mux" title="Driven over the mux protocol, not a tmux pane">'+MUX_GLYPH+'</div>'
+  barMain.innerHTML = '<div class="status-dot mux" title="Driven over the mux protocol, not a tmux pane">'+activityGlyph(INFO.agent || (INFO.sessionId.indexOf('codex:') === 0 ? 'codex' : 'claude'), !INFO.snapshot)+'</div>'
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
-    + '<div class="hdr-title">'+esc(INFO.title || INFO.sessionId.slice(0,8))+'</div>';
+    + '<div class="hdr-title">'+esc(INFO.title || shortSessionId(INFO.sessionId))+'</div>';
   // The same header block ccbb's own session view opens behind the dots, from the same
   // stats object — the mux computes it off the transcript, which is where ccbb reads it
   // too. .hdr-status carries what only a mux session has: the permission mode, the model,
@@ -2596,7 +2617,7 @@ function createMuxSessionView(INFO){
   var headEl = document.createElement('div');
   headEl.className = 'sv-stats';
   headEl.innerHTML = '<span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status show"></div>';
-  el.appendChild(makeViewBar(v, barMain, { close:true, term:true, menu:true, headEl:headEl }));
+  el.appendChild(makeViewBar(v, barMain, { close:true, term:!INFO.snapshot, menu:true, headEl:headEl }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
   // Renamable, like every other session page. The name lives in the transcript as a
@@ -2609,6 +2630,7 @@ function createMuxSessionView(INFO){
     e.stopPropagation();
     editTitleInline(titleEl, titleEl.textContent, API, INFO.sessionId, function(val){
       titleEl.textContent = val;
+      if (INFO.snapshot) INFO.snapshot.state.title = val;
     });
   });
   var projEl = headEl.querySelector('.hdr-proj');
@@ -2635,6 +2657,7 @@ function createMuxSessionView(INFO){
     if (c.permissionMode) bits.push('mode '+esc(c.permissionMode));
     if (c.info && c.info.bin && c.info.bin !== 'claude') bits.push(esc(c.info.bin));
     if (c.info && c.info.model) bits.push(esc(prettyModel(c.info.model)));
+    if (c.info && c.info.agent === 'codex' && c.info.endpoint) bits.push('Native TUI: <code>'+esc('codex resume --remote '+c.info.endpoint+' '+c.info.nativeId)+'</code>');
     if (c.clients && c.clients.length) bits.push(c.clients.map(function(x){
       return esc(x.label)+' ('+esc(x.kind)+')'; }).join(', '));
     if (c.info && c.info.exit) bits.push('exited ('+esc(String(c.info.exit.code == null ? c.info.exit.signal : c.info.exit.code))+')');
@@ -2653,8 +2676,9 @@ function createMuxSessionView(INFO){
   // is the mux's own WebSocket path — and a peer's mux rides the peer proxy the same way.
   v.client = window.createMuxView(host, {
     base: API + '/mux',
+    snapshot: INFO.snapshot || null,
     session: INFO.sessionId,
-    label: 'web-' + INFO.sessionId.slice(0, 4),
+    label: 'web-' + shortSessionId(INFO.sessionId),
     machine: SRV,
     bar: false,
     onStats: function(st){ lastStats = st; paintHead(); },
@@ -2665,8 +2689,9 @@ function createMuxSessionView(INFO){
       // Matches every other view's dot, and 'exited' is the case that used to be missed:
       // the child is gone, the socket is not, and a plain "connected" reading painted a
       // dead session green while the list beside it already showed it as finished.
-      var alive = c.connected && c.status !== 'exited' && c.status !== 'gone';
-      dotEl.className = 'status-dot mux' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
+      var alive = c.live;
+      dotEl.innerHTML = activityGlyph(c.info && c.info.agent, !INFO.snapshot);
+      dotEl.className = 'status-dot' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
       dotEl.title = c.connected ? (c.status || '') : 'disconnected';
       paintHead();
     },
@@ -2682,6 +2707,7 @@ function createMuxSessionView(INFO){
     if (v.closeTerm) v.closeTerm();
     try { v.client.destroy({ closeSession: true }); } catch(e){}
   };
+  v.onExpanded = function(){ v.client.onVisible(); };
   v.refresh = function(){};
   return v;
 }
@@ -2806,7 +2832,7 @@ function createSessionView(INFO){
   var statEls = {}, statTurnNo = {}, statTurns = 0, statSeenFirst = false;
 
   function renderTitle() {
-    titleEl.textContent = INFO.title || '(untitled — ' + INFO.sessionId.slice(0,8) + ')';
+    titleEl.textContent = INFO.title || '(untitled — ' + shortSessionId(INFO.sessionId) + ')';
     titleEl.className = 'hdr-title' + (INFO.title ? '' : ' empty');
     titleEl.title = RO ? (INFO.title || '') : 'Click to rename';
   }
@@ -3608,7 +3634,7 @@ function createSessionView(INFO){
   function popCmd() {
     if (!lastCmd) return;
     var d = lastCmd;
-    var title = SRV + ' ' + (INFO.title || INFO.sessionId.slice(0, 8)) + ': ' + cmdTitle.textContent;
+    var title = SRV + ' ' + (INFO.title || shortSessionId(INFO.sessionId)) + ': ' + cmdTitle.textContent;
     floatWin(title, function (host) { host.appendChild(renderCmdOutput(d)); });
     hideCmd();
   }
@@ -4408,6 +4434,7 @@ let listUnwatch = null;
 // reload of it.
 function listSnapshot(month) {
   const snap = getSessions(month ? { period: 'month', key: month } : null);
+  snap.sessions.push(...require('./ccbb-agent-codex').cached(month, pushListDeltas));
   return muxWeb && mux ? muxWeb.mergeMuxRows(snap, mux) : snap;
 }
 
@@ -6176,6 +6203,18 @@ function runWeb(args) {
       return res.end(body);
     }
     if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) return sendHtml(res, appPageHtml(null, null, ro));
+    if (method === 'PATCH' && (m = pathname.match(/^\/api\/session\/(codex:[^/]+)$/))) {
+      if (ro) return send(res, 403, {error:'read-only'});
+      const session = mux && mux.get(decodeURIComponent(m[1]));
+      let body = ''; req.on('data', d => { body += d; if(body.length > 10000) req.destroy(); });
+      return req.on('end', async () => { try { const d=JSON.parse(body); if (typeof d.title !== 'string' || !d.title.trim()) throw new Error('Title is required'); if (session) await session.rename(d.title.trim()); else await require('./ccbb-agent-codex').renameCodexThread(decodeURIComponent(m[1]).slice(6), d.title.trim()); pushListDeltas(); send(res,200,{ok:true}); } catch(e){send(res,400,{error:e.message});} });
+    }
+    if (method === 'GET' && (m = pathname.match(/^\/api\/codex\/activity\/([^/]+)$/))) {
+      return send(res, 200, require('./ccbb-agent-codex').nativeActivity(decodeURIComponent(m[1])));
+    }
+    if (method === 'GET' && (m = pathname.match(/^\/api\/codex\/history\/([^/]+)$/))) {
+      return require('./ccbb-agent-codex').history(decodeURIComponent(m[1])).then(d => send(res, 200, d), e => send(res, 500, {error:e.message}));
+    }
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');
       const filter = mk && /^\d{4}-\d{2}$/.test(mk) ? { period: 'month', key: mk } : null;
@@ -6360,7 +6399,7 @@ function runWeb(args) {
     // by a dead server is not a running mux.
     if (mux) {
       try {
-        const dir = path.join(CLAUDE_DIR, 'ccbb-mux');
+        const dir = path.join(process.env.CCBB_HOME || CLAUDE_DIR, 'ccbb-mux');
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, 'address'), JSON.stringify({
           port, host: '127.0.0.1', prefix: '/mux', pid: process.pid, startedAt: new Date().toISOString(),

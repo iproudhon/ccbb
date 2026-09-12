@@ -20,7 +20,7 @@ const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const PORT = 8597, CDP = 9333;
 const KEEP = process.argv.includes('--keep');
 const sleep = ms => new Promise(r => setTimeout(r, ms));

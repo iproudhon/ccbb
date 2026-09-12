@@ -133,6 +133,7 @@ class StatusLine {
     return p;
   }
   update(st, usage) {
+    if (st.agent === 'codex') { this.stop(); this.lines = []; this.cfg = null; return; }
     if (!this.cfg) return;
     this.st = st; this.usage = usage;
     clearTimeout(this.timer);
@@ -834,7 +835,7 @@ class TuiClient {
   // the ctrl+o hint are mux facts, and no status-line script can know them.
   footerLines() {
     const st = this.state;
-    const cost = st.cost ? `$${Number(st.cost).toFixed(2)}` : '$0.00';
+    const cost = st.agent === 'codex' ? (st.cost == null ? 'cost: —' : `~$${Number(st.cost).toFixed(2)}`) : (st.cost ? `$${Number(st.cost).toFixed(2)}` : '$0.00');
     const ctx = st.contextTokens ? `ctx:${Math.round(st.contextTokens / 1000)}k` : null;
     const bits = [st.model || '?', cost, st.turns != null ? `turns:${st.turns}` : null, ctx].filter(Boolean);
     const mode = st.permissionMode || 'manual';
@@ -847,7 +848,7 @@ class TuiClient {
     const head = sl.length ? sl.map(l => '  ' + l) : [A.gray('  ' + bits.join('  '))];
     return [
       ...head,
-      A.gray(`  ${mark} ${mode} mode`) + who + this.agentTally() +
+      A.gray(st.agent === 'codex' ? '  Codex' : `  ${mark} ${mode} mode`) + who + this.agentTally() +
         A.gray(this.collapsed ? ' · ctrl+o for detail' : ' · ctrl+o to collapse') +
         (this.scroll ? A.yellow(`  ↑${this.scroll} lines up · End to follow`) : ''),
     ];
@@ -1012,7 +1013,7 @@ class TuiClient {
     const q = this.currentQuestion();
     const qs = o.payload.input.questions || [];
     const all = { ...(o.picks || {}) };
-    all[q.question] = q.multiSelect ? picks : picks[0];
+    all[q.id || q.question] = q.multiSelect ? picks : picks[0];
     o.picks = all; o.multi = null; o.sel = 0;
     const next = o.qIndex + 1;
     if (next < qs.length) { o.qIndex = next; return this.paint(); }
@@ -1128,7 +1129,7 @@ class TuiClient {
       if (!picks.length) return this.out(A.red('nothing picked'));
       if (!q.multiSelect && picks.length > 1) return this.out(A.red('this question takes one answer'));
       const all = { ...(o.picks || {}) };
-      all[q.question] = q.multiSelect ? picks : picks[0];
+      all[q.id || q.question] = q.multiSelect ? picks : picks[0];
       // Multi-question cards walk one tab at a time, the way the plugin's tabs do.
       const next = (o.qIndex || 0) + 1;
       if (next < o.payload.input.questions.length) {
@@ -1673,7 +1674,7 @@ class TuiClient {
     this.out('');
     // The tab strip, with the CLI's ☐/☒ answered marks and its ✔ Submit stop.
     // A single question still gets its header line — the CLI shows one too.
-    const answered = x => o.picks && o.picks[x.question] != null;
+    const answered = x => o.picks && o.picks[x.id || x.question] != null;
     const tabs = qs.map((x, i) => {
       const label = `${answered(x) ? '☒' : '☐'} ${x.header || `Q${i + 1}`}`;
       return i === o.qIndex ? A.bold(A.cyan(label)) : answered(x) ? A.green(label) : A.gray(label);

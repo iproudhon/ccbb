@@ -16,7 +16,7 @@ const path = require('path');
 const WebSocket = require('ws');
 const common = require('../ccbb-common');
 
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const WEB_PORT = 8599, CDP = 9335;
 const TOKEN = common.peerToken ? common.peerToken() : '';
 const MUX_DIR = path.join(common.CLAUDE_DIR, 'ccbb-mux');

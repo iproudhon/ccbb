@@ -46,7 +46,7 @@ function cacheCold(s) {
 }
 function ctxResendCost(s) {
   const ctx = s.context;
-  if (!ctx) return null;
+  if (!ctx || s.agent === 'codex') return null;
   return cacheCold(s) && ctx.costWrite != null ? ctx.costWrite : ctx.cost;
 }
 // Green cost = a cheap cache read; red = the cache went cold and the whole context is rebilled
@@ -58,7 +58,7 @@ function ctxColor(v, s) {
 }
 
 function fmtTokK(t) {
-  t = t || 0;
+  if (t == null) return '—';
   if (t >= 1e9) return (t / 1e9).toFixed(1) + 'B';
   if (t >= 1e6) return (t / 1e6).toFixed(1) + 'M';
   if (t >= 1e3) return (t / 1e3).toFixed(1) + 'K';
@@ -115,10 +115,12 @@ const SORT_KEYS = {
 const GROUP_ALIAS = { day: 'day', daily: 'day', week: 'week', weekly: 'week', month: 'month', monthly: 'month' };
 function parseLsArgs(args) {
   // Default scope is the current month; -a widens to all time. -z keeps empty sessions.
-  const opt = { sort: 'activity', dir: null, reverse: false, includeEmpty: false, wide: false, limit: 0, group: 'month' };
+  const opt = { agent: 'all', sort: 'activity', dir: null, reverse: false, includeEmpty: false, wide: false, limit: 0, group: 'month' };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '-s' || a === '--sort') { opt.sort = args[++i]; }
+    if (a === '--agent') { opt.agent = args[++i]; }
+    else if (a.startsWith('--agent=')) { opt.agent = a.slice(8); }
+    else if (a === '-s' || a === '--sort') { opt.sort = args[++i]; }
     else if (a === '-r' || a === '--reverse') { opt.reverse = true; }
     else if (a === '-a' || a === '--all') { opt.group = null; }
     else if (a === '-z' || a === '--empty') { opt.includeEmpty = true; }
@@ -134,6 +136,9 @@ function parseLsArgs(args) {
     else if (/^--sort=/.test(a)) { opt.sort = a.slice(7); }
     else if (/^-\d+$/.test(a)) { opt.limit = parseInt(a.slice(1), 10) || 0; }
   }
+  if (!['all', 'claude', 'codex'].includes(opt.agent)) {
+    throw new Error('--agent must be one of: all, claude, codex');
+  }
   if (opt.group === 'invalid') {
     console.error('ccbb: --group must be one of: day, week, month');
     process.exit(1);
@@ -142,9 +147,12 @@ function parseLsArgs(args) {
 }
 
 function lsHelp() {
-  console.log(`ccbb ls — list Claude Code sessions
+  console.log(`ccbb ls — list Claude Code and Codex sessions
 
 Usage: ccbb ls [options]
+
+Agents (default: all):
+  --agent <agent>    all | claude | codex
 
 Sorting (default: activity, descending):
   -s, --sort <key>   activity | start | cost | turns | tokens | name
@@ -168,7 +176,15 @@ Display:
 
 Columns adapt to terminal width. A wide terminal (or -x) adds turns and the
 context column: current / largest / would-be cost (largest is shown only when
-it differs). Context is all-time, shown even in period-scoped views.`);
+it differs). Context is all-time, shown even in period-scoped views.
+
+Codex lists non-archived top-level sessions through the installed codex app-server
+(inherits CODEX_HOME). Local usage records populate cost, tokens, turns and context.
+Codex costs estimate standard API token charges at published rates; they do not
+represent subscription bills, service-tier charges or tool fees. Unknown models
+keep token counts but have no cost estimate. Period filters use usage timestamps,
+falling back to last activity when records are unavailable. Codex context shows
+last request input + output; Claude cache-expiry/resend estimates do not apply.`);
 }
 
 function sortSessions(sessions, opt) {
@@ -183,8 +199,8 @@ function sortSessions(sessions, opt) {
     let vb = col === 'lastActivity' ? (b.lastActivity || b.startedAt) : b[col];
     let cmp;
     if (va == null && vb == null) cmp = 0;
-    else if (va == null) cmp = 1;
-    else if (vb == null) cmp = -1;
+    else if (va == null) return 1;
+    else if (vb == null) return -1;
     else if (typeof va === 'number' || typeof vb === 'number') cmp = (va || 0) - (vb || 0);
     else cmp = String(va).toLowerCase() < String(vb).toLowerCase() ? -1
             : String(va).toLowerCase() > String(vb).toLowerCase() ? 1 : 0;
@@ -249,7 +265,7 @@ function printCostSummary(scope, label, extended) {
   const keys = Object.keys(map).filter(k => map[k].tokens > 0).sort((a, b) => map[b].cost - map[a].cost);
   if (!keys.length) return;
   const pctStr = (cat, rowCost) => {
-    if (!cat || !cat.tokens) return '—';
+    if (!cat || !cat.tokens || cat.cost == null || rowCost == null) return '—';
     return (rowCost > 0 ? (cat.cost / rowCost * 100).toFixed(1) : '0.0') + '%';
   };
   const cell = (cat, rowCost) => {
@@ -293,20 +309,42 @@ function printCostSummary(scope, label, extended) {
   console.log('');
 }
 
-function runLs(args) {
+async function runLs(args) {
   const opt = parseLsArgs(args);
   if (opt.help) return lsHelp();
   // A different question with a different answer: --mux asks the running mux what it
   // is holding, where everything else here reads transcripts off disk. Sorting, period
   // scoping and the cost summary have nothing to say about a live child, so this
   // branches before any of them rather than growing flags they'd all have to honour.
-  if (opt.mux) return require('./ccbb-mux').runMuxLs();
+  if (opt.mux) return require('./ccbb-mux').runMuxLs(opt.agent);
   if (!SORT_KEYS[opt.sort]) {
     console.error(`ccbb: unknown sort key '${opt.sort}'. Valid: ${Object.keys(SORT_KEYS).join(', ')}`);
     process.exit(1);
   }
   const periodFilter = opt.group ? currentPeriod(opt.group) : null;
-  const { sessions, totals } = getSessions(periodFilter, opt.includeEmpty);
+  const { sessions, totals } = opt.agent === 'codex'
+    ? { sessions: [], totals: { totalCost: 0, totalTokens: 0 } }
+    : getSessions(periodFilter, opt.includeEmpty);
+  for (const session of sessions) {
+    session.agent = 'claude';
+    session.sessionKey = `claude:${session.sessionId}`;
+  }
+  if (opt.agent !== 'claude') {
+    try { sessions.push(...await require('./ccbb-agent-codex').getCodexSessions(periodFilter, undefined, opt.includeEmpty)); }
+    catch (error) {
+      if (opt.agent === 'codex') throw error;
+      console.error(`ccbb: Codex sessions unavailable: ${error.message}`);
+    }
+  }
+  const codexRows = sessions.filter(s => s.agent === 'codex');
+  const hasCodex = codexRows.length > 0;
+  const codexTotals = require('./ccbb-agent-codex').summarizeCodex(codexRows);
+  totals.totalCost += codexTotals.cost;
+  totals.totalTokens += codexTotals.tokens;
+  if (opt.agent === 'codex') {
+    if (!codexTotals.knownCost) totals.totalCost = null;
+    if (!codexTotals.knownUsage) totals.totalTokens = null;
+  }
   let rows = sortSessions(sessions, opt);
   if (opt.limit > 0) rows = rows.slice(0, opt.limit);
   if (!rows.length) {
@@ -317,10 +355,19 @@ function runLs(args) {
   const width = process.stdout.columns || 80;
   const extended = opt.wide || width >= 120;
 
-  const summary = getCostSummary(periodFilter);
-  printCostSummary(summary.overall, periodFilter ? periodFilter.label : 'all time', extended);
+  if (opt.agent !== 'codex') {
+    const summary = getCostSummary(periodFilter);
+    const label = (hasCodex ? 'Claude only — ' : '') + (periodFilter ? periodFilter.label : 'all time');
+    printCostSummary(summary.overall, label, extended);
+  }
+
+  if (hasCodex && codexTotals.tokens) {
+    printCostSummary({ byProvider: { Codex: { ...codexTotals, cost: codexTotals.incomplete ? null : codexTotals.cost } } },
+      'Codex — estimated API cost' + (codexTotals.incomplete ? ' (incomplete)' : ''), extended);
+  }
 
   const cols = [];
+  if (opt.agent !== 'claude') cols.push({ head: 'AGENT', align: 'l', w: 6, get: s => s.agent });
   cols.push({ head: 'ID', align: 'l', w: 8,
     get: s => s.sessionId.slice(0, 8), color: c.gray });
   cols.push({ head: 'TITLE', align: 'l', flex: true, min: 16,
@@ -332,18 +379,18 @@ function runLs(args) {
     get: s => fmtTokK(s.totalTokens), color: c.gray });
   if (extended) {
     cols.push({ head: 'TURNS', align: 'r', w: 6,
-      get: s => String(s.turns || 0) + (s.subTurns ? '+' + s.subTurns : ''),
+      get: s => (s.turns == null ? '—' : String(s.turns)) + (s.subTurns ? '+' + s.subTurns : ''),
       color: c.gray });
     cols.push({ head: 'CR', align: 'r', w: 7,
-      get: s => fmtTokK(s.cacheReadTokens || 0), color: c.gray });
+      get: s => fmtTokK(s.cacheReadTokens), color: c.gray });
     cols.push({ head: 'CW', align: 'r', w: 7,
-      get: s => fmtTokK(s.cacheCreationTokens || 0), color: c.gray });
+      get: s => fmtTokK(s.cacheCreationTokens), color: c.gray });
     cols.push({ head: 'CM', align: 'r', w: 7,
-      get: s => fmtTokK(s.cacheMissTokens || 0), color: c.gray });
+      get: s => fmtTokK(s.cacheMissTokens), color: c.gray });
     cols.push({ head: 'OUT', align: 'r', w: 7,
-      get: s => fmtTokK(s.outputTokens || 0), color: c.gray });
+      get: s => fmtTokK(s.outputTokens), color: c.gray });
     cols.push({ head: 'IN', align: 'r', w: 7,
-      get: s => fmtTokK(s.inputTokens || 0), color: c.gray });
+      get: s => fmtTokK(s.inputTokens), color: c.gray });
     // current [/ largest] / would-be cost. Largest is shown only when it differs from
     // current (after a /compact, or when the last turn was smaller than an earlier peak).
     // Context is an all-time property of the session, so it shows even in period-scoped views.
@@ -354,13 +401,14 @@ function runLs(args) {
         const cur = (ctx.postCompact ? '~' : '') + fmtTokK(ctx.tokens);
         const mx = s.contextMax;
         const showMax = mx && fmtTokK(mx.tokens) !== fmtTokK(ctx.tokens);
-        return cur + (showMax ? '/' + fmtTokK(mx.tokens) : '') + '/' + fmtCost(ctxResendCost(s));
+        return cur + (showMax ? '/' + fmtTokK(mx.tokens) : '') +
+          (s.agent === 'codex' ? '' : '/' + fmtCost(ctxResendCost(s)));
       } });
   } else {
     // Narrow view: current context size and what the next turn pays to resend it.
     cols.push({ head: 'CTX', align: 'r', w: 14, color: ctxColor,
       get: s => s.context
-        ? (s.context.postCompact ? '~' : '') + fmtTokK(s.context.tokens) + '/' + fmtCost(ctxResendCost(s))
+        ? (s.context.postCompact ? '~' : '') + fmtTokK(s.context.tokens) + (s.agent === 'codex' ? '' : '/' + fmtCost(ctxResendCost(s)))
         : '—' });
   }
   cols.push({ head: 'ACTIVITY', align: 'l', w: 12,
@@ -378,8 +426,10 @@ function runLs(args) {
   const scope = periodFilter ? ` ${periodFilter.label}` : '';
   console.log('');
   console.log(c.dim(`${rows.length} session${rows.length === 1 ? '' : 's'}${scope}` +
-    `  ·  total ${fmtCost(totals.totalCost)} / ${fmtTokK(totals.totalTokens)} tokens` +
+    `  ·  ${codexTotals.incomplete ? 'known total (incomplete)' : 'total'} ${fmtCost(totals.totalCost)} / ${fmtTokK(totals.totalTokens)} tokens` +
     `  ·  sorted by ${sortLabel}`));
+  if (hasCodex) console.log(c.dim('Codex costs estimate standard API token charges; subscription billing and tool fees differ.'));
+  if (codexTotals.incomplete) console.log(c.dim('Some Codex usage or prices are unavailable; totals include known values only.'));
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -421,4 +471,7 @@ function main() {
   process.exit(1);
 }
 
-main();
+Promise.resolve().then(main).catch(error => {
+  console.error(`ccbb: ${error.message}`);
+  process.exitCode = 1;
+});
