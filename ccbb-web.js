@@ -5774,9 +5774,18 @@ function proxyUpgrade(peer, subPath, req, socket, head) {
 // exactly as it does over HTTP, with no second implementation to keep in step.
 const inboundLinks = new Map();   // name → link we ACCEPTED (we can call them back)
 const outboundLinks = new Map();  // name → { ws, timer } we OPENED to a configured peer
+const forwardProxy = new (require('./ccbb-proxy').ForwardProxy)({
+  config: () => configUnreadable() ? {} : common.readConfig().proxy,
+  identity: () => serverIdentity().name,
+  findLink: name => {
+    const out = outboundLinks.get(name)?.link;
+    return out?.ws.readyState === 1 ? out : inboundLinks.get(name);
+  },
+});
 
-function makeLink(ws, name) {
-  const link = { name, ws, seq: 0, pending: new Map(), sockets: new Map(), openedAt: Date.now() };
+function makeLink(ws, name, inbound = false) {
+  const link = { name, ws, inbound, seq: 0, pending: new Map(), sockets: new Map(), openedAt: Date.now() };
+  forwardProxy.attachLink(link);
   ws.on('message', raw => {
     let f; try { f = JSON.parse(raw); } catch { return; }
     try { handleLinkFrame(link, f); } catch (e) { console.error('[link]', e.message); }
@@ -5813,6 +5822,8 @@ function linkRequest(link, method, path, body) {
 
 // Frames. Requests/opens flow callee→caller; responses and socket traffic flow back.
 function handleLinkFrame(link, f) {
+  if (!f || typeof f !== 'object') return;
+  if (forwardProxy.handleFrame(link, f)) return;
   if (f.t === 'res') {
     const cb = link.pending.get(f.id);
     if (cb) { link.pending.delete(f.id); cb({ status: f.status, ctype: f.ctype, body: f.body }); }
@@ -5972,7 +5983,7 @@ function connectLink(peer) {
   const rec = { ws, startedAt: Date.now(), stopBeat: null, url: peer.url, token: peer.token || '' };
   outboundLinks.set(peer.name, rec);
   ws.on('open', () => {
-    makeLink(ws, peer.name);
+    rec.link = makeLink(ws, peer.name);
     // A link can sit idle for hours; the heartbeat keeps it warm AND proves it is there.
     rec.stopBeat = linkHeartbeat(ws);
   });
@@ -6024,8 +6035,10 @@ function runWeb(args) {
         `  --host         address to bind (default 127.0.0.1; use 0.0.0.0 to reach it from the LAN)\n` +
         `  --webex        also run the Webex front-end (shares this server's prompt path)\n` +
         `  --confluence   also run the Confluence page front-end\n\n` +
+        `Forward proxy: configure proxy.enabled and proxy.exitNode in ccbb-config.json\n` +
+        `to use this same port for HTTP/HTTPS browser traffic over peer links (docs/proxy.md).\n\n` +
         `Multi-server: set "server".name and "peers" in ${CLAUDE_DIR}/ccbb-config.json to list\n` +
-        `and drive other machines' sessions from this UI. See peers.md.`);
+        `and drive other machines' sessions from this UI. See docs/peers.md.`);
       return;
     }
   }
@@ -6033,6 +6046,7 @@ function runWeb(args) {
   serverPort = port;   // the cookie is named after it, so it must be set before we listen
 
   const server = http.createServer((req, res) => {
+    if (forwardProxy.handles(req)) return void forwardProxy.request(req, res);
     const { method } = req;
     const pathname = req.url.split('?')[0];
     const qs = req.url.split('?')[1] || '';
@@ -6390,6 +6404,8 @@ function runWeb(args) {
     };
   }
 
+  server.on('connect', (req, socket, head) => forwardProxy.connect(req, socket, head));
+  server.on('close', () => forwardProxy.close());
   server.listen(port, host, () => {
     const self = serverIdentity();
     console.log(`ccbb http://127.0.0.1:${port}  (server "${self.name}" on ${self.hostname})`);
@@ -6449,6 +6465,7 @@ function runWeb(args) {
     };
     wsSend = sendTo;
     server.on('upgrade', (req, socket, head) => {
+      if (forwardProxy.handles(req)) return void forwardProxy.upgrade(req, socket, head);
       const url = req.url || '';
       const level = authLevel(req, new URLSearchParams(url.split('?')[1] || ''));
       if (!level) return socket.destroy();
@@ -6475,7 +6492,7 @@ function runWeb(args) {
           // that end defers makeLink's drop - and every browser socket riding the old
           // link - by ws's 30s close timeout.
           if (prev && prev.ws !== ws) { try { prev.ws.terminate(); } catch {} }
-          const link = makeLink(ws, name);
+          const link = makeLink(ws, name, true);
           inboundLinks.set(name, link);
           console.log(`ccbb: peer "${name}" linked in`);
           // The callee pings too. Only the caller redials, but only the callee can notice

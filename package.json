@@ -25,6 +25,8 @@
     "ccbb-mux-web.js",
     "ccbb-stats.js",
     "ccbb-web.js",
+    "ccbb-proxy.js",
+    "docs/proxy.md",
     "ccbb-mobile.js",
     "ccbb-webex.js",
     "ccbb-confluence.js",

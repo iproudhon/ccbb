@@ -8,7 +8,7 @@
 //     --confluence            also run the Confluence page front-end
 //
 // `web` is also the multi-server front-end: with "peers" in ccbb-config.json it lists and
-// drives other machines' sessions through the same UI (see peers.md).
+// drives other machines' sessions through the same UI (see docs/peers.md).
 //
 // All discovery / stats / pricing / transcript reading live in ccbb-common.js so the
 // front-ends can't drift. ccbb never rewrites a transcript — the only write it makes is
@@ -441,7 +441,7 @@ Usage:
   ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
      [--webex]             ...also run the Webex front-end (one process)
      [--confluence]        ...also run the Confluence page front-end
-                           multi-machine: add "peers" to ccbb-config.json (peers.md)
+                           multi-machine: add "peers" to ccbb-config.json (docs/peers.md)
   ccbb new [-n name]       start a session in the mux and attach a terminal (ccbb new -h)
   ccbb attach [name|id]    attach a terminal to a running mux session (ccbb attach -h)
   ccbb stop [name|id]      end a mux session (ccbb stop -h)
