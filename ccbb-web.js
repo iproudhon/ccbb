@@ -5601,13 +5601,23 @@ function authLevel(req, query) {
 function sendForbidden(res, what) {
   send(res, 403, { error: `read-only token cannot ${what}` });
 }
-function sendUnauthorized(res, wantsHtml, cookieName) {
+function sendUnauthorized(res, wantsHtml, cookieName, badToken, back) {
   if (wantsHtml) {
-    const body = Buffer.from('<!DOCTYPE html><meta charset="utf-8"><title>ccbb</title>' +
-      '<body style="font:15px ui-sans-serif,system-ui;padding:40px;color:#3d3d3a">' +
+    // A form, not just instructions: on a phone there is no URL bar worth typing a token
+    // into. It POSTs to /login, which banks the cookie and bounces back here — the token
+    // never rides in a URL, so it lands in no history, no log line, no copied link.
+    const body = Buffer.from('<!DOCTYPE html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ccbb</title>' +
+      '<body style="font:15px ui-sans-serif,system-ui;padding:40px 24px;color:#3d3d3a;max-width:520px">' +
       '<h2>ccbb — token required</h2><p>This server has <code>peerToken</code> set. ' +
-      'Open it once as <code>?token=&lt;your token&gt;</code>; the token is then remembered in a cookie ' +
-      `(<code>${cookieName}</code>, named per port so each ccbb server keeps its own).</p>`);
+      'Enter it once; it is then remembered in a cookie ' +
+      `(<code>${cookieName}</code>, named per port so each ccbb server keeps its own).</p>` +
+      (badToken ? '<p style="color:#b42318">That token was not accepted.</p>' : '') +
+      '<form method="post" action="/login" style="display:flex;gap:8px;flex-wrap:wrap">' +
+      `<input type="hidden" name="back" value="${String(back || '/').replace(/&/g,'&amp;').replace(/"/g,'&quot;')}">` +
+      '<input name="token" type="password" autocomplete="current-password" autofocus required placeholder="token" ' +
+      'style="flex:1;min-width:200px;font:inherit;padding:8px 10px;border:1px solid #bbb;border-radius:6px">' +
+      '<button type="submit" style="font:inherit;padding:8px 14px;border:1px solid #888;border-radius:6px;background:#f4f4f2;cursor:pointer">Open</button>' +
+      '</form>');
     res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': body.length });
     return res.end(body);
   }
@@ -6086,8 +6096,30 @@ function runWeb(args) {
       return res.end(png);
     }
 
+    // The 401 page's form. Banks the token exactly as the ?token=… hand-off does, then
+    // returns to the page that asked; a wrong token goes back with ?login=0 so the page
+    // can say so. Only same-site paths are honoured as a return address.
+    if (method === 'POST' && pathname === '/login' && peerToken()) {
+      return readBody(req, body => {
+        const form = new URLSearchParams(body);
+        const tok = form.get('token') || '';
+        let back = form.get('back') || '/';
+        if (!/^\/(?!\/)/.test(back)) back = '/';
+        const ok = safeEq(tok, peerToken()) || (readToken() && safeEq(tok, readToken()));
+        if (!ok) { res.writeHead(303, { Location: back + '?login=0' }); return res.end(); }
+        res.writeHead(303, {
+          'Set-Cookie': [
+            `${tokenCookieName(req)}=${encodeURIComponent(tok)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000`,
+            `${LEGACY_COOKIE}=; Path=/; Max-Age=0`,
+          ],
+          Location: back,
+        });
+        res.end();
+      });
+    }
+
     const level = authLevel(req, query);
-    if (!level) return sendUnauthorized(res, isPage, tokenCookieName(req));
+    if (!level) return sendUnauthorized(res, isPage, tokenCookieName(req), !!query.get('login'), pathname);
     // Whoever came in with the read token. Every route that changes something — a session's
     // input, a terminal, a peer hop — consults this; everything that only reads ignores it.
     const ro = level === 'read';
