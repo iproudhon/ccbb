@@ -8,7 +8,7 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 const common = require('./ccbb-common');
 const { Session } = require('./ccbb-mux');
-const { normalizeItem, readHistory, readCodexUsage } = require('./ccbb-agent-codex');
+const { codexTitle, normalizeItem, readHistory, readCodexUsage } = require('./ccbb-agent-codex');
 
 // Persistent socket transport
 
@@ -149,7 +149,7 @@ class CodexSession extends Session {
     this.socketIdentity = socketIdentity(rpc.endpoint);
     this.rpc = rpc; this.nativeId = nativeId; this.agent = 'codex';
     this.state = { ...this.state, agent: 'codex', nativeId, endpoint: rpc.endpoint,
-      title: result.thread.name || opt.label || result.thread.preview || 'Codex',
+      title: codexTitle(result.thread),
       cwd: result.cwd || result.thread.cwd || this.cwd, model: result.model || result.thread.model,
       permissionMode: null, approvalPolicy: result.approvalPolicy, reasoningEffort: result.reasoningEffort,
       cost: null, tokens: null, status: 'idle', capabilities: ['submit', 'steer', 'interrupt', 'approve', 'answerQuestion', 'rename', 'compact', 'terminalAttach'] };
@@ -226,6 +226,7 @@ class CodexSession extends Session {
     }
     if (m.method === 'turn/started') {
       this.activeTurn = p.turn.id; this.beginTurn('working');
+      if (!this.thread.name && !this.thread.preview) this.refreshTitle().catch(() => {});
       for (const item of p.turn.items || []) this.put(item, p.turn.id);
     } else if (m.method === 'turn/completed') {
       for (const item of p.turn.items || []) this.put(item, p.turn.id);
@@ -234,6 +235,7 @@ class CodexSession extends Session {
       this.turnLive = false; this.state.status = 'idle'; this.state.activity = null;
       this.emitStatus(); this.emit('init', { state: this.state });
       this.refreshUsage().catch(() => {});
+      this.refreshTitle().catch(() => {});
       if (p.turn.error) this.emit('stderr', { text: p.turn.error.message || JSON.stringify(p.turn.error) });
       this.drain().catch(e => this.emit('stderr', { text: e.message }));
     } else if (m.method === 'item/started' || m.method === 'item/completed') {
@@ -268,7 +270,12 @@ class CodexSession extends Session {
     } else if (m.method === 'account/rateLimits/updated') {
       this.state.rateLimits=p.rateLimits || p; this.emit('init',{state:this.state});
     } else if (m.method === 'thread/name/updated') {
-      this.state.title = p.threadName || p.name || this.state.title; this.emit('init', { state: this.state });
+      if ('threadName' in p || 'name' in p) {
+        this._titleVersion = (this._titleVersion || 0) + 1;
+        this.thread.name = p.threadName ?? p.name ?? null;
+        this.state.title = codexTitle(this.thread);
+        this.emit('init', { state: this.state });
+      }
     } else if (m.method === 'turn/plan/updated' || m.method === 'turn/diff/updated') {
       this.put({ id: m.method, type: 'plan', text: p.diff || (p.plan || []).map(x => x.status + ': ' + x.step).join('\n') }, p.turnId);
     } else if (m.method === 'thread/status/changed') {
@@ -364,11 +371,29 @@ class CodexSession extends Session {
     if (!(r.data || []).some(x => x.model === model)) throw new Error('Unknown Codex model');
     this.nextModel = model; this.state.model = model; this.emit('model', { model });
   }
+  async refreshTitle() {
+    const version = this._titleVersion = (this._titleVersion || 0) + 1;
+    const { thread } = await this.rpc.request('thread/read', { threadId: this.nativeId, includeTurns: false });
+    // A native rename or newer read wins over this read's older response.
+    if (!thread || this.closing || version !== this._titleVersion) return;
+    this.thread.name = thread.name;
+    this.thread.preview = thread.preview;
+    const title = codexTitle(this.thread);
+    if (title !== this.state.title) {
+      this.state.title = title;
+      this.emit('init', { state: this.state });
+    }
+  }
   async refreshUsage() {
     const u = await readCodexUsage(this.thread, null);
     if (u) { Object.assign(this.state, {cost:u.totalCost, costEstimated:true, tokens:u.totalTokens, turns:u.turns, contextTokens:u.context && u.context.tokens, contextPeak:u.contextMax && u.contextMax.tokens}); this.emit('init', {state:this.state}); }
   }
-  async rename(name) { await this.rpc.request('thread/name/set', { threadId: this.nativeId, name }); this.state.title = name; this.emit('init', { state: this.state }); }
+  async rename(name) {
+    await this.rpc.request('thread/name/set', { threadId: this.nativeId, name });
+    this._titleVersion = (this._titleVersion || 0) + 1;
+    this.thread.name = name; this.state.title = codexTitle(this.thread);
+    this.emit('init', { state: this.state });
+  }
   async compact() { await this.rpc.request('thread/compact/start', { threadId: this.nativeId }); }
   // Stop means detach CCBB. Thread shutdown is deliberately unavailable on a shared server.
   async stop() { this.flushItems(); this.closing = true; clearTimeout(this.reconnectTimer); this.queue = []; this.rpc.close(); }

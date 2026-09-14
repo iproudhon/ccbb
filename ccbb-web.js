@@ -2411,14 +2411,14 @@ function hdrPlanPillsHtml(st, sub, lvl){
   return s ? '<span class="fwins" title="'+esc(subWinTitle(sub))+'">'+s+'</span>' : '';
 }
 function renderHdrStats(projEl, statsEl, st, projectPath, sub, sessionId){
-  if (!st) { if (statsEl) statsEl.textContent = ''; return; }
   // The full session id, selectable. Every page shows the short form somewhere — the
   // list's ID column, this page's own title when it has no name — but the id you have
   // to paste into claude --resume or ccbb attach is the whole one, and it appeared
   // nowhere but the URL.
   if (projEl) projEl.innerHTML = (projectPath?'<b>'+esc(projectPath)+'</b>':'') +
     (sessionId ? '  &middot;  <span class="hdr-sid" title="Session id">'+esc(sessionId)+'</span>' : '') +
-    '  &middot;  last '+esc(fmtStatDate(st.lastActivity))+'  &middot;  started '+esc(fmtStatDate(st.startedAt));
+    (st ? '  &middot;  last '+esc(fmtStatDate(st.lastActivity))+'  &middot;  started '+esc(fmtStatDate(st.startedAt)) : '');
+  if (!st) { if (statsEl) statsEl.textContent = ''; return; }
   if (!statsEl) return;
   var models = (st.models||[]).filter(function(m){ return m.cost>=0.005; });
   var modelStr = models.length>=2
@@ -2649,7 +2649,7 @@ function createMuxSessionView(INFO){
 
   var subInfo = null, lastStats = null, lastChrome = null;
   function paintHead(){
-    if (lastStats) renderHdrStats(projEl, statsEl, lastStats, (lastChrome && lastChrome.cwd) || INFO.projectPath, subInfo, INFO.sessionId);
+    renderHdrStats(projEl, statsEl, lastStats, (lastChrome && lastChrome.cwd) || INFO.projectPath, subInfo, INFO.sessionId);
     var c = lastChrome;
     if (!c) { statusRow.textContent = ''; return; }
     var bits = [];

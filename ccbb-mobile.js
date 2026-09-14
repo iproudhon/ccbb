@@ -235,6 +235,8 @@ body.has-max .panel:not(.max){display:none}
 /* The desktop composer this view borrows centres itself on a 740px column and pads for
    a mouse. On a 390px screen that padding is most of the gutter. */
 .pbody>.muxv .input-area{padding:8px 10px}
+/* Match .cbox: smaller input text makes iOS zoom on focus, including input-max. */
+.pbody>.muxv .input-box{font-size:16px}
 .pbody>.muxv .mx-wrap{padding:0 10px}
 /* The one rule of this file's own that reaches INTO the mux view and wins there: the
    phone draws a user turn's bubble on .msg.you, the desktop draws it on .msg.you
@@ -842,10 +844,13 @@ function onForeground(fn){
 // the whole document up to reveal a focused field, which would push the panel headers off.
 function syncViewport(){
   var vv = window.visualViewport;
+  if (vv && vv.scale > 1.01) return;
   var h = vv ? vv.height : window.innerHeight;
   var doc = document.documentElement;
   doc.style.setProperty('--app-h', Math.round(h)+'px');
-  if (window.scrollY !== 0) window.scrollTo(0, 0);
+  // The terminal follows offsetTop itself; scrolling the document here would
+  // fight Safari's focus scrolling and move the keyboard-relative container.
+  if (!termState && window.scrollY !== 0) window.scrollTo(0, 0);
 }
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncViewport);
@@ -2543,21 +2548,23 @@ function openTerminal(server, sessionId){
   // the other end starts at the wrong size.
   // Two searches running at once — the open finishing while a refit is in flight —
   // would interleave their probes and each conclude from the other's font size.
-  var fitRun = 0;
+  var fitRun = 0, fitStepTimer = null, fitWaiters = [];
   function fitTermGrid(pass, done, bounds, run){
-    if (run == null) run = ++fitRun;
-    if (!t.term || t.destroyed) return;    // torn down: the open it gates is moot too
-    // Every OTHER exit has to settle the callback. The shell is opened from it, so a
-    // search that stands down for a newer one — a viewport resize landing mid-probe is
-    // enough, and on a phone the URL bar collapsing does exactly that — or one that finds
-    // nothing measurable yet would leave the panel on "Starting a shell…" forever, with
-    // no shell ever requested and nothing to show for it.
+    if (t.destroyed) return;
+    if (done) fitWaiters.push(done);
+    if (run == null) { run = ++fitRun; clearTimeout(fitStepTimer); }
+    if (!t.term || run !== fitRun || selOn) return;
+    // A superseding resize inherits the open callback. Only the latest settled
+    // fit may release it; measuring an old run must never open an 80x24 shell.
     var scr = wrap.querySelector('.xterm-screen');
     var r = scr && scr.getBoundingClientRect();
-    if (!scr || run !== fitRun || !(r.width > 0 && t.term.cols > 0)) { if (done) done(); return; }
+    if (!scr || !(r.width > 0 && r.height > 0 && bodyEl.clientHeight > 4)) {
+      fitStepTimer = setTimeout(function(){ fitTermGrid(pass, null, bounds, run); }, 25);
+      return;
+    }
     var cellW = r.width / t.term.cols, cellH = r.height / t.term.rows;
     var availW = bodyEl.clientWidth - 6;   // .xterm padding, kept in sync with the CSS
-    var availH = bodyEl.clientHeight;
+    var availH = bodyEl.clientHeight - 4; // vertical .xterm padding
     var cols = t.pinned ? t.cols : TERM_COLS;
     var cur = t.term.options.fontSize;
     if (t.pinned) {
@@ -2572,18 +2579,18 @@ function openTerminal(server, sessionId){
       var next = Math.floor((b[0] + b[1]) / 2 * 2) / 2;
       if (next > b[0] && next < b[1] && (pass||0) < 14) {
         t.term.options.fontSize = next;
-        return setTimeout(function(){ fitTermGrid((pass||0)+1, done, b, run); }, 25);
+        return fitStepTimer = setTimeout(function(){ fitTermGrid((pass||0)+1, null, b, run); }, 25);
       }
       // Land on the largest size that actually fitted, not on the last one probed.
       if (cur !== b[0]) {
         t.term.options.fontSize = b[0];
-        return setTimeout(function(){ fitTermGrid((pass||0)+1, done, b, run); }, 25);
+        return fitStepTimer = setTimeout(function(){ fitTermGrid((pass||0)+1, null, b, run); }, 25);
       }
     } else {
       var want = Math.max(3, Math.min(24, Math.floor(cur * (availW / (cols * cellW)) * 2) / 2));
       if (want !== cur && (pass||0) < 6) {
         t.term.options.fontSize = want;
-        return setTimeout(function(){ fitTermGrid((pass||0)+1, done, bounds, run); }, 25);
+        return fitStepTimer = setTimeout(function(){ fitTermGrid((pass||0)+1, null, bounds, run); }, 25);
       }
     }
     var rows = t.pinned ? t.rows : Math.max(5, Math.floor(availH / cellH));
@@ -2594,12 +2601,34 @@ function openTerminal(server, sessionId){
     geomEl.textContent = t.term.cols + '×' + t.term.rows + ' · ' + t.term.options.fontSize + 'px';
     // Never for a pinned terminal: its size is tmux's, and the server drops the frame.
     if (!t.pinned) wsSendJ({ type:'size', cols:t.cols, rows:t.rows });
-    if (done) done();
+    // A viewport event invalidates this run immediately, even while its next
+    // fit is debounced. Waiters must not escape during that debounce window.
+    var waiters = fitWaiters.splice(0);
+    waiters.forEach(function(f){ f(); });
   }
-  var fitTimer = null;
-  function refit(){ clearTimeout(fitTimer); fitTimer = setTimeout(function(){ fitTermGrid(0); }, 80); }
-  window.addEventListener('resize', refit);
-  if (window.visualViewport) window.visualViewport.addEventListener('resize', refit);
+  var fitTimer = null, focusTimer = null;
+  function refit(){
+    ++fitRun; clearTimeout(fitStepTimer); clearTimeout(fitTimer);
+    fitTimer = setTimeout(function(){ fitTermGrid(0); }, 80);
+  }
+  function fitViewport(){
+    if (t.destroyed) return;
+    var vv = window.visualViewport;
+    if (vv && vv.scale > 1.01) return;
+    wrap.style.top = (vv ? vv.offsetTop : 0) + 'px';
+    wrap.style.height = (vv ? vv.height : window.innerHeight) + 'px';
+    wrap.style.bottom = 'auto';
+    // The home-indicator inset belongs at the screen edge, not between the
+    // software keyboard and our keys. Some browsers retain it with keys up.
+    wrap.style.paddingBottom = vv && window.innerHeight - vv.height > 100 ? '0px' : '';
+    refit();
+  }
+  window.addEventListener('resize', fitViewport);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitViewport);
+    window.visualViewport.addEventListener('scroll', fitViewport);
+  }
+  fitViewport();
 
   head.addEventListener('click', function(e){
     var b = e.target.closest('.pbtn');
@@ -2619,17 +2648,39 @@ function openTerminal(server, sessionId){
   // literal this file is in.
   var KEYS = { esc:'\\x1b', tab:'\\t', bt:'\\x60', ctrlc:'\\x03',
                up:'\\x1b[A', down:'\\x1b[B', right:'\\x1b[C', left:'\\x1b[D' };
-  keysEl.addEventListener('click', function(e){
-    var b = e.target.closest('.tkey');
+  function pressKey(b){
     if (!b || !t.term) return;
     var k = b.dataset.k;
     if (k === 'sel') { setSel(!selOn); return; }
     if (selOn) return;                      // the grid is not on screen to type into
     if (k === 'ctrl') { t.ctrl = !t.ctrl; b.classList.toggle('on', t.ctrl); t.term.focus(); return; }
     var s = KEYS[k];
+    if (s && /^(up|down|left|right)$/.test(k) && t.term.modes.applicationCursorKeysMode)
+      s = s.replace('[', 'O');
     if (s) { sendData(s); t.term.focus(); }
+  }
+  keysEl.addEventListener('pointerdown', function(e){
+    if (e.button !== 0) return;
+    var b = e.target.closest('.tkey');
+    if (!b) return;
+    e.preventDefault(); // keep xterm's textarea focused and the keyboard open
+    pressKey(b);
+  });
+  keysEl.addEventListener('click', function(e){
+    // Keyboard and assistive activation still work; pointer clicks already sent.
+    if (e.detail === 0) pressKey(e.target.closest('.tkey'));
   });
   function sendData(d){
+    // Apply the sticky modifier to both keyboard input and the extra key row.
+    if (t.ctrl) {
+      if (d.length === 1) {
+        var c = d.toUpperCase().charCodeAt(0);
+        if (c >= 63 && c <= 95) d = String.fromCharCode(c === 63 ? 127 : c & 0x1f);
+      }
+      t.ctrl = false;
+      var cb = keysEl.querySelector('[data-k="ctrl"]');
+      if (cb) cb.classList.remove('on');
+    }
     wsSendJ({ type:'in', b: b64FromBytes(new TextEncoder().encode(d)) });
   }
 
@@ -2666,8 +2717,8 @@ function openTerminal(server, sessionId){
       selTextEl.scrollTop = selTextEl.scrollHeight;   // the end is what you just watched
     } else {
       selTextEl.textContent = '';
-      // The grid measured zero the whole time it was display:none, so the font size it
-      // settled on is meaningless now and has to be searched for again.
+      // Fitting was paused while the grid was hidden. Measure the current viewport
+      // before returning to the terminal.
       fitTermGrid(0);
     }
   }
@@ -2687,28 +2738,22 @@ function openTerminal(server, sessionId){
     t.term.open(bodyEl);
     // Ctrl as a sticky modifier from the key bar: the next printable character becomes
     // its control code, which is the only way to reach ctrl-c from an iOS keyboard.
-    t.term.onData(function(d){
-      if (t.ctrl && d.length === 1) {
-        var c = d.toLowerCase().charCodeAt(0);
-        if (c >= 97 && c <= 122) d = String.fromCharCode(c - 96);
-        else if (d === '[') d = '\\x1b';
-        t.ctrl = false;
-        var cb = keysEl.querySelector('[data-k="ctrl"]');
-        if (cb) cb.classList.remove('on');
-      }
-      sendData(d);
-    });
+    t.term.onData(sendData);
     t.term.onBinary(function(d){
       var u = new Uint8Array(d.length);
       for (var i=0;i<d.length;i++) u[i] = d.charCodeAt(i) & 0xff;
       wsSendJ({ type:'in', b: b64FromBytes(u) });
     });
     return new Promise(function(ok){ fitTermGrid(0, ok); }).then(function(){
+      if (t.destroyed) return;
       return fetch(API+'/api/term/open', { method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ cols:t.cols, rows:t.rows, sessionId: sessionId || null }) })
         .then(function(r){ return r.json(); })
         .then(function(d){
-          if (t.destroyed) return;
+          if (t.destroyed) {
+            if (d && d.id) fetch(API+'/api/term/'+d.id+'/close', { method:'POST' }).catch(function(){});
+            return;
+          }
           if (!d || d.error) {
             t.term.write('\\r\\n\\x1b[31m'+((d && d.error) || 'could not start a shell')+'\\x1b[0m\\r\\n');
             t.dead = true;
@@ -2723,7 +2768,7 @@ function openTerminal(server, sessionId){
           titleEl.textContent = name + (d.where === 'pane' ? ' · session pane'
                                       : d.where === 'window' ? ' · new window' : '');
           connect();
-          setTimeout(function(){ fitTermGrid(0); t.term.focus(); }, 150);
+          focusTimer = setTimeout(function(){ if (!t.destroyed) { fitTermGrid(0); t.term.focus(); } }, 150);
         });
     });
   }).catch(function(e){
@@ -2778,10 +2823,14 @@ function openTerminal(server, sessionId){
 
   t.destroy = function(){
     t.destroyed = true;
-    clearTimeout(reconnectTimer); clearTimeout(fitTimer);
+    clearTimeout(reconnectTimer); clearTimeout(fitTimer); clearTimeout(fitStepTimer); clearTimeout(quietTimer); clearTimeout(focusTimer);
+    fitWaiters = [];
     offWake();
-    window.removeEventListener('resize', refit);
-    if (window.visualViewport) window.visualViewport.removeEventListener('resize', refit);
+    window.removeEventListener('resize', fitViewport);
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', fitViewport);
+      window.visualViewport.removeEventListener('scroll', fitViewport);
+    }
     if (t.id && !t.dead) {
       if (t.ws && t.ws.readyState === 1) wsSendJ({ type:'close' });
       else fetch(API+'/api/term/'+t.id+'/close', { method:'POST' }).catch(function(){});
@@ -2789,8 +2838,10 @@ function openTerminal(server, sessionId){
     if (t.ws) { try { t.ws.close(); } catch(e){} }
     if (t.term) { try { t.term.dispose(); } catch(e){} }
     wrap.className = '';
+    wrap.style.top = wrap.style.height = wrap.style.bottom = wrap.style.paddingBottom = '';
     wrap.innerHTML = '';
     if (termState === t) termState = null;
+    syncViewport();
   };
   t.server = name;
   return t;

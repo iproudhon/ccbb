@@ -457,10 +457,14 @@ class Session {
 
   control(subtype, extra) {
     const requestId = uuid();
-    this.write({ type: 'control_request', request_id: requestId, request: { subtype, ...(extra || {}) } });
     return new Promise(res => {
-      this.outstanding.set(requestId, res);
-      setTimeout(() => { if (this.outstanding.delete(requestId)) res(null); }, 30000);
+      const timer = setTimeout(() => { if (this.outstanding.delete(requestId)) res(null); }, 30000);
+      this.outstanding.set(requestId, response => { clearTimeout(timer); res(response); });
+      if (!this.write({ type: 'control_request', request_id: requestId, request: { subtype, ...(extra || {}) } })) {
+        this.outstanding.delete(requestId);
+        clearTimeout(timer);
+        res(null);
+      }
     });
   }
 
@@ -522,12 +526,27 @@ class Session {
   // A turn begins where we begin it. The child's status messages report ON a turn; they
   // do not delimit one, so this is the only place that can say a turn started and mean
   // it. It also puts the spinner up on the keystroke rather than on the round trip.
-  beginTurn(activity) {
+  beginTurn(activity, submitted = false) {
     const was = this.state.status;
+    // Message starts between tool calls belong to the same turn. Only a new
+    // submission or work starting from idle supersedes a pending interrupt.
+    if (submitted || was !== 'busy' || !this.turnLive)
+      this._workVersion = (this._workVersion || 0) + 1;
     this.turnLive = true;
     if (was !== 'busy') { this.state.turnStartedAt = Date.now(); this.state.outTokens = 0; }
     this.state.status = 'busy';
     this.state.activity = activity || this.state.activity || 'requesting';
+    this.emitStatus();
+  }
+
+  // Every completed turn must update the deduper as well as the snapshot. Otherwise
+  // an interrupt followed by another prompt can suppress that prompt's busy event.
+  endTurn() {
+    if (this.turnLive || this.state.status !== 'idle')
+      this._workVersion = (this._workVersion || 0) + 1;
+    this.turnLive = false;
+    this.state.status = 'idle';
+    this.state.activity = null;
     this.emitStatus();
   }
 
@@ -562,7 +581,7 @@ class Session {
       if (this.attribution.length > 64) this.attribution.shift();
     }
     const ok = this.write({ type: 'user', message: { role: 'user', content: body }, parent_tool_use_id: null });
-    if (ok) this.beginTurn();
+    if (ok) this.beginTurn(null, true);
     // The card for a slash command, made HERE rather than waited for. Over stream-json
     // the child echoes nothing when a command is submitted — no <command-name>, no
     // replay — and answers synthetically whenever it is done, which for /compact is
@@ -621,10 +640,18 @@ class Session {
   // the replay echo lags submission by seconds, so clearing it here would strip
   // the owner off a turn that is still in flight.
   async interrupt(from) {
+    const version = this._workVersion || 0;
     this.emit('interrupted', { by: from });
     const r = await this.control('interrupt');
     const stillQueued = (r && r.response && r.response.still_queued) || [];
-    this.state.status = 'idle';
+    // A result or new submission may have arrived while control was pending.
+    // A missing/failed acknowledgement does not prove the child stopped, and
+    // surviving queued work must remain busy until its own completion.
+    if (r && r.subtype !== 'error' && version === (this._workVersion || 0) &&
+        !stillQueued.length && this.state.status !== 'exited') {
+      this.endTurn();
+      this.settlePendingCmd();
+    }
     this.emit('interrupt_done', { by: from, stillQueued });
     return r;
   }
@@ -698,17 +725,7 @@ class Session {
       case 'result': {
         // The one event that ends a turn. Everything after it that says 'requesting' is
         // the child idling, not working.
-        this.turnLive = false;
-        this.state.status = 'idle';
-        // The verb dies with the turn. Left standing, the NEXT turn's spinner opened on
-        // whatever the last one had been doing — "Compacting…" most memorably, on a
-        // turn that was doing nothing of the kind.
-        this.state.activity = null;
-        // Through emitStatus, not around it: the deduper can only skip a repeat if every
-        // move of the status is recorded in it. Ending a turn silently here left it still
-        // holding 'busy/requesting', so the NEXT turn's beginTurn looked like a repeat and
-        // sent nothing — the first turn of a page got a spinner and no turn after it did.
-        this.emitStatus();
+        this.endTurn();
         this.settlePendingCmd();
         const u = m.usage || {};
         // Provisional: the turn's own numbers, so the footer moves the instant the turn
@@ -800,11 +817,8 @@ class Session {
       // dot went blank, and the only word anywhere was the child's synthetic
       // "Compaction canceled." with no reason attached to it.
       if (m.compact_result) {
-        this.state.status = 'idle';
-        this.state.activity = null;
-        this.turnLive = false;
-        this.emit('compact_done', { result: m.compact_result, error: m.compact_error || '' });
-        return this.emitStatus();
+        this.endTurn();
+        return this.emit('compact_done', { result: m.compact_result, error: m.compact_error || '' });
       }
       // 'compacting' is a compaction; the child may name others. Those are the session
       // WORKING, and the word is what a client shows instead of a generic spinner —
@@ -820,15 +834,14 @@ class Session {
       const named = m.status && m.status !== 'idle' && m.status !== 'done';
       const work = named && (m.status !== 'requesting' || this.turnLive);
       if (work) {
+        if (this.state.status !== 'busy') this._workVersion = (this._workVersion || 0) + 1;
         if (this.state.status !== 'busy') { this.state.turnStartedAt = Date.now(); this.state.outTokens = 0; }
         this.state.status = 'busy';
         this.state.activity = m.status;
       } else {
         // Includes status:null — the child saying it stopped, which fell through every
         // branch here and left the last verb standing.
-        this.turnLive = false;
-        this.state.status = 'idle';
-        this.state.activity = null;
+        return this.endTurn();
       }
       return this.emitStatus();
     }

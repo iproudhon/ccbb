@@ -358,6 +358,10 @@ function summarizeCodex(sessions) {
   return { ...result, incomplete, knownUsage, knownCost };
 }
 
+// Native title data is shared by history, discovery and live pages. A mux label
+// is a CCBB address; it must never replace the native name or preview.
+function codexTitle(thread) { return thread.name || thread.preview || 'Codex'; }
+
 // Session discovery
 
 function timestamp(seconds) {
@@ -390,7 +394,7 @@ async function getCodexSessions(periodFilter, rpc = new CodexRpc(), includeEmpty
           (!lastActivity || periodKey(lastActivity, periodFilter.period) !== periodFilter.key))) continue;
         sessions.set(thread.id, {
           agent: 'codex', sessionId: thread.id, sessionKey: `codex:${thread.id}`,
-          title: thread.name || thread.preview || '', projectPath: thread.cwd || '',
+          title: codexTitle(thread), projectPath: thread.cwd || '',
           startedAt, lastActivity, totalCost: null, totalTokens: null, turns: null,
           cacheReadTokens: null, cacheCreationTokens: null, cacheMissTokens: null,
           outputTokens: null, inputTokens: null,
@@ -481,7 +485,7 @@ async function history(id) {
     const messages = turns.flatMap(t => (t.items || []).map(i => normalizeItem(i, t.id, true)));
     const usage = await readCodexUsage(thread, null);
     return { op: 'snapshot', seq: 0, epoch: 'history', pending: [], clients: [], messages,
-      state: { id: 'codex:' + id, agent: 'codex', nativeId: id, title: thread.name || thread.preview || 'Codex',
+      state: { id: 'codex:' + id, agent: 'codex', nativeId: id, title: codexTitle(thread),
         cwd: thread.cwd, model: thread.model, status: 'history', ...nativeActivity(id), capabilities: [], cost: usage && usage.totalCost,
         tokens: usage && usage.totalTokens, turns: usage && usage.turns,
         contextTokens: usage && usage.context && usage.context.tokens, contextPeak: usage && usage.contextMax && usage.contextMax.tokens, costEstimated: true } };
@@ -496,5 +500,5 @@ async function renameCodexThread(id, name, rpc = new CodexRpc()) {
   } finally { rpc.close(); }
 }
 
-module.exports = { CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts,
+module.exports = { codexTitle, CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts,
   normalizeItem, readHistory, cached, refresh, history, error: month => entry(month).error };

@@ -1512,7 +1512,9 @@ function paintBusy() {
   // The mux's own turn clock wins: this page may have opened halfway through the turn.
   var started = (S.info || {}).turnStartedAt || turnStart;
   var secs = started ? Math.max(0, Math.round((t - started) / 1000)) : 0;
-  row.querySelector('.mx-spin').textContent = SPIN_FRAMES[Math.floor(t / 120) % SPIN_FRAMES.length];
+  // U+2733 otherwise becomes a green emoji on some phones. Keep text presentation
+  // local to the web painter: the TUI consumes the shared frames as terminal cells.
+  row.querySelector('.mx-spin').textContent = SPIN_FRAMES[Math.floor(t / 120) % SPIN_FRAMES.length] + '\uFE0E';
   var tok = (S.info || {}).outTokens;
   // The whimsical verbs are for an ordinary turn, where the CLI has nothing better to
   // say. When the child DOES name what it is doing — compacting, most of all, which
