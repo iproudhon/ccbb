@@ -8,8 +8,8 @@ CCBB's proxy listener (`https://proxy-host`) is not implemented.
 
 The proxy uses the existing persistent `/peer-link` network. Both ends must run
 a version with proxy support. A connection opened in either direction works:
-Node1 can use Node2 as an exit even when only Node2 can dial Node1, if Node1 sets
-`proxy.allowInboundExit` (see below). Existing SSH forwards, peer names, tokens,
+Node1 can use Node2 as an exit even when only Node2 can dial Node1, unless Node1
+sets `proxy.allowInboundExit` to false (see below). Existing SSH forwards, peer names, tokens,
 heartbeat and reconnection behavior are reused.
 
 ## Node1 entrance, Node2 exit
@@ -43,28 +43,26 @@ Node1:
 
 The example peer URL assumes port 8591 already forwards to Node2's CCBB port.
 Use the existing configured URL for Node2. If Node2 already links into Node1,
-Node1 can drop the `peers` entry and set `"allowInboundExit": true` instead.
+Node1 can drop the `peers` entry; the inbound link is used by default.
 An inbound link is identified only by the name the caller asserts with Node1's
 `peerToken`; any holder of that token could link in as "Node2", replace the real
 link and receive all proxied traffic, including plaintext HTTP. An outbound
-`peers` entry pins the exit to a configured URL and token, so it is the default
-and the inbound form is opt-in.
+`peers` entry pins the exit to a configured URL and token, so prefer it and set
+`"allowInboundExit": false` where inbound trust is unwanted.
 
 Node2:
 
 ```json
 {
   "server": { "name": "Node2" },
-  "peerToken": "node2-peer-secret",
-  "proxy": {
-    "allowExit": true
-  }
+  "peerToken": "node2-peer-secret"
 }
 ```
 
-Keep Node2's existing Node1/Node3 peer settings. `allowExit` lets authenticated
-full-access peers use this node's exit; it does not enable a local browser proxy
-listener. Set `peerToken` on reachable CCBB servers so peer links authenticate.
+Keep Node2's existing Node1/Node3 peer settings. `allowExit` (default true) lets
+authenticated full-access peers use this node's exit; it does not enable a local
+browser proxy listener. Set `"proxy": { "allowExit": false }` on nodes that must
+not egress for peers. Set `peerToken` on reachable CCBB servers so peer links authenticate.
 As with CCBB's existing network, a full peer token grants trust in the peer;
 read-only web tokens cannot establish links.
 
@@ -105,10 +103,10 @@ All fields below live under `proxy`; proxy functionality is disabled by default.
 | `enabled` | Accept browser proxy requests on this web port; default false. |
 | `exitNode` | Required exact peer name. Use this server's own name for local egress, which also requires `allowExit`. |
 | `username`, `password` | Separate Basic proxy credentials. Both must be nonempty when either is set. Without either, only loopback clients are accepted. |
-| `allowExit` | Permit destination connections on this node for itself and directly linked full-access peers; default false. Does not relay onward to this node's `exitNode`. |
-| `allowedPorts` | Exit-side destination ports; default `[80, 443]`. Set an explicit array to add development-server ports. |
+| `allowExit` | Permit destination connections on this node for itself and directly linked full-access peers; default true. Does not relay onward to this node's `exitNode`. |
+| `allowedPorts` | Exit-side destination port allowlist, e.g. `[80, 443]`. Unset by default: every port is allowed. |
 | `allowPrivate` | Exit-side permission for localhost, private/LAN and other non-public addresses; default false. Enable only when those destinations are intended. |
-| `allowInboundExit` | Entrance-side permission to use an exit whose link the exit opened towards this node; default false. See the trust note above. |
+| `allowInboundExit` | Entrance-side permission to use an exit whose link the exit opened towards this node; default true. See the trust note above. |
 | `forwardCcbbAuthTo` | Entrance-side array of origins (for example `["http://127.0.0.1:8590"]`) that keep `x-ccbb-token` and `ccbb_token*` cookies. By default they are stripped from every proxied request, so browsing another CCBB UI through the proxy loses its login unless its origin is listed. |
 
 Public destinations are DNS-resolved and checked on the exit, then connected by
@@ -161,7 +159,7 @@ fixed the same day:
 4. LOW — exit budget counted a tunnel and its socket as two slots; now one.
 5. LOW — CCBB auth stripping was destination-blind; `forwardCcbbAuthTo` added.
 6. LOW — inbound links were trusted by self-asserted name; `allowInboundExit`
-   opt-in added and the trust model documented above.
+   added (default true, set false to opt out) and the trust model documented above.
 7. LOW — DNS + connect could take 20 s against a 10 s tunnel timer; budgets now
    share one 10 s deadline. `::ffff:` public IPv4 is rejected by design.
 

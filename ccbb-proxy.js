@@ -161,9 +161,9 @@ class ForwardProxy {
   async dial(dest, { signal, slot, deadline = performance.now() + this.openTimeout } = {}) {
     const generation = this.generation;
     const cfg = this.config();
-    if (cfg.allowExit !== true) throw fail('Proxy exit is disabled on this node', 403);
-    const ports = cfg.allowedPorts === undefined ? [80, 443] : cfg.allowedPorts;
-    if (!Array.isArray(ports) || !ports.includes(dest.port)) throw fail('Proxy destination port is not allowed', 403);
+    if (cfg.allowExit === false) throw fail('Proxy exit is disabled on this node', 403);
+    const ports = cfg.allowedPorts;
+    if (ports !== undefined && (!Array.isArray(ports) || !ports.includes(dest.port))) throw fail('Proxy destination port is not allowed', 403);
     slot = this.reserve(slot);
     let connected = false;
     const check = () => {
@@ -224,8 +224,8 @@ class ForwardProxy {
     if (node === this.identity()) return this.dial(dest, { signal });
     const link = this.findLink(node);
     if (!link || link.ws.readyState !== 1) throw fail(`Proxy exit "${node}" has no live peer link`, 503);
-    if (link.inbound && this.config().allowInboundExit !== true)
-      throw fail('Set proxy.allowInboundExit to trust this inbound exit link', 403);
+    if (link.inbound && this.config().allowInboundExit === false)
+      throw fail('proxy.allowInboundExit is false; this exit link was opened inbound', 403);
     const s = this.newTunnel(link);
     const abort = () => s.destroy(fail('Proxy connection cancelled'));
     signal?.addEventListener('abort', abort, { once: true });

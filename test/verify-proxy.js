@@ -92,12 +92,12 @@ test('authentication, disabled exit, unknown exit, private-address policy and li
   a.cfg.exitNode = 'Node2'; a.links.get('Node2').ws.terminate();
   assert.equal((await request(a.port, dest.url)).status, 503);
 });
-test('an exit that dialed in is used only with allowInboundExit', { timeout: 10000 }, async t => {
+test('an exit that dialed in is refused when allowInboundExit is false', { timeout: 10000 }, async t => {
   const [a, b] = await fixture(t, true);
   const dest = await origin(t, (req, res) => res.end('inbound exit'));
   Object.assign(b.cfg, { allowExit: true, allowedPorts: [dest.port], allowPrivate: true });
   assert.equal(a.links.get('Node2').inbound, true);
-  delete a.cfg.allowInboundExit;
+  a.cfg.allowInboundExit = false;
   const r = await request(a.port, dest.url);
   assert.equal(r.status, 403); assert.match(r.body.toString(), /allowInboundExit/);
   a.cfg.allowInboundExit = true;
@@ -300,8 +300,9 @@ test('exitNode naming this server egresses locally without a peer link', { timeo
   const [a, b] = await fixture(t);
   const dest = await origin(t, (req, res) => res.end('local exit'));
   Object.assign(a.cfg, { exitNode: 'Node1', allowedPorts: [dest.port], allowPrivate: true });
-  assert.equal((await request(a.port, dest.url)).status, 403, 'local exit still requires allowExit');
-  a.cfg.allowExit = true;
+  a.cfg.allowExit = false;
+  assert.equal((await request(a.port, dest.url)).status, 403, 'local exit honours allowExit: false');
+  delete a.cfg.allowExit;
   let dials = 0; b.proxy.dial = () => { dials++; throw new Error('Node2 must not be used'); };
   assert.equal((await request(a.port, dest.url)).body.toString(), 'local exit');
   assert.equal(dials, 0); assert.equal(a.proxy.channels.get(a.links.get('Node2')).size, 0);
