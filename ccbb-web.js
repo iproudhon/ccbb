@@ -3791,7 +3791,7 @@ function createSessionView(INFO){
     if (btn) btn.disabled = true;
     fetch(API+'/mux/api/sessions', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ resume: INFO.sessionId, cwd: INFO.projectPath || undefined,
-        label: INFO.title || undefined, bin: bin }) })
+        label: INFO.title || undefined, pinned: false, bin: bin }) })
       .then(function(r){ return r.json().then(function(d){ return { code:r.status, d:d }; }); })
       .then(function(r){
         // 409 running-in-mux is not a failure: the thing the button would have made
@@ -6453,7 +6453,7 @@ function runWeb(args) {
           port, host: '127.0.0.1', prefix: '/mux', pid: process.pid, startedAt: new Date().toISOString(),
         }), { mode: 0o600 });
       } catch {}
-      console.log('ccbb: mux running in-process — ccbb new / ccbb ls --mux, open at /mux/s/<id>');
+      console.log('ccbb: mux running in-process — ccbb new / ccbb ls, open at /mux/s/<id>');
     }
     if (host !== '127.0.0.1') for (const a of lanAddrs()) console.log(`ccbb http://${a}:${port}`);
     const peers = peerList();

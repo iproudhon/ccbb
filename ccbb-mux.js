@@ -260,7 +260,9 @@ class Session {
     this.id = opt.sessionId || (opt.resume && !opt.fork ? opt.resume : uuid());
     this.cwd = opt.cwd || process.cwd();
     this.opt = opt;
-    this.label = opt.label || path.basename(this.cwd);
+    // Whether the name was chosen by a person (-n, a rename). A pinned name stays put;
+    // an unpinned one is only a seed the transcript's own title replaces. See setTitle.
+    this.pinned = !!opt.pinned;
 
     this.seq = 0;
     // Which INCARNATION of this session id this is. seq alone cannot say: a mux that
@@ -282,16 +284,16 @@ class Session {
     this.pendingCmd = null;           // a slash command whose output has not arrived
     this.lastCmd = null;              // the most recent command card, answered or not
     this._compactMeta = null;         // set by compact_boundary, claimed by the summary
+    const name = opt.label || path.basename(this.cwd);
     this.state = {
-      id: this.id, cwd: this.cwd, label: this.label, status: 'starting',
-      // What every UI calls this session. The LABEL is its address — what `ccbb attach`
-      // takes, unique among live sessions — and it is not a name for reading: it is
-      // whatever the directory was called when the session started. The transcript's
-      // own title is what ccbb's session list has always shown, and showing the label
-      // on the session page meant one session answered to two different names
-      // depending on which screen you were looking at. Seeded to the label so a session
-      // with no transcript yet is not nameless.
-      title: this.label,
+      id: this.id, cwd: this.cwd, status: 'starting',
+      // ONE name for this session. The title is what every UI shows AND the address
+      // `ccbb attach` takes — a separate mux label meant one session answered to two
+      // different names depending on which screen you were looking at. It starts as
+      // the name given (or the directory), and unless that name was pinned by a person
+      // the transcript's own title takes over as it arrives (setTitle). `label` on the
+      // wire is the same string, kept for clients that still read it as the address.
+      title: name, label: name,
       bin: opt.bin, model: null, permissionMode: opt.permissionMode || null,
       tools: [], mcpServers: [], plugins: [], commands: [], slashCommands: [],
       capabilities: [], auth: null, cost: 0, tokens: 0, turns: 0,
@@ -314,6 +316,24 @@ class Session {
       if (opt.resume) this.seedHistory(opt.resume);
       this.spawn();
     }
+  }
+
+  // The address is the title; see the note on state.title.
+  get label() { return this.state.title; }
+
+  // Apply a name. A pinned name (given by a person) ignores titles the transcript or
+  // the agent generate; pin:true is how a person's choice becomes pinned. The name is
+  // made unique among live sessions because it is an address, and a title two sessions
+  // happen to share would make `ccbb attach <name>` ambiguous. Returns whether it changed.
+  setTitle(title, { pin = false } = {}) {
+    title = String(title || '').trim();
+    if (pin) this.pinned = true;
+    else if (this.pinned || !title) return false;
+    if (!title) return false;
+    if (this.mux && this.mux.uniqueLabel) title = this.mux.uniqueLabel(title, this);
+    if (title === this.state.title) return false;
+    this.state.title = this.state.label = title;
+    return true;
   }
 
   // What --resume does NOT give back. In print/stream-json the child replays nothing:
@@ -426,21 +446,21 @@ class Session {
       if (this.state.status === 'exited') this._statsDone = true;
       const ctx = st.context ? st.context.tokens : 0;
       const peak = st.contextMax ? st.contextMax.tokens : ctx;
+      const renamed = this.setTitle(st.title);
       const next = {
-        title: st.title || this.label,
         cost: st.cost || 0, tokens: st.totalTokens || 0,
         turns: st.turns || 0, subTurns: st.subTurns || 0,
         contextTokens: ctx, contextPeak: Math.max(peak, ctx),
         contextMax: (st.context && st.context.max) || 0,
         contextPostCompact: !!(st.context && st.context.postCompact),
       };
-      const same = Object.keys(next).every(k => this.state[k] === next[k]);
+      const same = !renamed && Object.keys(next).every(k => this.state[k] === next[k]);
       Object.assign(this.state, next);
       // The whole stats object rides along for the header block ccbb web opens behind
       // the dots — the same shape /api/session/<id>/stats returns, because it IS that.
       this.state.stats = st;
       if (same) return;
-      this.emit('stats', { stats: st, ...next });
+      this.emit('stats', { stats: st, title: this.state.title, ...next });
       this.mux.notifyChange();
     }, delay == null ? 700 : delay);
     if (this._statsTimer.unref) this._statsTimer.unref();
@@ -1241,6 +1261,7 @@ class Mux {
         e.code = 'EBUSY'; e.reason = 'live-in-terminal'; throw e;
       }
     }
+    o.pinned = o.pinned != null ? !!o.pinned : !!o.label;
     o.label = this.uniqueLabel(o.label || path.basename(o.cwd || process.cwd()));
     const s = new Session(this, o);
     this.sessions.set(s.id, s);
@@ -1252,9 +1273,9 @@ class Mux {
   // sessions only: an exited session stays in the map so its transcript stays
   // browsable, and counting those would ratchet the suffix up every time you restart
   // in the same directory (ccbb-mux, then -2, then -3, forever, with nothing running).
-  uniqueLabel(want) {
+  uniqueLabel(want, self = null) {
     const taken = new Set([...this.sessions.values()]
-      .filter(s => s.state.status !== 'exited').map(s => s.label));
+      .filter(s => s !== self && !(self && s.id === self.id) && s.state.status !== 'exited').map(s => s.label));
     if (!taken.has(want)) return want;
     for (let n = 2; ; n++) if (!taken.has(`${want}-${n}`)) return `${want}-${n}`;
   }
@@ -1470,7 +1491,12 @@ async function api(pathname, method, body) {
 // form — `ccbb attach` with no argument — resolves only when exactly one session is
 // RUNNING. Counting exited ones would make "attach" fail with "several sessions" on a
 // machine with one live session and three remembered ones, which reads as a bug.
-function pickSession(list, ref) {
+//
+// opts.prefix (attach): when nothing matches exactly, the MOST RECENT session whose
+// name or id starts with ref, live ones first. Titles are long and typed from memory;
+// attach is read-only enough that landing on the newest "ccbb: …" is what was meant.
+// stop keeps the strict rules — quietly ending the wrong session has no undo.
+function pickSession(list, ref, opts = {}) {
   const live = list.filter(s => s.status !== 'exited');
   if (!ref) {
     if (live.length === 1) return live[0];
@@ -1484,29 +1510,39 @@ function pickSession(list, ref) {
   if (named) return named;
   const hits = list.filter(s => s.id.startsWith(ref) || (s.nativeId && s.nativeId.startsWith(ref)));
   if (hits.length === 1) return hits[0];
+  if (opts.prefix) {
+    const lc = ref.toLowerCase();
+    const starts = s => [s.label, s.title, s.id, s.nativeId].some(v => v && String(v).toLowerCase().startsWith(lc));
+    const when = s => Date.parse(s.lastActivity || s.startedAt || 0) || 0;
+    const pool = live.filter(starts).length ? live.filter(starts) : list.filter(starts);
+    if (pool.length) return pool.slice().sort((a, b) => when(b) - when(a))[0];
+  }
   return { error: hits.length ? `'${ref}' matches ${hits.length} sessions` : `no session named '${ref}'` };
 }
 
 // Resolve a name/id/short-id against the running mux, or exit with the reason.
-async function resolveRef(ref) {
+async function resolveRef(ref, opts) {
   const r = await api('/api/sessions');
-  const hit = pickSession(r.sessions || [], ref);
+  const hit = pickSession(r.sessions || [], ref, opts);
   if (hit.error) { console.error('ccbb:', hit.error); process.exit(1); }
   return hit;
 }
 
-// ── ccbb new / stop / ls --mux ───────────────────────────────────────────────
+// ── ccbb new / stop ───────────────────────────────────────────────────────
 function newHelp() {
-  console.log(`ccbb new — start a Claude Code or Codex session in the mux and attach a terminal to it
+  console.log(`ccbb <binary> — start a Claude Code or Codex session in the mux and attach a terminal to it
 
-Usage: ccbb new [--agent codex | -b <claude-binary>] [-n name] [options]
+Usage: ccbb <binary> [-n name] [options]
+
+<binary> is what to run: a name on PATH (claude, claude.pass, claude.aws, codex,
+codex.sh) or a full path. Its basename must start with claude or codex — that is
+how the agent is chosen. For Codex it is the app-server launched on first use.
 
 Options:
-  --agent <agent>       claude (default) | codex
-  -b, --bin <binary>     Required for Claude. which Claude Code to run: a name on PATH
-                         (claude, claude.pass, claude.aws) or a full path
-  -n, --name <name>      name for the session (default: this directory's basename;
-                         a -2, -3 … suffix is added if that name is already running)
+  -n, --name <name>      name for the session — its title and its address for attach/stop
+                         (a -2, -3 … suffix is added if that name is already running).
+                         Without -n the session is named after this directory until the
+                         transcript's own title arrives, which then becomes the name
   -m, --model <model>    model alias or full name
   -C, --cwd <dir>        working directory for the session (default: here)
   --permission-mode <m>  manual | auto | acceptEdits | plan | dontAsk | bypassPermissions
@@ -1517,10 +1553,17 @@ Options:
   --detach               create the session but do not attach a terminal
 
 The session runs inside \`ccbb web\` — start that first. It shows up in the web UI as a
-tab and in \`ccbb ls --mux\`; the terminal here is just one more attached client, so
+tab and in \`ccbb ls\`; the terminal here is just one more attached client, so
 closing it leaves the session running.
 Codex uses CCBB_CODEX_ENDPOINT or a persistent local app-server. A saved Codex thread
 with unknown ownership cannot be resumed in place. Codex stop detaches CCBB only.`);
+}
+
+// Which agent a binary is: decided by its basename, so `claude.aws`, `codex.sh` and a
+// full path to either all work, and anything else is refused rather than guessed.
+function agentOfBin(bin) {
+  const base = path.basename(String(bin || '')).toLowerCase();
+  return base.startsWith('claude') ? 'claude' : base.startsWith('codex') ? 'codex' : null;
 }
 
 function parseNew(args) {
@@ -1565,10 +1608,13 @@ async function resolveResume(ref) {
 
 async function runNew(args) {
   const o = parseNew(args);
-  if (o.error) { console.error('ccbb:', o.error, '— see `ccbb new -h`'); process.exit(1); }
+  if (o.error) { console.error('ccbb:', o.error, '— see `ccbb claude -h`'); process.exit(1); }
   if (o.help) return newHelp();
-  if (o.agent !== 'codex' && !o.bin) { console.error('ccbb: new needs -b/--bin <binary> (claude, claude.pass, claude.aws, or a path)'); process.exit(1); }
-  if (o.agent === 'codex' && o.bin) { console.error('ccbb: -b/--bin is for Claude; Codex runs through its app-server'); process.exit(1); }
+  // The binary names the agent: `ccbb codex.sh`, `ccbb claude.aws`. --agent only
+  // matters when there is no binary to read it from.
+  if (o.bin && !o.agent) o.agent = agentOfBin(o.bin);
+  if (o.bin && !agentOfBin(o.bin)) { console.error(`ccbb: '${o.bin}' — the binary's name must start with claude or codex`); process.exit(1); }
+  if (o.agent !== 'codex' && !o.bin) { console.error('ccbb: name the binary to run: ccbb claude|claude.pass|claude.aws|codex|<path> …'); process.exit(1); }
   if (o.agent !== 'codex' && o.resume) o.resume = await resolveResume(o.resume.trim());
   const detach = o.detach; delete o.detach;
   const r = await api('/api/sessions', 'POST', o);
@@ -1596,29 +1642,22 @@ interrupt-and-drain and closes the child's stdin immediately.`);
   console.log(`stopped ${s.label}`);
 }
 
-// `ccbb ls --mux`. The disk listing has these sessions too — they write ordinary
-// transcripts — but not the things that are only true of a running child: its status,
-// how many clients are attached, and whether it is blocked on a request nobody has
-// answered. Those are what this view is for.
-async function runMuxLs(agent = 'all') {
-  const r = await api('/api/sessions');
-  const list = (r.sessions || []).filter(s => agent === 'all' || (s.agent || 'claude') === agent);
-  if (!list.length) return console.log('No mux sessions. Start one with `ccbb new`.');
-  const w = Math.max(4, ...list.map(s => (s.label || '').length));
-  // cwd last and clipped to what's left: it is the only unbounded column, and a home
-  // directory deep enough to wrap takes every column above it out of alignment.
-  const bw = Math.max(3, ...list.map(s => path.basename(s.bin || '').length));
-  const left = w + bw + 36;
-  const room = Math.max(12, (process.stdout.columns || 80) - left);
-  const clip = t => (t = String(t || '')).length <= room ? t : '…' + t.slice(t.length - room + 1);
-  console.log(`${'NAME'.padEnd(w)}  ID        STATUS    ${'BIN'.padEnd(bw)}  CLI  ASK  MSGS  CWD`);
-  for (const s of list) {
-    console.log(`${String(s.label || '').padEnd(w)}  ${(s.nativeId || s.id).slice(0, 8)}  ` +
-      `${String(s.status).padEnd(8)}  ${path.basename(s.bin || '').padEnd(bw)}  ${String(s.clients).padStart(3)}  ` +
-      `${String(s.pending).padStart(3)}  ${String(s.messages).padStart(4)}  ${clip(s.cwd)}`);
-  }
+// What the mux is holding, for `ccbb ls` to mark the rows that are running — and
+// nothing when no mux is up or it does not answer, because the disk listing works
+// without one and must not turn into an error message about it.
+async function muxSessionsQuiet(timeoutMs = 1500) {
+  const a = muxAddress();
+  if (!a) return [];
+  const tok = common.peerToken ? common.peerToken() : null;
+  try {
+    const res = await fetch(`http://${a.host}:${a.port}${a.prefix || ''}/api/sessions`, {
+      headers: tok ? { 'x-ccbb-token': tok } : {}, signal: AbortSignal.timeout(timeoutMs),
+    });
+    const r = await res.json();
+    return Array.isArray(r.sessions) ? r.sessions : [];
+  } catch { return []; }
 }
 
-module.exports = { runNew, runStop, runMuxLs, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
+module.exports = { runNew, runStop, agentOfBin, muxSessionsQuiet, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
   TURN_VERBS, SPIN_VERBS, SPIN_FRAMES,
   muxAddress, MUX_DIR };

@@ -471,7 +471,9 @@ function attachHelp() {
 Usage:
   ccbb attach [<name>|<session-id>] [options]
 
-With no name, attaches to the session if exactly one is running.
+With no name, attaches to the session if exactly one is running. A name or id that
+matches nothing exactly picks the most recent session (running first) whose name or
+id starts with it.
 
 Options:
   --label <name>    how this controller identifies itself to the others
@@ -517,7 +519,7 @@ async function runAttach(argv) {
   // `ccbb attach` with nothing at all works when exactly one session is running.
   let sessionId = ref;
   if (!url) {
-    sessionId = (await require('./ccbb-mux').resolveRef(ref)).id;
+    sessionId = (await require('./ccbb-mux').resolveRef(ref, { prefix: true })).id;
     const addr = muxAddress();
     if (!addr) { console.error('ccbb: no mux running — start `ccbb web`'); process.exit(1); }
     url = `ws://${addr.host}:${addr.port}${addr.prefix || ""}/mux`;

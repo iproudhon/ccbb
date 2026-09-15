@@ -15,6 +15,7 @@
 // appending a custom-title entry on rename.
 
 const common = require('./ccbb-common');
+const path = require('path');
 const {
   getSessions, getCostSummary, periodKey, priceTable, maybeRefreshPricing,
 } = common;
@@ -125,9 +126,9 @@ function parseLsArgs(args) {
     else if (a === '-a' || a === '--all') { opt.group = null; }
     else if (a === '-z' || a === '--empty') { opt.includeEmpty = true; }
     else if (a === '-x' || a === '--wide') { opt.wide = true; }
+    else if (a === '--mux') { opt.mux = true; }
     else if (a === '-n' || a === '--limit') { opt.limit = parseInt(args[++i], 10) || 0; }
     else if (a === '-h' || a === '--help') { opt.help = true; }
-    else if (a === '--mux') { opt.mux = true; }
     else if (a === '-d' || a === '--daily') { opt.group = 'day'; }
     else if (a === '-w' || a === '--weekly') { opt.group = 'week'; }
     else if (a === '-m' || a === '--monthly') { opt.group = 'month'; }
@@ -167,16 +168,19 @@ the period; sessions with no usage in scope are dropped):
   -g, --group <unit> day | week | month   (periods use local time)
 
 Display:
-  --mux              list the sessions running in the mux instead (status, attached
-                     clients, unanswered requests) — see also: ccbb new
+  --mux              only the sessions the mux is running (see: ccbb new)
   -x, --wide         force extended columns
   -z, --empty        include sessions with no usage in scope
   -n, --limit <n>    show only the first n rows
   -h, --help         this help
 
-Columns adapt to terminal width. A wide terminal (or -x) adds turns and the
+Columns adapt to terminal width. A wide terminal (or -x) adds turns, the
 context column: current / largest / would-be cost (largest is shown only when
-it differs). Context is all-time, shown even in period-scoped views.
+it differs), and for sessions the mux is running, BIN and CLI (attached clients).
+Context is all-time, shown even in period-scoped views.
+
+Sessions running in the mux (ccbb new) are marked with * in AGENT (claude*, codex*)
+and listed even when they have no usage in scope.
 
 Codex lists non-archived top-level sessions through the installed codex app-server
 (inherits CODEX_HOME). Local usage records populate cost, tokens, turns and context.
@@ -312,17 +316,12 @@ function printCostSummary(scope, label, extended) {
 async function runLs(args) {
   const opt = parseLsArgs(args);
   if (opt.help) return lsHelp();
-  // A different question with a different answer: --mux asks the running mux what it
-  // is holding, where everything else here reads transcripts off disk. Sorting, period
-  // scoping and the cost summary have nothing to say about a live child, so this
-  // branches before any of them rather than growing flags they'd all have to honour.
-  if (opt.mux) return require('./ccbb-mux').runMuxLs(opt.agent);
   if (!SORT_KEYS[opt.sort]) {
     console.error(`ccbb: unknown sort key '${opt.sort}'. Valid: ${Object.keys(SORT_KEYS).join(', ')}`);
     process.exit(1);
   }
   const periodFilter = opt.group ? currentPeriod(opt.group) : null;
-  const { sessions, totals } = opt.agent === 'codex'
+  let { sessions, totals } = opt.agent === 'codex'
     ? { sessions: [], totals: { totalCost: 0, totalTokens: 0 } }
     : getSessions(periodFilter, opt.includeEmpty);
   for (const session of sessions) {
@@ -336,11 +335,36 @@ async function runLs(args) {
       console.error(`ccbb: Codex sessions unavailable: ${error.message}`);
     }
   }
+  // The sessions the mux is running write ordinary transcripts, so they are already
+  // rows here; what the disk cannot say is that they are RUNNING, who is attached and
+  // under which binary. Mark those rows, and add the live ones the scope dropped —
+  // a session started a minute ago has no usage this month, yet it is the one you
+  // are most likely looking for.
+  const live = (await require('./ccbb-mux').muxSessionsQuiet())
+    .filter(m => m.status !== 'exited' && (opt.agent === 'all' || (m.agent || 'claude') === opt.agent));
+  const byKey = new Map(live.map(m => [(m.agent || 'claude') === 'codex' ? m.id : `claude:${m.id}`, m]));
+  for (const s of sessions) { const m = byKey.get(s.sessionKey); if (m) { s.mux = m; byKey.delete(s.sessionKey); } }
+  for (const [sessionKey, m] of byKey) {
+    sessions.push({
+      agent: m.agent || 'claude', sessionKey, sessionId: String(m.nativeId || m.id).replace(/^codex:/, ''),
+      title: m.title || m.label || '', projectPath: m.cwd || '',
+      totalCost: m.cost || 0, totalTokens: m.tokens || 0, turns: m.turns || 0, subTurns: m.subTurns || 0,
+      context: m.contextTokens ? { tokens: m.contextTokens, postCompact: !!m.contextPostCompact } : null,
+      startedAt: m.startedAt || null, lastActivity: m.lastActivity || null, mux: m,
+    });
+  }
+  // --mux: only what is running. The summary tables and the footer total describe the
+  // month, not these rows, so they are recomputed from the rows and the tables skipped.
+  if (opt.mux) {
+    sessions = sessions.filter(s => s.mux);
+    totals = { totalCost: sessions.reduce((n, s) => n + (s.totalCost || 0), 0),
+      totalTokens: sessions.reduce((n, s) => n + (s.totalTokens || 0), 0) };
+  }
+  const hasMux = sessions.some(s => s.mux);
   const codexRows = sessions.filter(s => s.agent === 'codex');
   const hasCodex = codexRows.length > 0;
   const codexTotals = require('./ccbb-agent-codex').summarizeCodex(codexRows);
-  totals.totalCost += codexTotals.cost;
-  totals.totalTokens += codexTotals.tokens;
+  if (!opt.mux) { totals.totalCost += codexTotals.cost; totals.totalTokens += codexTotals.tokens; }
   if (opt.agent === 'codex') {
     if (!codexTotals.knownCost) totals.totalCost = null;
     if (!codexTotals.knownUsage) totals.totalTokens = null;
@@ -348,26 +372,28 @@ async function runLs(args) {
   let rows = sortSessions(sessions, opt);
   if (opt.limit > 0) rows = rows.slice(0, opt.limit);
   if (!rows.length) {
-    console.log(periodFilter ? `No sessions active ${periodFilter.label}.` : 'No sessions found.');
+    console.log(opt.mux ? 'No mux sessions running. Start one with `ccbb new`.'
+      : periodFilter ? `No sessions active ${periodFilter.label}.` : 'No sessions found.');
     return;
   }
 
   const width = process.stdout.columns || 80;
   const extended = opt.wide || width >= 120;
 
-  if (opt.agent !== 'codex') {
+  if (opt.agent !== 'codex' && !opt.mux) {
     const summary = getCostSummary(periodFilter);
     const label = (hasCodex ? 'Claude only — ' : '') + (periodFilter ? periodFilter.label : 'all time');
     printCostSummary(summary.overall, label, extended);
   }
 
-  if (hasCodex && codexTotals.tokens) {
+  if (hasCodex && codexTotals.tokens && !opt.mux) {
     printCostSummary({ byProvider: { Codex: { ...codexTotals, cost: codexTotals.incomplete ? null : codexTotals.cost } } },
       'Codex — estimated API cost' + (codexTotals.incomplete ? ' (incomplete)' : ''), extended);
   }
 
   const cols = [];
-  if (opt.agent !== 'claude') cols.push({ head: 'AGENT', align: 'l', w: 6, get: s => s.agent });
+  // `*` marks a session the mux is running — the one you can `ccbb attach` by title.
+  if (opt.agent !== 'claude' || hasMux) cols.push({ head: 'AGENT', align: 'l', w: 7, get: s => s.agent + (s.mux ? '*' : '') });
   cols.push({ head: 'ID', align: 'l', w: 8,
     get: s => s.sessionId.slice(0, 8), color: c.gray });
   cols.push({ head: 'TITLE', align: 'l', flex: true, min: 16,
@@ -417,6 +443,13 @@ async function runLs(args) {
     cols.push({ head: 'STARTED', align: 'l', w: 12,
       get: s => fmtDate(s.startedAt), color: c.cyan });
   }
+  if (extended && hasMux) {
+    const binW = Math.max(3, ...sessions.map(s => s.mux && s.mux.bin ? path.basename(s.mux.bin).length : 0));
+    cols.push({ head: 'BIN', align: 'l', w: Math.min(binW, 16),
+      get: s => s.mux && s.mux.bin ? path.basename(s.mux.bin) : (s.mux ? '—' : ''), color: c.gray });
+    cols.push({ head: 'CLI', align: 'r', w: 3,
+      get: s => s.mux ? String(s.mux.clients || 0) : '', color: c.gray });
+  }
   cols.push({ head: 'PROJECT', align: 'l', flex: true, min: 12, weight: 0.5,
     get: s => s.projectPath || '', color: c.magenta });
 
@@ -442,10 +475,11 @@ Usage:
      [--webex]             ...also run the Webex front-end (one process)
      [--confluence]        ...also run the Confluence page front-end
                            multi-machine: add "peers" to ccbb-config.json (docs/peers.md)
-  ccbb new [-n name]       start a session in the mux and attach a terminal (ccbb new -h)
+  ccbb <binary> [-n name]  start a session in the mux and attach a terminal (ccbb claude -h)
+                           binary: claude | claude.pass | claude.aws | codex | codex.sh | a path
   ccbb attach [name|id]    attach a terminal to a running mux session (ccbb attach -h)
+  ccbb ls --mux            list only the sessions the mux is running
   ccbb stop [name|id]      end a mux session (ccbb stop -h)
-  ccbb ls --mux            list the sessions the mux is running
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
   ccbb skel [-o file]      extract privacy-safe session skeletons to one JSON (see: ccbb skel -h)
   ccbb stats <file...>     render an HTML stats report from skeletons (see: ccbb stats -h)
@@ -460,7 +494,9 @@ function main() {
   if (cmd === 'help' || cmd === '-h' || cmd === '--help') return topHelp();
   if (!cmd || cmd.startsWith('-')) { cmd = 'ls'; rest = argv; } // no command / bare flags → ls
   if (cmd === 'ls') return runLs(rest);
+  // `ccbb claude.aws -n x` / `ccbb /opt/bin/codex.sh`: the binary IS the command.
   if (cmd === 'new') return require('./ccbb-mux').runNew(rest);
+  if (require('./ccbb-mux').agentOfBin(cmd)) return require('./ccbb-mux').runNew(['-b', cmd, ...rest]);
   if (cmd === 'stop') return require('./ccbb-mux').runStop(rest);
   if (cmd === 'attach') return require('./ccbb-mux-tui').runAttach(rest);
   if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);

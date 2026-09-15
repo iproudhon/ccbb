@@ -1132,31 +1132,37 @@ path rather than a fixture-only one. `verify-web.js` dropped its second server e
 is the machine's own `peerToken`, so the section runs against whatever is really
 configured and skips with a note when nothing is.
 
-### `ccbb new` / `attach` / `stop`, and names
+### `ccbb <binary>` (new) / `attach` / `stop`, and names
 
 The mux had grown a CLI shaped like the thing it used to be — a daemon with a
 subcommand group, `ccbb mux new|ls|stop`. It is not that any more; it is the way you
 start a session. So the verbs moved to the top level and the group went away:
 
 ```
-ccbb new [-n name] [-m model] [...]   start a session in the mux, attach a terminal
+ccbb <claude|codex|path> [-n name] [...] start a session in the mux, attach a terminal
 ccbb attach [<name>|<id>]             attach a terminal to one that is running
 ccbb stop [<name>|<id>] [--force]     end one
-ccbb ls --mux                         what the mux is holding
+ccbb ls                               sessions; the ones the mux is running are marked *
 ```
 
-`ccbb new` attaches on purpose. The point of the verb is to start working, and a
+`ccbb <binary>` — `ccbb claude.aws`, `ccbb codex.sh`, a full path; the basename picks the
+agent, and `ccbb new -b` remains as the spelled-out form — attaches on purpose. The point of the verb is to start working, and a
 session you have to look up an id for before you can type into it is not started. It
 runs the same client `ccbb attach` runs — nothing about the session knows which verb
 created it, and `--detach` prints the name and id for the case where you want the
 process without the terminal.
 
-`ccbb ls --mux` is a different question from `ccbb ls`, not a filter on it. The disk
-listing has these sessions too — a mux session writes an ordinary transcript — but not
-the facts that only exist while a child is running: its status, how many controllers
-are attached, whether it is blocked on a request nobody has answered. So it branches
-before sorting, period scoping and the cost summary rather than teaching all three
-about a live child they have nothing to say about.
+A mux session writes an ordinary transcript, so it
+is already a row in `ccbb ls`; `--mux` keeps only those rows. The listing asks the running mux (quietly — no mux is
+not an error) which rows are live, marks them `claude*` / `codex*`, adds the live ones
+the period scope would have dropped, and under `-x` shows BIN and CLI (attached
+clients) for them.
+
+**A session has one name: its title is its address.** A separate mux label meant one
+session answered to two names depending on the screen. A name given with `-n` (or a
+rename) is pinned — it is the title and stays. Without `-n` the session is named after
+its directory only until the transcript's own title arrives, which then becomes the
+name `ccbb attach` takes.
 
 **Names are addresses, so they have to be unique.** `ccbb attach api-work` has to
 reach one session or none, never "one of these two". A new session takes the

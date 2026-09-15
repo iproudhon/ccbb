@@ -31,7 +31,7 @@ function mux(session) {
   return { list: () => [{ id: 'codex:term', agent: 'codex', title: session.state.title, label: session.label, status: 'busy' }] };
 }
 
-test('native name, preview, and unnamed fallback never use the mux label', () => {
+test('an unpinned seed gives way to native name, preview, or the unnamed fallback', () => {
   for (const [thread, expected] of [
     [{ name: 'Native title', preview }, 'Native title'],
     [{ name: null, preview }, preview],
@@ -40,8 +40,25 @@ test('native name, preview, and unnamed fallback never use the mux label', () =>
     const s = live(thread);
     assert.equal(s.state.title, expected);
     assert.equal(codexTitle(thread), expected);
-    assert.equal(s.label, 'ccbb: term', 'address is independent of title');
+    assert.equal(s.label, expected, 'the title is the address');
+    assert.equal(s.state.label, expected);
   }
+});
+
+test('a name a person chose is pinned: native titles do not replace it', async () => {
+  const rpc = new EventEmitter(); rpc.endpoint = 'ws://127.0.0.1:1';
+  const s = new CodexSession({ notifyChange() {} }, { label: 'my name', pinned: true }, rpc,
+    { thread: { id: 'term', cwd: '/tmp', turns: [], name: 'Native title', preview } });
+  s.emit = () => {};
+  assert.equal(s.state.title, 'my name');
+  assert.equal(s.label, 'my name');
+  s.onRpc({ method: 'thread/name/updated', params: { threadId: 'term', threadName: 'Generated later' } });
+  assert.equal(s.state.title, 'my name');
+  // An explicit rename is the person choosing again.
+  rpc.request = async () => ({});
+  await s.rename('renamed');
+  assert.equal(s.label, 'renamed');
+  assert.equal(s.pinned, true);
 });
 
 test('list and page use the same native title before and after discovery refresh', async () => {

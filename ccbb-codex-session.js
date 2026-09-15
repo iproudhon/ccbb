@@ -74,7 +74,9 @@ class CodexSocket extends EventEmitter {
 }
 let launching;
 function stateRoot() { return process.env.CCBB_HOME || common.CLAUDE_DIR; }
-async function endpoint() {
+// bin: which codex to launch the app-server with, when none is running yet. A server
+// already up is shared as-is — the binary only matters for the first launch.
+async function endpoint(bin) {
   if (process.env.CCBB_CODEX_ENDPOINT) return process.env.CCBB_CODEX_ENDPOINT;
   if (launching) return launching;
   launching = (async () => {
@@ -85,7 +87,7 @@ async function endpoint() {
     if (await probe()) return address;
     // The server owns its socket. Never unlink a socket that may belong to another runtime.
     const fd = fs.openSync(path.join(dir, 'server.log'), 'a', 0o600);
-    const child = spawn('codex', ['app-server', '--listen', address], { detached: true, stdio: ['ignore', fd, fd] });
+    const child = spawn(bin || 'codex', ['app-server', '--listen', address], { detached: true, stdio: ['ignore', fd, fd] });
     fs.closeSync(fd);
     let failure;
     child.on('error', e => { failure = e; });
@@ -127,7 +129,7 @@ function write(rows) {
 }
 function save(session) {
   const rows = read().filter(r => r.id !== session.nativeId);
-  rows.push({ id: session.nativeId, endpoint: session.rpc.endpoint, identity: socketIdentity(session.rpc.endpoint), label: session.label });
+  rows.push({ id: session.nativeId, endpoint: session.rpc.endpoint, identity: socketIdentity(session.rpc.endpoint), label: session.label, pinned: session.pinned });
   write(rows);
 }
 function forget(id) { write(read().filter(r => r.id !== id)); }
@@ -136,7 +138,7 @@ async function restore(mux) {
     // A new inode is a new server lifetime. Never automatically resume on it.
     if (!b.identity || socketIdentity(b.endpoint) !== b.identity) continue;
     if (process.env.CCBB_CODEX_ENDPOINT && process.env.CCBB_CODEX_ENDPOINT !== b.endpoint) continue;
-    try { await mux.create({ agent: 'codex', resume: b.id, label: b.label }); } catch { /* Historical rows remain available. */ }
+    try { await mux.create({ agent: 'codex', resume: b.id, label: b.label, pinned: !!b.pinned }); } catch { /* Historical rows remain available. */ }
   }
 }
 
@@ -149,12 +151,12 @@ class CodexSession extends Session {
     this.socketIdentity = socketIdentity(rpc.endpoint);
     this.rpc = rpc; this.nativeId = nativeId; this.agent = 'codex';
     this.state = { ...this.state, agent: 'codex', nativeId, endpoint: rpc.endpoint,
-      title: codexTitle(result.thread),
       cwd: result.cwd || result.thread.cwd || this.cwd, model: result.model || result.thread.model,
       permissionMode: null, approvalPolicy: result.approvalPolicy, reasoningEffort: result.reasoningEffort,
       cost: null, tokens: null, status: 'idle', capabilities: ['submit', 'steer', 'interrupt', 'approve', 'answerQuestion', 'rename', 'compact', 'terminalAttach'] };
     this.cwd = this.state.cwd;
     this.thread = result.thread;
+    this.setTitle(codexTitle(this.thread));
     this.completedTurns = new Set();
     this.inputAuthors = new Map();
     this.items = new Map(); this.queue = []; this.sending = false;
@@ -177,7 +179,7 @@ class CodexSession extends Session {
       if (!this.closing && this.socketIdentity) {
         this.reconnectTimer = setTimeout(() => {
           if (socketIdentity(rpc.endpoint) !== this.socketIdentity) return;
-          this.mux.create({agent:'codex',resume:this.nativeId,label:this.label}).catch(e=>this.emit('stderr',{text:'Codex reconnect: '+e.message}));
+          this.mux.create({agent:'codex',resume:this.nativeId,label:this.label,pinned:this.pinned}).catch(e=>this.emit('stderr',{text:'Codex reconnect: '+e.message}));
         }, 750);
         this.reconnectTimer.unref();
       }
@@ -273,8 +275,7 @@ class CodexSession extends Session {
       if ('threadName' in p || 'name' in p) {
         this._titleVersion = (this._titleVersion || 0) + 1;
         this.thread.name = p.threadName ?? p.name ?? null;
-        this.state.title = codexTitle(this.thread);
-        this.emit('init', { state: this.state });
+        if (this.setTitle(codexTitle(this.thread))) this.emit('init', { state: this.state });
       }
     } else if (m.method === 'turn/plan/updated' || m.method === 'turn/diff/updated') {
       this.put({ id: m.method, type: 'plan', text: p.diff || (p.plan || []).map(x => x.status + ': ' + x.step).join('\n') }, p.turnId);
@@ -378,11 +379,7 @@ class CodexSession extends Session {
     if (!thread || this.closing || version !== this._titleVersion) return;
     this.thread.name = thread.name;
     this.thread.preview = thread.preview;
-    const title = codexTitle(this.thread);
-    if (title !== this.state.title) {
-      this.state.title = title;
-      this.emit('init', { state: this.state });
-    }
+    if (this.setTitle(codexTitle(this.thread))) this.emit('init', { state: this.state });
   }
   async refreshUsage() {
     const u = await readCodexUsage(this.thread, null);
@@ -391,7 +388,8 @@ class CodexSession extends Session {
   async rename(name) {
     await this.rpc.request('thread/name/set', { threadId: this.nativeId, name });
     this._titleVersion = (this._titleVersion || 0) + 1;
-    this.thread.name = name; this.state.title = codexTitle(this.thread);
+    // A person chose this name: it is pinned, so a later generated title cannot undo it.
+    this.thread.name = name; this.setTitle(codexTitle(this.thread), { pin: true });
     this.emit('init', { state: this.state });
   }
   async compact() { await this.rpc.request('thread/compact/start', { threadId: this.nativeId }); }
@@ -406,7 +404,7 @@ async function createCodexSession(mux, opt) {
     if (existing && existing.state.status !== 'disconnected') return existing;
   }
   if (opt.fork && !ref) throw new Error('Codex --fork requires --resume <thread-id>');
-  const rpc = await new CodexSocket(await endpoint()).connect();
+  const rpc = await new CodexSocket(await endpoint(opt.bin)).connect();
   const buffered = []; const collect = m => buffered.push(m); rpc.on('message', collect);
   try {
     if (ref && !opt.fork && !(await loadedThreads(rpc)).has(ref)) throw new Error('Codex thread ownership is unknown: attach only a thread already loaded on the configured app-server');
@@ -415,6 +413,7 @@ async function createCodexSession(mux, opt) {
     const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref } : { cwd: opt.cwd || process.cwd(), ...(opt.model ? { model: opt.model } : {}), ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
     if (!result.thread || !result.thread.id) throw new Error('Codex returned no thread identity');
     if (opt.fork && result.thread.id === ref) throw new Error('Codex fork did not return a distinct thread ID');
+    opt.pinned = opt.pinned != null ? !!opt.pinned : !!opt.label;
     opt.label = mux.uniqueLabel(opt.label || 'codex');
     if (prior && !opt.fork && prior.turns.length > (result.thread.turns || []).length) {
       const combined = new Map(prior.turns.map(t=>[t.id,t]));

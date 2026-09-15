@@ -2,9 +2,11 @@
 
 Thread: `01a096ac-3297-7aa3-9f4a-273f3d2d8f1f`.
 
-The previous mux-label override was incorrect. A CCBB label is an address, not
-the native Codex title. The corrected code uses native name/preview data in
-discovery, history and live pages, and never writes a mux label as a native name.
+The previous mux-label override was incorrect. The corrected code uses native
+name/preview data in discovery, history and live pages, and never writes a mux
+label as a native name. (Superseded 2026-09-14: the separate label is gone — the
+title IS the address; an explicit `-n`/rename pins it, otherwise the native title
+becomes the name. See docs/ccbb-mux-plan.md.)
 
 ## History reviewed
 
