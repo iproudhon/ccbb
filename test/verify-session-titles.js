@@ -109,3 +109,26 @@ test('unattached history and Claude transcript title priority are unchanged', as
   mergeMuxRows(payload, { list: () => [{ id: 'claude', agent: 'claude', title: 'Old mux title' }] });
   assert.equal(payload.sessions[0].title, 'Saved Claude title');
 });
+
+test('a Codex reconnect keeps a pinned name without stepping it to name-2', () => {
+  const { Mux } = require('../ccbb-mux');
+  const mux = new Mux({});
+  const rpc = new EventEmitter(); rpc.endpoint = 'ws://127.0.0.1:1';
+  const first = new CodexSession(mux, { label: 'api', pinned: true }, rpc,
+    { thread: { id: 'term', cwd: '/tmp', turns: [], name: 'Native', preview } });
+  first.emit = () => {};
+  mux.sessions.set(first.id, first);
+  first.state.status = 'disconnected';
+  // What createCodexSession does for the name on a reconnect, with the old holder present.
+  const held = mux.sessions.get('codex:term');
+  const opt = { };
+  if (held && opt.label == null) { opt.label = held.label; if (opt.pinned == null) opt.pinned = held.pinned; }
+  assert.equal(mux.uniqueLabel(opt.label, { id: 'codex:term' }), 'api');
+  assert.equal(opt.pinned, true);
+  // A different live session with the same name still forces a suffix.
+  const other = new CodexSession(mux, { label: 'api', pinned: true }, rpc,
+    { thread: { id: 'other', cwd: '/tmp', turns: [], name: null, preview: '' } });
+  other.emit = () => {};
+  mux.sessions.set(other.id, other);
+  assert.equal(mux.uniqueLabel('api', { id: 'codex:term' }), 'api-2');
+});

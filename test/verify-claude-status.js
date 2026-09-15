@@ -146,3 +146,24 @@ test('a turn starting during automatic compaction supersedes its pending interru
   assert.equal(s.state.status, 'busy');
   assert.equal(s.turnLive, true);
 });
+
+test('the per-turn system init does not reset a running turn to idle', () => {
+  const { s, statuses } = fixture();
+  s.state.status = 'starting';
+  s.onSystem({ subtype: 'init', model: 'm' });
+  assert.equal(s.state.status, 'idle', 'startup init settles to idle');
+  // A prompt typed while idle: submit declares busy, then the child's init and its
+  // own 'requesting' arrive. The client must end the turn believing busy the whole way.
+  s.beginTurn(null, true);
+  s.onSystem({ subtype: 'init', model: 'm' });
+  assert.equal(s.state.status, 'busy');
+  s.onSystem({ subtype: 'status', status: 'requesting' });
+  s.onMessage({ type: 'result', num_turns: 1 });
+  assert.deepEqual(statuses(), ['busy', 'idle']);
+  // The other order: the child starts a queued turn (init first) before anything
+  // declared it busy. The init carries idle, so the following busy must not be deduped.
+  s.onSystem({ subtype: 'init', model: 'm' });
+  s.beginTurn();
+  s.onMessage({ type: 'result', num_turns: 1 });
+  assert.deepEqual(statuses(), ['busy', 'idle', 'busy', 'idle']);
+});

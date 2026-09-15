@@ -811,8 +811,13 @@ class Session {
 
   onSystem(m) {
     if (m.subtype === 'init') {
+      // The child sends init at the start of EVERY turn, not only at startup. Forcing
+      // idle here reset a turn that submit had already declared busy — silently, so the
+      // deduper still believed busy was the last word and swallowed the child's own
+      // busy that followed. Every client then sat on the idle carried by this event for
+      // the whole turn. Only a session that has not started yet becomes idle here.
       Object.assign(this.state, {
-        status: 'idle',
+        status: this.state.status === 'starting' ? 'idle' : this.state.status,
         model: m.model || this.state.model,
         tools: m.tools || [],
         mcpServers: m.mcp_servers || [],
@@ -822,6 +827,9 @@ class Session {
         slashCommands: m.slash_commands || this.state.slashCommands,
         cwd: m.cwd || this.cwd,
       });
+      // The state on this event is what clients now hold, so it is also what the
+      // deduper must measure the next status against.
+      this._statusLine = this.state.status + '/' + this.state.activity;
       return this.emit('init', { state: this.state, errors: {
         plugins: m.plugin_errors, mcp: m.mcp_server_errors } });
     }
@@ -1645,7 +1653,7 @@ interrupt-and-drain and closes the child's stdin immediately.`);
 // What the mux is holding, for `ccbb ls` to mark the rows that are running — and
 // nothing when no mux is up or it does not answer, because the disk listing works
 // without one and must not turn into an error message about it.
-async function muxSessionsQuiet(timeoutMs = 1500) {
+async function muxSessionsQuiet(timeoutMs = 600) {
   const a = muxAddress();
   if (!a) return [];
   const tok = common.peerToken ? common.peerToken() : null;

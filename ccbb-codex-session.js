@@ -413,8 +413,14 @@ async function createCodexSession(mux, opt) {
     const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref } : { cwd: opt.cwd || process.cwd(), ...(opt.model ? { model: opt.model } : {}), ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
     if (!result.thread || !result.thread.id) throw new Error('Codex returned no thread identity');
     if (opt.fork && result.thread.id === ref) throw new Error('Codex fork did not return a distinct thread ID');
+    // A reconnect to a thread this mux already holds keeps that session's name and
+    // its pin unless the caller says otherwise — the browser's Reconnect button sends
+    // neither — and must not count the old, disconnected holder of the name as taken,
+    // or every reconnect would step a pinned `api` to `api-2`, `api-2-2`, …
+    const held = mux.sessions.get('codex:' + result.thread.id);
+    if (held && opt.label == null) { opt.label = held.label; if (opt.pinned == null) opt.pinned = held.pinned; }
     opt.pinned = opt.pinned != null ? !!opt.pinned : !!opt.label;
-    opt.label = mux.uniqueLabel(opt.label || 'codex');
+    opt.label = mux.uniqueLabel(opt.label || 'codex', { id: 'codex:' + result.thread.id });
     if (prior && !opt.fork && prior.turns.length > (result.thread.turns || []).length) {
       const combined = new Map(prior.turns.map(t=>[t.id,t]));
       for(const t of result.thread.turns || [])combined.set(t.id,t);
