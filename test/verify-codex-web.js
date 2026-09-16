@@ -56,7 +56,7 @@ let ws;
  await evaluate('document.querySelector("dialog select[name=agent]").value="codex";document.querySelector("dialog input[name=cwd]").value="/tmp/ccbb-codex-control-smoke";document.querySelector("dialog form").requestSubmit()');
  for(let i=0;i<200;i++){if(await evaluate('!document.querySelector("dialog") && !!document.querySelector(".muxv .input-box")'))break;await sleep(100);}
  assert(await evaluate('!document.querySelector("dialog")'),'Codex creation succeeds');
- for(let i=0;i<100;i++){if(await evaluate('document.querySelector(".muxv .sv-foot")?.textContent.includes("Codex")'))break;await sleep(100);}
+ for(let i=0;i<100;i++){if(await evaluate('document.querySelector(".muxv .sv-foot")?.textContent.includes("cost: —")'))break;await sleep(100);}
  assert.deepEqual((await evaluate('window.testErrors')).filter(e=>!e.startsWith('ResizeObserver loop')),[], 'no browser JavaScript errors');
  assert(await evaluate('document.querySelector(".muxv .input-box").dataset.ph.includes("Codex")'),'composer identifies Codex');
  assert(await evaluate('document.querySelector(".muxv .sv-foot").textContent.includes("cost: —")'),'unknown cost is not zero');

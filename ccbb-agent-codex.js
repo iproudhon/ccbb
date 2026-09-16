@@ -477,6 +477,14 @@ function refresh(changed, month) {
   return c.pending;
 }
 function cached(month, changed) { refresh(changed,month); return entry(month).rows.map(x=>({...x, ...nativeActivity(x.nativeId)})); }
+async function subscription(rpc = new CodexRpc()) {
+  try {
+    await rpc.initialize();
+    const data = await rpc.request('account/rateLimits/read', {});
+    return { rateLimits: data.rateLimits, windows: require('./ccbb-common').codexWindows(data.rateLimits) };
+  } finally { rpc.close(); }
+}
+
 async function history(id) {
   const rpc = new CodexRpc();
   try {
@@ -500,5 +508,5 @@ async function renameCodexThread(id, name, rpc = new CodexRpc()) {
   } finally { rpc.close(); }
 }
 
-module.exports = { codexTitle, CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts,
+module.exports = { subscription, codexTitle, CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts,
   normalizeItem, readHistory, cached, refresh, history, error: month => entry(month).error };

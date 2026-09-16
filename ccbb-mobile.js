@@ -250,6 +250,7 @@ body.has-max .panel:not(.max){display:none}
 .pbtn{background:none;border:none;color:var(--ink-soft);font-size:15px;line-height:1;
   min-width:40px;height:40px;border-radius:10px;font-family:inherit;display:flex;
   align-items:center;justify-content:center;cursor:pointer}
+.pbtn[hidden]{display:none}
 .pbtn:active{background:var(--line);color:var(--ink)}
 .pbtn[data-k="term"]{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:13px}
 .pbtn.on{color:var(--accent)}
@@ -1361,6 +1362,33 @@ function openMuxSession(sid, server){
   return p;
 }
 
+function muxStartButton(head, sid, server, agent, onStarted){
+  if (RO) return null;
+  var button = el('button', 'pbtn');
+  button.innerHTML = '&#9654;'; button.title = 'Start mux session'; button.setAttribute('aria-label', button.title);
+  button.hidden = true;
+  head.appendChild(button);
+  button.addEventListener('click', async function(e){
+    e.stopPropagation();
+    var options = {agent:agent, resume:sid};
+    if (agent === 'codex') options.startInactive = true;
+    else {
+      var last = 'claude'; try { last = localStorage.getItem('ccbb.muxBin') || last; } catch(e) {}
+      var bin = window.prompt('Claude binary to resume with', last);
+      if (!bin || !bin.trim()) return;
+      options.bin = bin.trim(); try { localStorage.setItem('ccbb.muxBin', options.bin); } catch(e) {}
+    }
+    button.disabled = true;
+    try {
+      var r = await fetch(apiBase(server)+'/mux/api/sessions', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(options)});
+      var d = await r.json();
+      if (!r.ok && !(r.status === 409 && d.reason === 'running-in-mux')) throw new Error(d.error || 'Could not start mux session');
+      onStarted(); openMuxSession(d.session ? d.session.id : sid, server);
+    } catch(e) { button.disabled = false; toast(e.message); }
+  });
+  return button;
+}
+
 function createMuxPanel(sid, server, snapshot){
   var p = { kind:'mux', sessionId:sid, server:server, state:'min' };
   var API = apiBase(server);
@@ -1412,6 +1440,7 @@ function createMuxPanel(sid, server, snapshot){
   var dirEl = body.querySelector('[data-r="dir"]');
   var whenEl = body.querySelector('[data-r="when"]');
 
+  var resumeButton = snapshot ? muxStartButton(head, sid, server, 'codex', function(){removePanel(p);}) : null;
   var client = window.createMuxView(host, {
     base: API + '/mux',
     snapshot: snapshot || null,
@@ -1425,6 +1454,7 @@ function createMuxPanel(sid, server, snapshot){
       // 'exited' is the case the desktop used to miss too: the child is gone but the
       // socket is not, and "connected" alone painted a finished session green.
       var alive = c.live;
+      if (resumeButton) resumeButton.hidden = alive;
       dotEl.innerHTML = activityGlyph(c.info && c.info.agent, !snapshot);
       dotEl.className = 'dot' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
       var bits = [c.connected ? (c.status || 'idle') : 'disconnected'];
@@ -1573,11 +1603,13 @@ function createSessionPanel(sid, server){
 
   function api(path, opts){ return fetch(API + path, opts); }
 
+  var resumeButton = muxStartButton(head, sid, server, 'claude', function(){removePanel(p);});
   // — header —
   function renderHead(){
     titleEl.textContent = (INFO && INFO.title) || '(untitled)';
     dirEl.textContent = ltr((INFO && INFO.projectPath) || '');
     var live = INFO && INFO.live;
+    if (resumeButton) resumeButton.hidden = !INFO || !!live;
     dotEl.className = 'dot' + (live ? (INFO.liveStatus === 'idle' ? ' idle' : ' live') : '');
     renderWhen();
   }

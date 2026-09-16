@@ -26,7 +26,7 @@ test('shared socket control, ownership, arbitration, external input, and safe de
     if (!m.method) { answers.push(m); return; }
     if (m.method === 'initialized') return;
     if (m.method === 'initialize') return reply({ userAgent: 'codex/0.154.0' });
-    if (m.method === 'thread/loaded/list') return reply({ data: [...threads.keys()], nextCursor: null });
+    if (m.method === 'thread/loaded/list') return reply({ data: [...threads.keys()].filter(id => id !== 'dormant'), nextCursor: null });
     if (m.method === 'thread/start') { const id = 'thread-' + ++n; threads.set(id, { id, cwd: '/tmp', turns: [] }); ws.thread = id; mutations.push(m.method); return reply({ thread: threads.get(id), model: 'test-model' }); }
     if (m.method === 'thread/resume') { ws.thread = p.threadId; return reply({ thread: threads.get(p.threadId), model: 'test-model' }); }
     if (m.method === 'thread/read') return reply({ thread: threads.get(p.threadId) });
@@ -38,6 +38,7 @@ test('shared socket control, ownership, arbitration, external input, and safe de
       reply({ turn }); return;
     }
     if (m.method === 'turn/interrupt') { publish(p.threadId, 'turn/completed', { turn: { id:p.turnId,status:'interrupted',items:[] } }); return reply({}); }
+    if (m.method === 'account/rateLimits/read') return reply({rateLimits:{primary:{usedPercent:24,windowDurationMins:300,resetsAt:1800000000},secondary:{usedPercent:41,windowDurationMins:10080,resetsAt:1800500000}}});
     if (m.method === 'model/list') return reply({data:[{model:'test-model'}]});
     if (m.method === 'thread/name/set' || m.method === 'thread/compact/start') return reply({});
     ws.send(JSON.stringify({id:m.id,error:{code:-32601,message:'unsupported'}}));
@@ -48,9 +49,19 @@ test('shared socket control, ownership, arbitration, external input, and safe de
   assert.equal(mux.sessions.size, 0); assert.equal(mutations.length, 0);
   const session = await mux.create({agent:'codex'});
   assert.equal(session.id,'codex:thread-1');
+  assert.equal(session.state.rateLimits.primary.usedPercent,24);
+  publish(session.nativeId,'account/rateLimits/updated',{rateLimits:{primary:{usedPercent:26,windowDurationMins:300,resetsAt:1800000000}}});
+  await tick(); assert.equal(session.state.rateLimits.primary.usedPercent,26);
   assert.equal(mux.get('thread-1'),session);
   assert.equal(require('../ccbb-mux').pickSession(mux.list(),'thread-1').id,session.id);
   const again = await mux.create({agent:'codex',resume:session.id}); assert.equal(again,session);
+  if (process.platform === 'linux') {
+    threads.set('dormant', {id:'dormant',cwd:'/tmp',turns:[]});
+    await assert.rejects(mux.create({agent:'codex',resume:'dormant'}), /ownership/);
+    const resumed = await mux.create({agent:'codex',resume:'dormant',startInactive:true});
+    assert.equal(resumed.id,'codex:dormant');
+    await resumed.stop(true);
+  }
   const native = await new CodexSocket(process.env.CCBB_CODEX_ENDPOINT).connect();
   await native.request('thread/resume',{threadId:session.nativeId});
   await native.request('turn/start',{threadId:session.nativeId,input:[{type:'text',text:'native'}]});

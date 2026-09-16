@@ -222,3 +222,16 @@ Reviewed against main `399b1c1`, preserving its explicit Claude binary selection
 Validation: 25 Codex regression tests pass; desktop/mobile browser checks pass for creation, persisted rename, activity, history windows, scroll following, and standalone control. `npm pack --dry-run` includes both Codex modules and LICENSE. The existing `test/verify.js` has seven failures in the reviewed tree, all also present among nine failures on untouched main: Read summary, ResizeObserver notification, command-error rendering, current/peak context display, and three seeded-history fixture checks. These are recorded limitations, not passing results. No model turns were submitted during this final review.
 
 The implementation is the desktop/mobile/shared-session release described above, not full bot/export or arbitrary-native-session parity. See TODO.md for the remaining work.
+
+### Session chrome
+
+Codex web/mobile footers and the TUI status line show cost, turns, context, and the
+account's 5h/7d usage windows when available. Agent and model labels are omitted
+from the footer; web/mobile info headers format identifiers such as `gpt-6-astra`
+as `GPT 6 Astra`. Unknown or unsupported quota windows stay absent.
+
+Inactive history pages offer a triangle button to start a mux session. Codex's
+explicit `startInactive` request permits an unloaded thread only on a local Linux
+app server after checking native rollout owners. Ordinary attach and remote
+app-server connections still require a loaded thread. Claude start controls use
+the same triangle on desktop and mobile.

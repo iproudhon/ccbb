@@ -407,7 +407,14 @@ async function createCodexSession(mux, opt) {
   const rpc = await new CodexSocket(await endpoint(opt.bin)).connect();
   const buffered = []; const collect = m => buffered.push(m); rpc.on('message', collect);
   try {
-    if (ref && !opt.fork && !(await loadedThreads(rpc)).has(ref)) throw new Error('Codex thread ownership is unknown: attach only a thread already loaded on the configured app-server');
+    if (ref && !opt.fork && !(await loadedThreads(rpc)).has(ref)) {
+      // The history page explicitly asks to start an inactive thread. Check local
+      // native owners again at click time; never apply a local /proc check remotely.
+      const local = rpc.endpoint.startsWith('unix://') || ['localhost', '127.0.0.1', '[::1]'].includes(new URL(rpc.endpoint).hostname);
+      const inactive = opt.startInactive === true && local && process.platform === 'linux' &&
+        !require('./ccbb-agent-codex').nativeRollouts().has(ref);
+      if (!inactive) throw new Error('Codex thread ownership is unknown: attach a loaded thread or start a verified inactive local thread');
+    }
     if (!/\/0\.154\./.test(rpc.info.userAgent || '')) throw new Error('Codex socket control requires the tested 0.154.x CLI');
     const prior = ref ? await readHistory(rpc, ref) : null;
     const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref } : { cwd: opt.cwd || process.cwd(), ...(opt.model ? { model: opt.model } : {}), ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
@@ -429,6 +436,7 @@ async function createCodexSession(mux, opt) {
     const s = new CodexSession(mux, opt, rpc, result);
     rpc.removeListener('message', collect);
     for (const m of buffered) s.onRpc(m);
+    try { const data = await rpc.request('account/rateLimits/read', {}); s.state.rateLimits = data.rateLimits; } catch {}
     await s.refreshUsage();
     const old = mux.sessions.get(s.id);
     mux.sessions.set(s.id, s);

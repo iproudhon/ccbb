@@ -280,6 +280,8 @@ function webManifest(self) {
 // toggle. The mux client renders ccbb's .input-box and .tool-card markup, so it needs
 // ccbb's behaviour for them — hoisted rather than copied, for the same reason APP_CSS was.
 const SHARED_JS = `
+${require('./ccbb-common').codexWindows.toString()}
+
 // ── shared helpers ────────────────────────────────────────────────────────────
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function trunc(s,n){ s=String(s||''); return s.length>n?s.slice(0,n-1)+'…':s; }
@@ -395,7 +397,7 @@ function fmtUntilAge(ms){
 }
 // "claude-opus-5" → "Opus 5". In SHARED_JS rather than in the desktop app because the
 // phone's mux panel names the model too, and it had no formatter of its own.
-function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown'; var x=m.replace(/^claude-/,'').replace(/-\\d{6,}$/,''); var parts=x.split('-'); var name=(parts.shift()||''); name=name.charAt(0).toUpperCase()+name.slice(1); var ver=parts.join('.'); return ver?name+' '+ver:name; }
+function prettyModel(m){ m=String(m||''); if(!m||m==='unknown')return 'Unknown'; if (/^gpt[- ]/i.test(m)) return m.replace(/^gpt[- ]/i, 'GPT ').replace(/[- ](astra|sol|terra|luna|codex)(?=$|[- ])/gi, function(_, name){ return ' '+name.charAt(0).toUpperCase()+name.slice(1).toLowerCase(); }).replace(/-/g, ' '); var x=m.replace(/^claude-/,'').replace(/-\\d{6,}$/,''); var parts=x.split('-'); var name=(parts.shift()||''); name=name.charAt(0).toUpperCase()+name.slice(1); var ver=parts.join('.'); return ver?name+' '+ver:name; }
 // The composer's tooltips. They are the only place the key bindings are written down
 // for the reader, so both composers say the same thing by sharing the strings.
 var SEND_TIP = 'Send  \u00b7  Ctrl+Enter  \u00b7  Enter inserts a newline  \u00b7  //help for commands';
@@ -1516,7 +1518,7 @@ function viewBtnsHtml(buttons){
     (buttons && buttons.term && !RO ? '<button class="vb-btn term-open" data-act="term" title="Terminal in this view">$_</button>' : '')+
     (buttons && buttons.term && !RO ? '<button class="vb-btn" data-act="termwin" title="Floating terminal for this session">#_</button>' : '')+
     (buttons && buttons.resume && !RO ? '<button class="vb-btn vb-resume" data-act="resume" hidden '+
-      'title="Resume this session in the mux — starts a Claude Code process you can drive from here">&#9654;mux</button>' : '')+
+      'aria-label="Start mux session" title="Resume this session in the mux">&#9654;</button>' : '')+
     (buttons && buttons.orient ? '<button class="vb-btn" data-act="orient" title="Stack horizontally">&#9637;</button>' : '')+
     (buttons && buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
 }
@@ -2617,7 +2619,7 @@ function createMuxSessionView(INFO){
   var headEl = document.createElement('div');
   headEl.className = 'sv-stats';
   headEl.innerHTML = '<span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status show"></div>';
-  el.appendChild(makeViewBar(v, barMain, { close:true, term:!INFO.snapshot, menu:true, headEl:headEl }));
+  el.appendChild(makeViewBar(v, barMain, { close:true, term:!INFO.snapshot, resume:!!INFO.snapshot, menu:true, headEl:headEl }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
   // Renamable, like every other session page. The name lives in the transcript as a
@@ -2665,6 +2667,7 @@ function createMuxSessionView(INFO){
   }
   // Plan windows are an account fact, not a transcript one, so nothing pushes them.
   function fetchSub(){
+    if (INFO.sessionId.indexOf('codex:') === 0) return;
     fetch(API+'/api/subscription').then(function(r){ return r.json(); })
       .then(function(d){ subInfo = (d && d.account) ? d : null; paintHead(); }).catch(function(){});
   }
@@ -2690,12 +2693,26 @@ function createMuxSessionView(INFO){
       // the child is gone, the socket is not, and a plain "connected" reading painted a
       // dead session green while the list beside it already showed it as finished.
       var alive = c.live;
+      var resumeBtn = el.querySelector('.vb-resume');
+      if (resumeBtn) resumeBtn.hidden = alive;
       dotEl.innerHTML = activityGlyph(c.info && c.info.agent, !INFO.snapshot);
       dotEl.className = 'status-dot' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
       dotEl.title = c.connected ? (c.status || '') : 'disconnected';
       paintHead();
     },
   });
+  v.onResume = async function(){
+    if (RO || !INFO.snapshot) return;
+    var btn = el.querySelector('.vb-resume');
+    if (btn) btn.disabled = true;
+    try {
+      var r = await fetch(API+'/mux/api/sessions', {method:'POST', headers:{'content-type':'application/json'},
+        body:JSON.stringify({agent:'codex', resume:INFO.sessionId, startInactive:true})});
+      var d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Could not start mux session');
+      closeView(v); openSession(d.session.id, INFO.server, true, d.session.title);
+    } catch(e) { if(btn)btn.disabled=false; toast(e.message); }
+  };
   wireSessionTerm(v, el, body, INFO, SRV, {});
   // closeView calls this; without it the client's reconnect timer outlives the view and
   // the mux goes on counting a client nobody can see. closeSession goes further: closing
@@ -5532,6 +5549,10 @@ function readBody(req, done) {
 const TOKEN_HEADER = 'x-ccbb-token';
 const VIA_HEADER = 'x-ccbb-via';
 const LEGACY_COOKIE = 'ccbb_token';
+// SameSite=Lax, not Strict: a home-screen app launch (and a link tapped in another app)
+// is a cross-site top-level navigation, and Strict cookies stay home on that request —
+// so the phone's PWA opened on the 401 form every launch once ?token= left the URL.
+// Lax still rides on top-level GETs and is still withheld from cross-site POSTs.
 // Cookies are scoped to the HOST, not the origin — the port is ignored — so several ccbb
 // servers reached as 127.0.0.1:<port> (your own, plus every peer you tunnel to a local
 // port) would all read and overwrite one another's cookie, and logging into one would log
@@ -6109,7 +6130,7 @@ function runWeb(args) {
         if (!ok) { res.writeHead(303, { Location: back + '?login=0' }); return res.end(); }
         res.writeHead(303, {
           'Set-Cookie': [
-            `${tokenCookieName(req)}=${encodeURIComponent(tok)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000`,
+            `${tokenCookieName(req)}=${encodeURIComponent(tok)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`,
             `${LEGACY_COOKIE}=; Path=/; Max-Age=0`,
           ],
           Location: back,
@@ -6132,7 +6153,7 @@ function runWeb(args) {
         // The second cookie expires the pre-port-scoped one, so a browser that already
         // has a shared ccbb_token from another server stops carrying it around.
         'Set-Cookie': [
-          `${tokenCookieName(req)}=${encodeURIComponent(query.get('token'))}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000`,
+          `${tokenCookieName(req)}=${encodeURIComponent(query.get('token'))}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`,
           `${LEGACY_COOKIE}=; Path=/; Max-Age=0`,
         ],
         Location: loc,
@@ -6146,7 +6167,7 @@ function runWeb(args) {
     if (isPage && (query.get('ui') === 'mobile' || query.get('ui') === 'desktop')) {
       const rest = new URLSearchParams(qs); rest.delete('ui');
       res.writeHead(302, {
-        'Set-Cookie': `${UI_COOKIE}=${query.get('ui')}; Path=/; SameSite=Strict; Max-Age=31536000`,
+        'Set-Cookie': `${UI_COOKIE}=${query.get('ui')}; Path=/; SameSite=Lax; Max-Age=31536000`,
         Location: pathname + (rest.toString() ? '?' + rest.toString() : ''),
       });
       return res.end();
@@ -6254,6 +6275,9 @@ function runWeb(args) {
       const session = mux && mux.get(decodeURIComponent(m[1]));
       let body = ''; req.on('data', d => { body += d; if(body.length > 10000) req.destroy(); });
       return req.on('end', async () => { try { const d=JSON.parse(body); if (typeof d.title !== 'string' || !d.title.trim()) throw new Error('Title is required'); if (session) await session.rename(d.title.trim()); else await require('./ccbb-agent-codex').renameCodexThread(decodeURIComponent(m[1]).slice(6), d.title.trim()); pushListDeltas(); send(res,200,{ok:true}); } catch(e){send(res,400,{error:e.message});} });
+    }
+    if (method === 'GET' && pathname === '/api/codex/subscription') {
+      return require('./ccbb-agent-codex').subscription().then(d => send(res, 200, d), () => send(res, 200, {}));
     }
     if (method === 'GET' && (m = pathname.match(/^\/api\/codex\/activity\/([^/]+)$/))) {
       return send(res, 200, require('./ccbb-agent-codex').nativeActivity(decodeURIComponent(m[1])));
@@ -6629,7 +6653,7 @@ function runWeb(args) {
 module.exports = {
   runWeb, DEFAULT_PORT,
   // Page assets the standalone mux page serves too, so both pages get ONE copy.
-  APP_CSS, SHARED_JS, muxHostCss,
+  APP_CSS, SHARED_JS, muxHostCss, appPageHtml,
   // Server-side seam shared with the in-process front-ends (webex/confluence). They
   // subscribe to the event bus and drive sessions through the SAME hook+scrape path.
   onServerEvent, activePrompts,

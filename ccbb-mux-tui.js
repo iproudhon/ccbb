@@ -435,6 +435,7 @@ const HIDE = '\x1b[?25l', SHOW = '\x1b[?25h';
 const ROLLUP = {
   Read:  n => `Read ${n} file${n === 1 ? '' : 's'}`,
   Bash:  n => `Ran ${n} shell command${n === 1 ? '' : 's'}`,
+  'Codex command': n => `Ran ${n} shell command${n === 1 ? '' : 's'}`,
   Glob:  n => `Listed ${n} director${n === 1 ? 'y' : 'ies'}`,
   Grep:  n => `Searched ${n} pattern${n === 1 ? '' : 's'}`,
   Edit:  n => `Made ${n} edit${n === 1 ? '' : 's'}`,
@@ -559,6 +560,7 @@ class TuiClient {
     // paint, which is what lets ctrl+o restate history rather than only affecting
     // what comes next.
     this.entries = [];
+    this.codexMessages = new Map(); // stable item id → current transcript entry
     this.sink = null;          // when set, out() collects instead of painting
     this.scroll = 0;           // lines scrolled up from the bottom; 0 = following
     this.collapsed = true;     // the CLI's default view; ctrl+o expands
@@ -709,6 +711,7 @@ class TuiClient {
     const es = this.entries;
     for (let i = 0; i < es.length; i++) {
       const e = es[i];
+      if (e.t === 'message') { out.push(...this.capture(() => this.renderMessageBody(e.message))); continue; }
       if (e.t !== 'tool') { out.push(...e.lines); continue; }
       if (!this.collapsed || !this.settled(e) || NEVER_COLLAPSE.has(e.block.name) || e.sub) {
         // Re-rendering every tool on every frame costs real CPU once a session
@@ -839,7 +842,9 @@ class TuiClient {
     const st = this.state;
     const cost = st.agent === 'codex' ? (st.cost == null ? 'cost: —' : `~$${Number(st.cost).toFixed(2)}`) : (st.cost ? `$${Number(st.cost).toFixed(2)}` : '$0.00');
     const ctx = st.contextTokens ? `ctx:${Math.round(st.contextTokens / 1000)}k` : null;
-    const bits = [st.model || '?', cost, st.turns != null ? `turns:${st.turns}` : null, ctx].filter(Boolean);
+    const windows = st.agent === 'codex' ? common.codexWindows(st.rateLimits) : {};
+    const plan = [['5h', windows.fiveHour], ['7d', windows.sevenDay]].filter(([, w]) => w).map(([label, w]) => label + ':' + Math.round(w.pct) + '%').join('  ');
+    const bits = [st.agent === 'codex' ? null : st.model || '?', cost, plan, st.turns != null ? `turns:${st.turns}` : null, ctx].filter(Boolean);
     const mode = st.permissionMode || 'manual';
     const mark = mode === 'default' || mode === 'manual' ? '⏸' : '⏵⏵';
     const peers = (this.peers || []).filter(p => p.label !== this.label);
@@ -850,7 +855,7 @@ class TuiClient {
     const head = sl.length ? sl.map(l => '  ' + l) : [A.gray('  ' + bits.join('  '))];
     return [
       ...head,
-      A.gray(st.agent === 'codex' ? '  Codex' : `  ${mark} ${mode} mode`) + who + this.agentTally() +
+      A.gray(st.agent === 'codex' ? ' ' : `  ${mark} ${mode} mode`) + who + this.agentTally() +
         A.gray(this.collapsed ? ' · ctrl+o for detail' : ' · ctrl+o to collapse') +
         (this.scroll ? A.yellow(`  ↑${this.scroll} lines up · End to follow`) : ''),
     ];
@@ -1182,6 +1187,10 @@ class TuiClient {
 
   onSnapshot(m) {
     this.state = m.state || {};
+    if (this.tty && this.state.agent === 'codex') {
+      this.entries = []; this.codexMessages.clear(); this.toolEntries.clear();
+      this.stream = ''; this.streaming = false; this.scroll = 0;
+    }
     this.syncBusy();
     this.statusLine.update(this.state, this.lastUsage);
     this.peers = m.clients || [];
@@ -1204,7 +1213,12 @@ class TuiClient {
     switch (e.kind) {
       case 'init':
         this.state = e.state || this.state;
+        this.statusLine.update(this.state, this.lastUsage);
         this.syncBusy();
+        if (this.state.agent === 'codex') {
+          if (this.state.status !== 'busy') this.endStream();
+          return;
+        }
         return this.out(A.gray(`— ${this.state.model} · ${(this.state.tools || []).length} tools · ${this.state.permissionMode || 'manual'} —`));
       case 'message': return this.renderMessage(e.message);
       case 'delta': {
@@ -1372,6 +1386,45 @@ class TuiClient {
   }
 
   renderMessage(msg) {
+    if (!msg.codexType || !msg.id) return this.renderMessageBody(msg);
+    const previous = this.codexMessages.get(msg.id);
+    if (previous && previous.message.role === msg.role && JSON.stringify(previous.message.blocks) === JSON.stringify(msg.blocks)) return;
+    const tools = msg.blocks.some(b => b.type === 'tool_use');
+    if (this.tty && !tools) {
+      // Codex publishes whole-item replacements, not Claude-style text deltas.
+      // Keep one entry in its original position and reflow it at the current width.
+      if (previous) previous.message = msg;
+      else {
+        const entry = { t: 'message', message: msg };
+        this.codexMessages.set(msg.id, entry);
+        this.entries.push(entry);
+      }
+      return this.paint();
+    }
+    this.codexMessages.set(msg.id, { message: msg });
+    if (!this.tty && msg.role === 'assistant' && !tools) {
+      const text = msg.blocks.map(b => b.text || '').join('\n');
+      const before = previous ? previous.message.blocks.map(b => b.text || '').join('\n') : '';
+      if (!text || text === before) return;
+      // A pipe cannot replace prior output. Append only the new suffix for an
+      // expanding item; an authoritative correction is printed once in full.
+      const suffix = text.startsWith(before) ? text.slice(before.length) : text;
+      const thinking = msg.blocks[0] && msg.blocks[0].type === 'thinking';
+      if (!this.streaming || this.codexStreamId !== msg.id) {
+        this.endStream();
+        this.raw('\n' + (thinking ? A.gray('✻ ') : DOT.done + ' '));
+        this.streaming = true; this.codexStreamId = msg.id;
+      }
+      return this.raw(thinking ? A.gray(suffix) : suffix);
+    }
+    if (!this.tty && tools && msg.blocks.some(b => b.type === 'tool_use' && b.status === 'running')) return;
+    // Tools already have mutable entries. Their identities include the turn so
+    // two different Codex calls that reuse an item id cannot collapse into one.
+    if (tools) msg = { ...msg, blocks: msg.blocks.map(b => b.type === 'tool_use' ? { ...b, id: msg.id + ':' + b.id } : b) };
+    return this.renderMessageBody(msg);
+  }
+
+  renderMessageBody(msg) {
     this.endStream();
     const w = this.width() - 2;
     // Before the role branch on purpose: a command's result arrives as an assistant
@@ -1419,7 +1472,7 @@ class TuiClient {
         // Its result may have landed first — a settled outcome is never regressed.
         const have = b.id && this.toolEntries.get(b.id);
         if (have) {
-          const keep = this.settled(have) ? { status: have.block.status, result: have.block.result, resultMeta: have.block.resultMeta } : {};
+          const keep = !msg.codexType && this.settled(have) ? { status: have.block.status, result: have.block.result, resultMeta: have.block.resultMeta } : {};
           const { runAt, runDesc } = have.block;
           have.block = { ...b, ...keep, runAt, runDesc };
           have.sub = sub; have.w = w; have.gap = gap;
@@ -1708,4 +1761,4 @@ class TuiClient {
   }
 }
 
-module.exports = { runAttach };
+module.exports = { runAttach, TuiClient };

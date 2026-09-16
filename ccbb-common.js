@@ -1880,7 +1880,22 @@ function getCostSummary(periodFilter) {
 }
 
 // ── Exports ────────────────────────────────────────────────────────────────
+function codexWindows(limits) {
+  const windows = {};
+  if (!limits) return windows;
+  for (const key of ['primary', 'secondary']) {
+    const w = limits[key];
+    if (!w || !Number.isFinite(w.usedPercent)) continue;
+    const name = w.windowDurationMins === 300 ? 'fiveHour' : w.windowDurationMins === 10080 ? 'sevenDay' : null;
+    if (!name) continue;
+    const reset = Number.isFinite(w.resetsAt) ? new Date(w.resetsAt * 1000) : null;
+    windows[name] = { pct: w.usedPercent, resetsAt: reset && Number.isFinite(reset.getTime()) ? reset.toISOString() : null };
+  }
+  return windows;
+}
+
 module.exports = {
+  codexWindows,
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
   serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable,

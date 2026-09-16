@@ -1554,10 +1554,11 @@ function footHtml(i, lvl) {
   // list price and these are the figure that actually runs out, so a status line without
   // them is missing the number people are really watching. footWin/subWinTitle come from
   // ccbb's SHARED_JS — the pill is one object, drawn by one function, in both clients.
-  var pills = i.agent !== 'codex' && SUB && SUB.windows && typeof footWin === 'function'
+  var sub = i.agent === 'codex' ? { windows: typeof codexWindows === 'function' ? codexWindows(i.rateLimits || (SUB && SUB.rateLimits)) : {} } : SUB;
+  var pills = sub && sub.windows && typeof footWin === 'function'
     ? (function () {
-        var w = SUB.windows, p = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
-        return p ? '<span class="fwins" title="' + esc(subWinTitle(SUB)) + '">' + p + '</span>' : '';
+        var w = sub.windows, p = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
+        return p ? '<span class="fwins" title="' + esc(subWinTitle(sub)) + '">' + p + '</span>' : '';
       })()
     : '';
   var turns = '<span><b>' + (i.turns || 0) + '</b>' +
@@ -1584,7 +1585,7 @@ function footHtml(i, lvl) {
   var last = fresh[fresh.length - 1];
   if (pin) right.push(pin.text);
   if (last && last !== pin) right.push(last.text);
-  return [i.agent === 'codex' ? '<span>Codex · '+esc(i.model || '')+'</span>' : '', money, pills, turns, ctxStr,
+  return [money, pills, turns, ctxStr,
     right.length ? '<span class="sl-note">' + esc(right.join(' \u00b7 ')) + '</span>' : ''
   ].filter(Boolean).join('');
 }
@@ -1913,11 +1914,11 @@ var CMD_SEQ = 0;
 // fact, ccbb already computes it, and ccbbBase() reaches it from both hosts. Failure is
 // silent and the pills simply do not appear — a machine on an API key has no windows,
 // and neither does a ccbb that is not answering.
-var SUB = null;
+var SUB = null, subTimer = null;
 function loadSub() {
-  fetch(ccbbBase() + '/api/subscription', { headers: TOKEN ? { 'x-ccbb-token': TOKEN } : {} })
+  fetch(ccbbBase() + ((S.info.agent === 'codex' || SESSION.indexOf('codex:') === 0) ? '/api/codex/subscription' : '/api/subscription'), { headers: TOKEN ? { 'x-ccbb-token': TOKEN } : {} })
     .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (d) { if (d && d.account) { SUB = d; paintChrome(); } })
+    .then(function (d) { SUB = d && (d.account || d.rateLimits) ? d : null; paintChrome(); })
     .catch(function () {});
 }
 
@@ -2135,6 +2136,7 @@ function wire() {
     if (compose) { compose.hidden = true; compose.style.display = 'none'; }
   } else connect();
   loadSub();
+  subTimer = setInterval(loadSub, 60000);
   input.focus();
 }
 // A deliberate debug surface. The terminal client could be watched through tmux;
@@ -2161,6 +2163,7 @@ var handle = {
   destroy: function (o) {
     if (o && o.closeSession) send({ op: 'close' });
     dead = true;
+    if (subTimer) clearInterval(subTimer);
     if (scrollFrame != null) cancelAnimationFrame(scrollFrame);
     if (logObserver) logObserver.disconnect();
     if (gapObserver) gapObserver.disconnect();
