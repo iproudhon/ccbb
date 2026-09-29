@@ -49,17 +49,9 @@ let WS; try { WS = require('ws'); } catch {}
 // ── Event bus ────────────────────────────────────────────────────────────────
 // Every server-side event (permission, permission_clear, ask_block, transcript,
 // command output) is emitted through emit(sessionId, obj). Browsers receive it over
-// WebSocket (wsSend, wired by runWeb once the WS server exists); in-process front-ends
-// (webex, confluence, launched via `ccbb web --webex/--confluence`) receive the SAME
-// events by registering via onServerEvent(). This is what lets every front-end share
-// the one hook+scrape permission path instead of each running its own scraper.
+// WebSocket (wsSend, wired by runWeb once the WS server exists).
 let wsSend = () => {};                    // set to the WS fan-out in runWeb
-const busListeners = new Set();           // fn(sessionId, obj)
-function onServerEvent(fn) { busListeners.add(fn); return () => busListeners.delete(fn); }
-function wsBroadcast(sessionId, obj) {
-  wsSend(sessionId, obj);
-  for (const fn of busListeners) { try { fn(sessionId, obj); } catch (e) { console.error('[bus]', e.message); } }
-}
+function wsBroadcast(sessionId, obj) { wsSend(sessionId, obj); }
 
 // ── Custom "//" commands (web variant: returns structured { kind, title, content }) ──
 const awsLogins = new Map();   // sessionId → running `aws sso login` child (one at a time)
@@ -6055,17 +6047,12 @@ function lanAddrs() {
 function runWeb(args) {
   let port = DEFAULT_PORT;
   let host = '127.0.0.1';
-  let withWebex = false, withConfluence = false;
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) port = parseInt(args[++i], 10);
     else if (args[i] === '--host' && args[i + 1]) host = args[++i];
-    else if (args[i] === '--webex') withWebex = true;
-    else if (args[i] === '--confluence') withConfluence = true;
     else if (args[i] === '-h' || args[i] === '--help') {
-      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port] [--host addr] [--webex] [--confluence]\n\n` +
-        `  --host         address to bind (default 127.0.0.1; use 0.0.0.0 to reach it from the LAN)\n` +
-        `  --webex        also run the Webex front-end (shares this server's prompt path)\n` +
-        `  --confluence   also run the Confluence page front-end\n\n` +
+      console.log(`ccbb web — web UI\n\nUsage: ccbb web [-p port] [--host addr]\n\n` +
+        `  --host         address to bind (default 127.0.0.1; use 0.0.0.0 to reach it from the LAN)\n\n` +
         `Forward proxy: configure proxy.enabled and proxy.exitNode in ccbb-config.json\n` +
         `to use this same port for HTTP/HTTPS browser traffic over peer links (docs/proxy.md).\n\n` +
         `Multi-server: set "server".name and "peers" in ${CLAUDE_DIR}/ccbb-config.json to list\n` +
@@ -6497,20 +6484,6 @@ function runWeb(args) {
   setInterval(() => { pollPeers(); pollLinks(); }, 15000).unref();
   setInterval(termReap, 60000).unref();
 
-  // Optional in-process front-ends. They subscribe to the event bus (onServerEvent) and
-  // drive sessions via the exported answer/inject/command helpers, so the permission path
-  // (hooks + scrape) is shared — no separate scraper. Loaded lazily so a missing optional
-  // dep (e.g. webex-node-bot-framework) only affects the flag that needs it.
-  const hostApi = module.exports;
-  if (withConfluence) {
-    try { require('./ccbb-confluence').attachConfluence(hostApi); }
-    catch (e) { console.error('ccbb: --confluence failed:', e.message); }
-  }
-  if (withWebex) {
-    try { require('./ccbb-webex').attachWebex(hostApi); }
-    catch (e) { console.error('ccbb: --webex failed:', e.message); }
-  }
-
   if (WS) {
     const wss = new WS.Server({ noServer: true });
     const sendTo = (sessionId, obj) => {
@@ -6654,11 +6627,6 @@ module.exports = {
   runWeb, DEFAULT_PORT,
   // Page assets the standalone mux page serves too, so both pages get ONE copy.
   APP_CSS, SHARED_JS, muxHostCss, appPageHtml,
-  // Server-side seam shared with the in-process front-ends (webex/confluence). They
-  // subscribe to the event bus and drive sessions through the SAME hook+scrape path.
-  onServerEvent, activePrompts,
-  answerPrompt, answerAsk, runCommand,
-  startWatching, stopWatching, startPaneWatch, stopPaneWatch,
 };
 
 // Handed to the mux client rather than required back out of here: it requires this

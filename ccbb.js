@@ -4,8 +4,6 @@
 //
 //   ccbb ls [options]         column-adaptive session listing for the terminal
 //   ccbb web [-p port]        clean web UI (drive live sessions in tmux)
-//     --webex                 also run the Webex front-end (shares the server)
-//     --confluence            also run the Confluence page front-end
 //
 // `web` is also the multi-server front-end: with "peers" in ccbb-config.json it lists and
 // drives other machines' sessions through the same UI (see docs/peers.md).
@@ -472,8 +470,6 @@ function topHelp() {
 Usage:
   ccbb ls [options]        list sessions in the terminal (see: ccbb ls --help)
   ccbb web [-p port]       start the web UI (default port ${DEFAULT_PORT})
-     [--webex]             ...also run the Webex front-end (one process)
-     [--confluence]        ...also run the Confluence page front-end
                            multi-machine: add "peers" to ccbb-config.json (docs/peers.md)
   ccbb <binary> [-n name]  start a session in the mux and attach a terminal (ccbb claude -h)
                            binary: claude | claude.pass | claude.aws | codex | codex.sh | a path
@@ -481,8 +477,6 @@ Usage:
   ccbb ls --mux            list only the sessions the mux is running
   ccbb stop [name|id]      end a mux session (ccbb stop -h)
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
-  ccbb skel [-o file]      extract privacy-safe session skeletons to one JSON (see: ccbb skel -h)
-  ccbb stats <file...>     render an HTML stats report from skeletons (see: ccbb stats -h)
 
 With no command, 'ls' is assumed.`);
 }
@@ -501,8 +495,6 @@ function main() {
   if (cmd === 'attach') return require('./ccbb-mux-tui').runAttach(rest);
   if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);
   if (cmd === 'web') return require('./ccbb-web').runWeb(rest);
-  if (cmd === 'skel') return require('./ccbb-stats').runSkel(rest);
-  if (cmd === 'stats') return require('./ccbb-stats').runStats(rest);
   console.error(`ccbb: unknown command '${cmd}'. Try: ccbb help`);
   process.exit(1);
 }

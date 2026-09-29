@@ -1,6 +1,6 @@
 'use strict';
 // ── ccbb-common.js ───────────────────────────────────────────────────────────
-// The shared core for every ccbb front-end (CLI `ls`, `web`, `webex`, `confluence`).
+// The shared core for every ccbb front-end (CLI `ls`, `web`, mux).
 // It owns everything the front-ends must agree on so they can't drift:
 //   • Pricing — LiteLLM-sourced model prices, refreshed daily.
 //   • Session discovery + per-session usage/cost stats, with a size+mtime cache.
@@ -23,9 +23,7 @@ const CACHE_FILE = path.join(CLAUDE_DIR, 'ccbb-cache.json');
 
 // Config lives in CLAUDE_DIR/ccbb-config.json; re-read on demand so edits take effect
 // without a restart. Shape (all keys optional except where a front-end needs them):
-//   { "token": "<webex bot token>", "allow": ["you@example.com"],
-//     "commands": { "name": { "run": "…", "kind": "console" } },
-//     "confluence": { "baseUrl": "…", "token": "…", "rootPageId": "…", "allow": […] },
+//   { "commands": { "name": { "run": "…", "kind": "console" } },
 //     "server": { "name": "workbox" }, "peerToken": "…", "readToken": "…",
 //     "peers": [ { "name": "laptop", "url": "http://127.0.0.1:8591", "token": "…" } ] }
 // A MISSING config and a BROKEN one are not the same answer, and the difference decides
@@ -796,111 +794,6 @@ function computeSessionStats(sessionId, opts) {
   return s;
 }
 
-// ── Skeleton extraction (privacy-safe, for stats collection / replay) ─────────
-// Reduces a session to structure + numbers only: NO message text, tool args/results,
-// prompts, cwd, file paths, git branches or titles survive. What's kept is a session
-// fingerprint (SHA over the main transcript's event sequence — used to dedup identical
-// sessions across a collection) plus one numeric row per billable assistant message
-// (token usage, provider, model, response time, local hour). Provider is anthropic vs
-// bedrock (msg_bdrk_ id prefix); a custom Anthropic-compatible endpoint can't be told
-// apart from subscription and reads as 'anthropic'.
-function buildSkeleton(sessionId, opts = {}) {
-  const usagePaths = sessionUsagePaths(sessionId, opts.mainPath);
-  if (!usagePaths.length) return null;
-  const mainPath = usagePaths[0];
-  const responses = [];
-  const models = new Set(), providers = new Set();
-  const fpParts = [];
-  const seenMsgIds = new Set();
-  let version = null, startedAt = null, lastActivity = null;
-  for (const filePath of usagePaths) {
-    const isMain = filePath === mainPath;
-    let text;
-    try { text = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
-    let lastUserTs = null;
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      let d;
-      try { d = JSON.parse(line); } catch { continue; }
-      if (d.sessionId && d.sessionId !== sessionId) continue;
-      if (d.version && !version) version = d.version;
-      if (d.timestamp) {
-        if (!startedAt || d.timestamp < startedAt) startedAt = d.timestamp;
-        if (!lastActivity || d.timestamp > lastActivity) lastActivity = d.timestamp;
-      }
-      // Structural fingerprint — main transcript only, in file order. Records the shape
-      // of the conversation (turn kinds + tool names), never any content.
-      if (isMain && d.message) {
-        const c = d.message.content;
-        if (d.type === 'user') {
-          const isTR = Array.isArray(c) && c.some(b => b && b.type === 'tool_result');
-          fpParts.push(isTR ? 'r' : 'u');
-        } else if (d.type === 'assistant' && Array.isArray(c)) {
-          for (const b of c) {
-            if (!b) continue;
-            if (b.type === 'tool_use') fpParts.push('t:' + (b.name || ''));
-            else if (b.type === 'text') fpParts.push('x');
-            else if (b.type === 'thinking') fpParts.push('k');
-            else fpParts.push(b.type || '?');
-          }
-        }
-      }
-      if (isMain && d.type === 'user' && d.timestamp) {
-        const t = Date.parse(d.timestamp); if (!isNaN(t)) lastUserTs = t;
-      }
-      const dkey = (d.message && d.message.id) ? d.message.id + '|' + (d.requestId || '') : null;
-      if (d.type === 'assistant' && d.message && d.message.usage && !(dkey && seenMsgIds.has(dkey))) {
-        if (dkey) seenMsgIds.add(dkey);
-        const u = d.message.usage;
-        const input = u.input_tokens || 0, output = u.output_tokens || 0;
-        const cacheRead = u.cache_read_input_tokens || 0, cacheWrite = u.cache_creation_input_tokens || 0;
-        const provider = String(d.message.id || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic';
-        const model = d.message.model || 'unknown';
-        models.add(model); providers.add(provider);
-        let respMs = null;
-        if (isMain && d.timestamp && lastUserTs != null) {
-          const r = Date.parse(d.timestamp) - lastUserTs;
-          if (r >= 0) respMs = r;
-        }
-        const ts = d.timestamp || null;
-        responses.push({
-          ts,
-          hour: ts ? new Date(ts).getHours() : null,   // local hour at extraction time
-          model, provider, main: isMain,
-          input, cacheRead, cacheWrite, output,
-          promptTokens: input + cacheRead + cacheWrite,  // context fed in
-          respMs,
-        });
-      }
-    }
-  }
-  if (!responses.length) return null;
-  const fingerprint = crypto.createHash('sha256').update(fpParts.join('|')).digest('hex').slice(0, 16);
-  return {
-    sessionId, fingerprint, version, startedAt, lastActivity,
-    models: [...models], providers: [...providers],
-    responses,
-  };
-}
-
-// Build skeletons for every discoverable session. Returns the collection object that
-// `ccbb skel` serializes to one JSON file.
-function buildAllSkeletons() {
-  const idx = sessionPathIndex(true);
-  const sessions = [];
-  for (const [sessionId, mainPath] of idx) {
-    let sk = null;
-    try { sk = buildSkeleton(sessionId, { mainPath }); } catch {}
-    if (sk) sessions.push(sk);
-  }
-  return {
-    tool: 'ccbb', kind: 'skeleton', schema: 1,
-    generatedAt: new Date().toISOString(),
-    count: sessions.length,
-    sessions,
-  };
-}
-
 // ── Stats cache (size+mtime keyed, persisted to CLAUDE_DIR/ccbb-cache.json) ────
 // Session JSONLs are append-only, so a session's computed stats stay valid until one of
 // its files changes size or mtime. Only unfiltered (all-time) stats are cached. Cached
@@ -1516,15 +1409,6 @@ function askQuestions(input) {
   }));
 }
 
-// Plain-text rendering of an AskUserQuestion input (tool cards, card fallbacks).
-function formatAskText(input) {
-  return askQuestions(input).map(q => {
-    const head = (q.header ? `[${q.header}] ` : '') + q.question + (q.multiSelect ? ' (multi-select)' : '');
-    return head + '\n' + q.options.map(o =>
-      `  ${o.n}. ${o.label}${o.description ? ' — ' + o.description : ''}`).join('\n');
-  }).join('\n\n');
-}
-
 // The AskUserQuestion tool_use whose dialog is open right now, or null. Open means the
 // transcript's LAST entry is the assistant line carrying the tool_use: answering appends
 // its tool_result, and an interrupt appends a user line, so any later entry closes it.
@@ -1712,48 +1596,6 @@ function getSessions(periodFilter, includeEmpty) {
   return { sessions, totals: { totalCost, totalTokens } };
 }
 
-// One row per session that ever had usage — plus every live session, which may have no
-// usage yet — sorted by last activity (desc). The compact listing shape used by the bots'
-// /list picker.
-function listSessions() {
-  maybeRefreshPricing();
-  sessionPathIndex(true);
-  const liveRecs = liveSessionRecords();
-  const rows = [];
-  const seen = new Set();
-  for (const filePath of sessionJsonlPaths()) {
-    const sessionId = path.basename(filePath, '.jsonl');
-    seen.add(sessionId);
-    const rec = liveRecs.get(sessionId) || null;
-    const stats = getSessionStats(sessionId, { mainPath: filePath });
-    if (!stats.totalTokens && !rec) continue;
-    rows.push({
-      sessionId,
-      title: stats.title || (rec ? rec.name : '') || '',
-      live: !!rec,
-      cost: stats.cost,
-      totalTokens: stats.totalTokens,
-      lastActivity: stats.lastActivity || stats.startedAt || null,
-    });
-  }
-  for (const [sessionId, rec] of liveRecs) {
-    if (seen.has(sessionId)) continue;
-    seen.add(sessionId);
-    rows.push({
-      sessionId,
-      title: rec.name || '',
-      live: true,
-      cost: 0,
-      totalTokens: 0,
-      lastActivity: rec.startedAt ? new Date(rec.startedAt).toISOString() : null,
-    });
-  }
-  pruneStatsCache(seen);
-  saveStatsCache();
-  rows.sort((a, b) => String(b.lastActivity || '').localeCompare(String(a.lastActivity || '')));
-  return rows;
-}
-
 // ── Cost summary (all sessions, by provider & model, overall + monthly) ───────
 function newBucket() {
   return {
@@ -1906,10 +1748,9 @@ module.exports = {
   // discovery + stats
   periodKey, sessionJsonlPaths, sessionPathIndex, findSessionJsonl,
   collectJsonl, sessionUsagePaths, computeSessionStats, getSessionStats, getSessionSummary,
-  buildSkeleton, buildAllSkeletons,
   loadStatsCache, saveStatsCache, sessionSig, pruneStatsCache,
   // listing + cost summary
-  getSessions, listSessions, sessionContribution, getCostSummary,
+  getSessions, sessionContribution, getCostSummary,
   // subscription usage windows
   getSubscription, subscriptionAccount, maybeRefreshUsage, USAGE_FILE,
   // liveness + mutation
@@ -1922,7 +1763,7 @@ module.exports = {
   // permission parsing
   PROMPT_RE, OPTION_RE, capturePane, parsePrompt, promptFingerprint,
   // AskUserQuestion
-  askQuestions, formatAskText, openAskEntry,
+  askQuestions, openAskEntry,
   // commands + aws
   BUILTIN_COMMANDS, loadCommands, truncTitle, expandRun, looksLikeDiff, langForFile,
   awsWhoami, awsIdText, awsLoginStream,

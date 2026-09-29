@@ -204,7 +204,7 @@ ignored. Both cases are called out on startup.
   remote session. (Proxying it would return the peer's whole app.)
 
 ## Limitations
-- The CLI (`ccbb ls`) and the Webex/Confluence front-ends are local-only.
+- The CLI (`ccbb ls`) is local-only.
 - A read-only token is per server. It grants nothing on your peers — but neither does it
   stop a peer of yours from being reached with ITS own full token by someone else.
 - One hop: your machine sees the peers *it* configures plus those that link in to it —

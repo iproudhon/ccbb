@@ -2,7 +2,7 @@
 
 Prepared 2026-09-11. Reviewed CCBB at `291da5c` (`main`). Worktree: `/home/sjung/src/ccbb-codex`, branch `codex`.
 
-The goal is to give Codex the same CCBB experience as Claude Code: discover sessions, browse history and usage, start/resume/fork sessions, attach multiple terminal and browser controllers, answer prompts, and reach sessions through the existing mobile, peer, Webex, and Confluence surfaces. This document tracks the integration architecture and remaining work. CLI discovery/usage and the first desktop/mobile Codex integration are implemented (see `Done.md` and the implementation status below). The remaining parity work is tracked explicitly; this document is not a claim that every roadmap item has shipped.
+The goal is to give Codex the same CCBB experience as Claude Code: discover sessions, browse history and usage, start/resume/fork sessions, attach multiple terminal and browser controllers, answer prompts, and reach sessions through the existing mobile and peer surfaces. This document tracks the integration architecture and remaining work. CLI discovery/usage and the first desktop/mobile Codex integration are implemented (see `Done.md` and the implementation status below). The remaining parity work is tracked explicitly; this document is not a claim that every roadmap item has shipped.
 
 **Selected architecture:** preserve CCBB's shared mux protocol and front ends, add a Codex adapter, and connect it to a persistent socket-based `codex app-server`. CCBB TUI/web/mobile clients attach through CCBB mux; native Codex TUIs connect directly to the same app-server and thread. Native-TUI coexistence was verified with the 0.154.0 compatibility probe. Keep Claude as the default for session creation; `ccbb ls` already lists both agents by default.
 
@@ -39,7 +39,7 @@ Validation:
 - `test/probe-codex-control.js` is an opt-in real-account smoke probe. `test/verify-codex-web.js` uses `CHROME`, `CCBB_TEST_URL`, and `CCBB_TEST_THREAD` to test creation and desktop/mobile history using that probe's thread.
 - The older `test/verify-web.js` reports nine identical failures on both this implementation and the unchanged `291da5c` baseline (stale badge/menu/mobile expectations, a text-isolation assertion, and a ResizeObserver notification). They are not reported as passing.
 
-Remaining roadmap work: full CCBB TUI parity for complex Codex request cards, Webex/Confluence control and embed/export parity, full Codex-specific model/effort and sandbox menus, richer image/child-agent rendering, complex MCP elicitation schemas, broader external-endpoint discovery, and a verified thread-scoped shutdown operation. MCP form/URL requests have browser cards; unsupported complex forms offer decline/cancel and explain that another Codex client is required. These limitations do not prevent the implemented desktop/mobile text-and-tool workflow.
+Remaining roadmap work: full CCBB TUI parity for complex Codex request cards, full Codex-specific model/effort and sandbox menus, richer image/child-agent rendering, complex MCP elicitation schemas, broader external-endpoint discovery, and a verified thread-scoped shutdown operation. MCP form/URL requests have browser cards; unsupported complex forms offer decline/cancel and explain that another Codex client is required. These limitations do not prevent the implemented desktop/mobile text-and-tool workflow.
 
 ## What Claude Code already has
 
@@ -47,13 +47,12 @@ The implementation has two distinct paths, both relevant to parity.
 
 | Area | Existing implementation | Codex work |
 | --- | --- | --- |
-| Discovery, history, stats | `ccbb-common.js`: `sessionJsonlPaths`, `getSessions`, `listSessions`, `getSessionHistoryWindow`, `computeSessionStats`, skeleton exports, cached period totals | Introduce agent-aware discovery/history/usage. Existing parsing assumes Claude JSONL records and content blocks. |
+| Discovery, history, stats | `ccbb-common.js`: `sessionJsonlPaths`, `getSessions`, `getSessionHistoryWindow`, `computeSessionStats`, cached period totals | Introduce agent-aware discovery/history/usage. Existing parsing assumes Claude JSONL records and content blocks. |
 | Native terminal sessions | Common reads Claude PID sidecars, finds tmux panes, tails transcripts, injects text, and parses terminal permission dialogs | Establish Codex ownership/liveness separately; Claude sidecars and dialog patterns cannot identify Codex sessions. |
 | Structured sessions | `ccbb-mux.js`: one Claude child per `Session`, bidirectional stream-json, history seeding, controls and lifecycle | Add a Codex app-server driver; retain mux snapshots, event replay and controller arbitration. |
 | Terminal rendering | `ccbb-mux-tui.js` renders normalized messages, tool cards, prompts, status and usage | Add semantic Codex item rendering and agent-specific controls. |
 | Browser/mobile | `ccbb-web.js`, `ccbb-mux-web.js`, `ccbb-mobile.js`: session lists, historical viewers, live mux pages, terminal UI, same-port mux routing | Agent selectors, distinct identities, capability-aware actions and shared Codex rendering. |
 | Remote access | Common peer configuration and web proxy/auth routes | Carry agent identity across peers while preserving read-only versus controlling access. |
-| Webex/Confluence/embed | `ccbb-webex.js`, `ccbb-confluence.js`, `ccbb-embed.js` share common helpers; bot input paths still call tmux helpers | Route history and actions through the adapter; adding a mux driver alone will not finish these integrations. |
 | Hooks | `ccbb-hooks.js` installs Claude prompt-capture hooks | Keep Claude hook installation agent-specific. Structured Codex prompts should come from its driver. |
 | Validation | `test/fake-claude.js`, `test/drive.js`, `test/verify.js`, `test/verify-web.js`, capture/probe scripts | Add a fake Codex protocol peer and run mixed-agent regressions. |
 
@@ -115,7 +114,7 @@ These are proposed boundaries, not a requirement to rewrite the large common mod
 
 Prefer Codex's history API over making its SQLite database or rollout layout CCBB's primary contract. `thread/list` needs explicit source coverage: its default interactive-source filter can omit CCBB-created app-server threads. Handle archive selection and pagination deliberately; default lists should show top-level sessions with children available from their parents.
 
-CCBB's current common history/list functions are synchronous. Introduce an asynchronous service for agent-aware operations and update affected CLI, web and bot callers. For frequently rendered session snapshots, refresh a cache in the background and publish changes; do not block the event loop on a subprocess per row. Keep the current Claude helpers available during migration. List metadata first, load histories on demand, and bound concurrency and memory.
+CCBB's current common history/list functions are synchronous. Introduce an asynchronous service for agent-aware operations and update affected CLI and web callers. For frequently rendered session snapshots, refresh a cache in the background and publish changes; do not block the event loop on a subprocess per row. Keep the current Claude helpers available during migration. List metadata first, load histories on demand, and bound concurrency and memory.
 
 History reads must not resume every discovered thread. Use one normalizer for historical items and live items, keyed by stable thread/turn/item identities. Distinguish unsupported history formats from empty history. The implemented usage listing uses a versioned, read-only rollout fallback with fixture coverage; do not edit Codex's internal storage.
 
@@ -187,11 +186,11 @@ Existing config, cache and mux state live under `CLAUDE_DIR`. Preserve that loca
 
 2. **Extract the agent boundary with Claude preserved.** Add identity and capability contracts, wrap existing Claude behavior, and separate mux transport from controller state. Add asynchronous history-service entry points. Acceptance: existing Claude fake-driver and browser regressions still pass; existing links and default CLI commands work.
 
-3. **Ship Codex browsing and usage.** Implement discovery, history normalization, rename, refresh, metadata, model display and honest usage fields. `ccbb ls --agent codex|claude|all` and CLI usage listing are implemented; unfiltered lists show both, while existing creation defaults to Claude. Include skeleton/stats exports and peer identity. Acceptance: mixed historical sessions render correctly, large histories remain responsive, and missing Codex/login/history support does not hide Claude sessions.
+3. **Ship Codex browsing and usage.** Implement discovery, history normalization, rename, refresh, metadata, model display and honest usage fields. `ccbb ls --agent codex|claude|all` and CLI usage listing are implemented; unfiltered lists show both, while existing creation defaults to Claude. Include peer identity. Acceptance: mixed historical sessions render correctly, large histories remain responsive, and missing Codex/login/history support does not hide Claude sessions.
 
 4. **Ship Codex mux control.** Add proposed `ccbb new --agent codex`, `--resume <id>` and `--fork`, retaining existing attach/stop workflows. Implement streamed items, decisions/questions, interrupt, queue/steer, model/effort controls and lifecycle recovery. Use the shared socket app-server architecture above. Acceptance: CCBB terminal/browser clients and a native Codex TUI can control the same loaded thread; approval races resolve once; reconnect snapshots include externally initiated work and pending prompts. Ownership refusal and simultaneous-resume tests must pass. Closing CCBB clients must preserve native work, and stopping one thread must not stop another thread or an externally owned server.
 
-5. **Complete front-end parity.** Update desktop/mobile creation and filtering, tool cards, menus, usage displays, same-port routes and peer forwarding. Route Webex/Confluence actions through the same control service and adapt embed payloads. Acceptance: each surface can browse, submit, interrupt and answer supported prompts for managed Codex sessions; read-only clients cannot invoke those actions. Validate bot transports with mocks or a configured test environment.
+5. **Complete front-end parity.** Update desktop/mobile creation and filtering, tool cards, menus, usage displays, same-port routes and peer forwarding. Acceptance: each surface can browse, submit, interrupt and answer supported prompts for managed Codex sessions; read-only clients cannot invoke those actions.
 
 6. **Complete external-terminal discovery and fidelity.** Build on the native `codex --remote` coexistence validated in step 4. Add endpoint discovery/configuration, daemon lifecycle guidance and native-TUI rendering comparisons. An arbitrary standalone TUI is attachable only when its owning server is identified and accessible; otherwise expose history browsing and a controlled known-idle resume/fork workflow. Terminal scraping is not the selected shared-session architecture. Acceptance: the supported native-terminal workflow is documented and tested, no duplicate runtime writes the same thread, and file activity is never mistaken for proof of a live controllable session.
 
@@ -207,7 +206,7 @@ Add history fixtures for resume/fork, compaction, child threads, source filters,
 
 Reuse `test/drive.js`, `test/verify.js` and `test/verify-web.js`. The browser scripts currently hard-code a macOS Chrome path; make the executable configurable for Linux and isolate CCBB/Claude/Codex state under temporary directories. Add checks for read-only auth, peer routing, agent-specific controls and empty/unknown cost behavior. Perform a small real-Codex smoke test after the fake protocol tests pass, then compare terminal/browser output against real Codex captures for the important item and prompt types.
 
-Current evidence and remaining scope are recorded in “Implemented web workflow” above. The delivery sequence remains the broader parity roadmap; completed desktop/mobile work must not be mistaken for completed bot/export or arbitrary-terminal parity.
+Current evidence and remaining scope are recorded in “Implemented web workflow” above. The delivery sequence remains the broader parity roadmap; completed desktop/mobile work must not be mistaken for completed arbitrary-terminal parity.
 
 Native Codex activity on Linux is detected from writable rollout descriptors owned by Codex processes, including VS Code sessions outside CCBB’s mux. Turn lifecycle records distinguish working from idle; an old transcript alone does not establish liveness. History views remain read-only for conversation input while their activity indicators poll every three seconds. Process visibility restrictions or platforms without `/proc` prevent this native ownership fallback.
 
@@ -221,7 +220,7 @@ Reviewed against main `399b1c1`, preserving its explicit Claude binary selection
 
 Validation: 25 Codex regression tests pass; desktop/mobile browser checks pass for creation, persisted rename, activity, history windows, scroll following, and standalone control. `npm pack --dry-run` includes both Codex modules and LICENSE. The existing `test/verify.js` has seven failures in the reviewed tree, all also present among nine failures on untouched main: Read summary, ResizeObserver notification, command-error rendering, current/peak context display, and three seeded-history fixture checks. These are recorded limitations, not passing results. No model turns were submitted during this final review.
 
-The implementation is the desktop/mobile/shared-session release described above, not full bot/export or arbitrary-native-session parity. See TODO.md for the remaining work.
+The implementation is the desktop/mobile/shared-session release described above, not full arbitrary-native-session parity. See TODO.md for the remaining work.
 
 ### Session chrome
 
