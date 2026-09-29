@@ -1158,18 +1158,19 @@ not an error) which rows are live, marks them `claude*` / `codex*`, adds the liv
 the period scope would have dropped, and under `-x` shows BIN and CLI (attached
 clients) for them.
 
-**A session has one name: its title is its address.** A separate mux label meant one
-session answered to two names depending on the screen. A name given with `-n` (or a
-rename) is pinned — it is the title and stays. Without `-n` the session is named after
-its directory only until the transcript's own title arrives, which then becomes the
-name `ccbb attach` takes.
+**A session has one name: its title is its address — and the title is the agent's.**
+A separate mux label meant one session answered to two names depending on the screen,
+and a ccbb-owned title drifted from the one Claude Code or Codex showed. So ccbb keeps
+no title of its own. A name given with `-n`, or a rename from any ccbb screen, is
+written to the agent: a `custom-title` record in Claude's transcript (the record
+`/rename` writes; held until the transcript exists), `thread/name/set` for Codex. What
+ccbb shows is read back from there — custom title, else the newest AI title for
+Claude; thread name, else the cleaned preview for Codex. Until the agent has one, the
+`-n` name or the directory's basename stands in as a placeholder.
 
-**Names are addresses, so they have to be unique.** `ccbb attach api-work` has to
-reach one session or none, never "one of these two". A new session takes the
-directory's basename, and a `-2`, `-3` suffix if that name is already **running**.
-Running, not present: an exited session stays in the map so its transcript stays
-browsable, and counting those would walk the name up by one every time you restarted
-in the same directory — `ccbb-mux`, `-2`, `-3`, forever, with nothing running.
+**Titles are not made unique.** A `-2` suffix would make the mux show a name the list
+and the agent never do. A title two sessions share addresses neither: `ccbb attach`
+refuses it and prints the short ids that tell them apart.
 
 Resolution is deliberately narrow. Full id, exact name, or the short id `ccbb ls`
 prints; a live holder beats an exited one, because "attach to foo" means the foo that
@@ -1181,7 +1182,7 @@ The rules live twice, which is not duplication: `Mux.get()` runs over the live m
 inside `ccbb web`, and `pickSession()` runs over the JSON list in the CLI process,
 which has only ever seen HTTP. Both are checked against the same fixtures. The bare
 form — `ccbb attach` with no argument — resolves when exactly one session is
-**running**, for the same reason the suffix ignores exited ones: one live session and
+**running**: an exited session stays browsable, but one live session and
 three remembered ones failing with "several sessions" reads as a bug.
 
 ### Clicking a session that isn't running: resume, but ask first

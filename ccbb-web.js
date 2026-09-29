@@ -37,7 +37,7 @@ const {
   sessionLiveness, pidAlive, renameSession, paneForSession, paneForPids, panesForLiveSessions, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
   loadCommands, expandRun, truncTitle, looksLikeDiff, langForFile,
-  awsIdText, awsLoginStream, tmux, capturePane, parsePrompt, promptFingerprint,
+  awsIdText, tmux, capturePane, parsePrompt, promptFingerprint,
   askQuestions, openAskEntry,
   startTail, stopTail,
 } = common;
@@ -54,7 +54,6 @@ let wsSend = () => {};                    // set to the WS fan-out in runWeb
 function wsBroadcast(sessionId, obj) { wsSend(sessionId, obj); }
 
 // ── Custom "//" commands (web variant: returns structured { kind, title, content }) ──
-const awsLogins = new Map();   // sessionId → running `aws sso login` child (one at a time)
 
 // Run a "//" command for a session. Returns { kind, title, content } (or { error }).
 // cwd defaults to the session's working directory; `cd` returns a new cwd the client
@@ -79,26 +78,6 @@ function runCommand(sessionId, name, args, cwd) {
   }
   if (spec.builtin === 'aws-id') {
     return { kind: 'console', title: '//aws-id', content: awsIdText(spec.cli || 'aws', spec.profile), cwd: baseCwd };
-  }
-  // //aws-login streams: the device URL/code print first, the process then blocks until
-  // the browser login completes. We return an initial frame and push updates over WS.
-  if (spec.builtin === 'aws-login') {
-    if (awsLogins.has(sessionId)) {
-      return { kind: 'console', title: '//aws-login', content: 'Login already in progress…', cwd: baseCwd };
-    }
-    let log = '';
-    const push = () => wsBroadcast(sessionId, { type: 'command', kind: 'console', title: '//aws-login', content: log.trim() || 'Starting AWS SSO login…' });
-    const cli = spec.cli || 'aws', profile = spec.profile;
-    const child = awsLoginStream(
-      cli, profile,
-      chunk => { log += chunk; push(); },
-      (ok, tail) => {
-        awsLogins.delete(sessionId);
-        log += `\n\n${ok ? '✅ Logged in.\n' + awsIdText(cli, profile) : '❌ Login failed.'}`;
-        push();
-      });
-    awsLogins.set(sessionId, child);
-    return { kind: 'console', title: '//aws-login', content: 'Starting AWS SSO login…', cwd: baseCwd };
   }
   // //sh runs the raw argument string as a shell script (no $ARGS/$1 substitution).
   if (spec.builtin === 'sh') {
@@ -2809,7 +2788,7 @@ function createSessionView(INFO){
   });
 
   var ws, reconnectTimer, destroyed = false, connected = false;
-  var msgEls = {}, toolEls = {}, seenUuids = {};
+  var msgEls = {}, thinkEls = {}, toolEls = {}, seenUuids = {};
   // Timing: response time = assistant entry ts − last USER entry ts (prompt/tool_result), anchored
   // to the last user entry since one response spans several assistant entries (thinking/text/tool).
   // Reaction time = typed-prompt ts − last ASSISTANT entry ts. toolStart maps a tool_use id → its
@@ -2990,8 +2969,10 @@ function createSessionView(INFO){
       lineEl = document.createElement('div');
       lineEl.className = 'result-line'+(hist?' hist':'');
       if (msg.id) statEls[msg.id] = lineEl;
-      tAppend(lineEl);
     }
+    // Every line of the message carries the same usage; the figure belongs under the
+    // last of them, so it follows each one down rather than staying under the first.
+    tAppend(lineEl);
     lineEl.innerHTML = line;
     scrollBottom();
   }
@@ -3007,7 +2988,7 @@ function createSessionView(INFO){
       if (!isNaN(ts)) lastAsstTs = ts;
       // record each tool_use's start so its result card can show how long the tool took
       if (!isNaN(ts)) for (var i=0;i<(msg.content||[]).length;i++) { var b=msg.content[i]; if (b.type==='tool_use' && b.id) toolStart[b.id]=ts; }
-      renderAssistant(msg, hist);
+      renderAssistant(msg, hist, entry.uuid);
       if (msg.usage) emitMsgStats(msg, hist, respGap);
     } else if (entry.role === 'user') {
       var youGap = (!isNaN(ts) && lastAsstTs != null) ? ts - lastAsstTs : null;
@@ -3019,8 +3000,13 @@ function createSessionView(INFO){
     }
     repinPermissions();
   }
-  function renderAssistant(msg, hist) {
-    var msgId = msg.id, streaming = !msg.stop_reason;
+  // One API message is written as several transcript lines — one per content block,
+  // each with its own uuid and all sharing message.id (thinking, tool_use, thinking,
+  // text…). Elements are keyed per LINE, so every block lands where it arrived; keyed by
+  // message.id, a second thinking block overwrote the first card in the first card's
+  // place, and one that arrived after the text was drawn below it.
+  function renderAssistant(msg, hist, uuid) {
+    var msgId = uuid || msg.id, streaming = !msg.stop_reason;
     var textParts=[], toolBlocks=[], thinkingParts=[];
     for (var i=0;i<(msg.content||[]).length;i++) {
       var b = msg.content[i];
@@ -3046,10 +3032,10 @@ function createSessionView(INFO){
     scrollBottom();
   }
   function renderThinking(msgId, text, hist) {
-    var id = 'think-'+msgId, card = document.getElementById(id);
+    var card = thinkEls[msgId];
     if (!card) {
       card = document.createElement('div');
-      card.id = id; card.className = 'think-card'+(hist?' hist':'');
+      thinkEls[msgId] = card; card.className = 'think-card'+(hist?' hist':'');
       card.innerHTML = '<div class="think-hdr" onclick="toggleTool(this)"><span class="think-label">&#10024; Thinking</span><span class="tool-toggle">&#9654;</span></div><div class="tool-body"><div class="think-body"></div></div>';
       tAppend(card);
     }
@@ -3414,7 +3400,9 @@ function createSessionView(INFO){
     // LAN and rare; through a tunnel, where a phone drops the socket on every
     // screen lock, this is the difference between a live transcript and one
     // with silent holes in it.
-    ws.onopen = function(){ connected = true; if (!first) loadHistory(true); };
+    // Live lines are held while that fetch is out: drawn now, they would land above the
+    // lines written while the socket was down — a reply's text above its own thinking.
+    ws.onopen = function(){ connected = true; if (!first) { historyLoaded = false; loadHistory(true); } };
     ws.onmessage = function(e){ handleWsMsg(JSON.parse(e.data)); };
     ws.onclose = function(){ if (!destroyed) reconnectTimer = setTimeout(connect, 2000); };
   }
@@ -3430,8 +3418,6 @@ function createSessionView(INFO){
       showPermission(msg); noteUpdate();
     } else if (msg.type==='permission_clear') {
       clearPermission(msg.fp);
-    } else if (msg.type==='command') {
-      showCmd(msg); noteUpdate();
     } else if (msg.type==='ask_block') {
       // Defer until history is in so the card lands at the bottom (after prior turns), not
       // above them. renderAskCard dedups by tool_use id, so a history copy won't double it.
@@ -3750,7 +3736,7 @@ function createSessionView(INFO){
   // — refresh / destroy —
   v.refresh = function(){
     transcript.innerHTML = '';
-    msgEls = {}; toolEls = {}; seenUuids = {}; askCards = {}; lastUserTs = null; lastAsstTs = null; toolStart = {};
+    msgEls = {}; thinkEls = {}; toolEls = {}; seenUuids = {}; askCards = {}; lastUserTs = null; lastAsstTs = null; toolStart = {};
     statEls = {}; statTurnNo = {}; statTurns = 0; statSeenFirst = false;
     historyLoaded = false; pendingTranscript = []; pendingAsk = null; histCount = 0;
     gapEl = null; gapFrom = 0; gapTo = 0; gapLoading = false; insertAnchor = null;
@@ -3800,7 +3786,7 @@ function createSessionView(INFO){
     if (btn) btn.disabled = true;
     fetch(API+'/mux/api/sessions', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ resume: INFO.sessionId, cwd: INFO.projectPath || undefined,
-        label: INFO.title || undefined, pinned: false, bin: bin }) })
+        label: INFO.title || undefined, bin: bin }) })
       .then(function(r){ return r.json().then(function(d){ return { code:r.status, d:d }; }); })
       .then(function(r){
         // 409 running-in-mux is not a failure: the thing the button would have made
@@ -6415,16 +6401,18 @@ function runWeb(args) {
       if (ro) return sendForbidden(res, 'rename a session');
       let body = '';
       req.on('data', c => { body += c; });
-      req.on('end', () => {
+      req.on('end', async () => {
         let title;
         try { title = (JSON.parse(body || '{}').title || '').trim(); } catch { title = ''; }
         if (!title) return send(res, 400, { error: 'title required' });
+        // A mux session renames through itself: the same custom-title record, plus the
+        // name it shows now — and, before its transcript exists, the one it writes later.
+        const sx = mux && mux.sessions && mux.sessions.get(m[1]);
+        if (sx) {
+          try { await sx.rename(title); return send(res, 200, { ok: true }); }
+          catch (e) { return send(res, 400, { error: e.message }); }
+        }
         const r = renameSession(m[1], title);
-        // A mux session reads its name out of the transcript's stats, which are cached
-        // on the file's size and mtime — appending the custom-title line changes both,
-        // so the only thing missing is somebody asking. Without this the page you just
-        // renamed goes on showing the old name until the next turn ends.
-        if (r.ok && mux) { const sx = mux.get(m[1]); if (sx) sx.refreshStats(0); }
         send(res, r.ok ? 200 : 404, r);
       });
       return;

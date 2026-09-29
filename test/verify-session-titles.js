@@ -12,6 +12,7 @@ const { mergeMuxRows } = require('../ccbb-mux-web');
 test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 const preview = '- Busy indicator for claude code sessions';
+const shown = 'Busy indicator for claude code sessions';   // as Codex's own UI shows it
 async function discovery(name) {
   const rows = await getCodexSessions(null, {
     async initialize() {},
@@ -31,42 +32,79 @@ function mux(session) {
   return { list: () => [{ id: 'codex:term', agent: 'codex', title: session.state.title, label: session.label, status: 'busy' }] };
 }
 
-test('an unpinned seed gives way to native name, preview, or the unnamed fallback', () => {
-  for (const [thread, expected] of [
-    [{ name: 'Native title', preview }, 'Native title'],
-    [{ name: null, preview }, preview],
-    [{ name: null, preview: '' }, 'Codex'],
+test('the placeholder gives way to native name, cleaned preview, or stays when there is neither', () => {
+  for (const [thread, expected, native] of [
+    [{ name: 'Native title', preview }, 'Native title', 'Native title'],
+    [{ name: null, preview }, shown, shown],
+    [{ name: null, preview: '' }, 'ccbb: term', 'Codex'],
   ]) {
     const s = live(thread);
     assert.equal(s.state.title, expected);
-    assert.equal(codexTitle(thread), expected);
+    assert.equal(codexTitle(thread), native);
     assert.equal(s.label, expected, 'the title is the address');
     assert.equal(s.state.label, expected);
   }
 });
 
-test('a name a person chose is pinned: native titles do not replace it', async () => {
+test('a rename goes to Codex, and later native titles still replace it', async () => {
   const rpc = new EventEmitter(); rpc.endpoint = 'ws://127.0.0.1:1';
-  const s = new CodexSession({ notifyChange() {} }, { label: 'my name', pinned: true }, rpc,
+  const s = new CodexSession({ notifyChange() {} }, { label: 'my name' }, rpc,
     { thread: { id: 'term', cwd: '/tmp', turns: [], name: 'Native title', preview } });
   s.emit = () => {};
-  assert.equal(s.state.title, 'my name');
-  assert.equal(s.label, 'my name');
-  s.onRpc({ method: 'thread/name/updated', params: { threadId: 'term', threadName: 'Generated later' } });
-  assert.equal(s.state.title, 'my name');
-  // An explicit rename is the person choosing again.
-  rpc.request = async () => ({});
+  assert.equal(s.state.title, 'Native title', 'a placeholder never outranks the native title');
+  const calls = [];
+  rpc.request = async (method, params) => { calls.push([method, params]); return {}; };
   await s.rename('renamed');
+  assert.deepEqual(calls, [['thread/name/set', { threadId: 'term', name: 'renamed' }]]);
   assert.equal(s.label, 'renamed');
-  assert.equal(s.pinned, true);
+  s.onRpc({ method: 'thread/name/updated', params: { threadId: 'term', threadName: 'Renamed in Codex' } });
+  assert.equal(s.state.title, 'Renamed in Codex');
+});
+
+test('a Claude rename is written to the transcript; before it exists it waits and shows', async () => {
+  const { Mux, Session } = require('../ccbb-mux');
+  const common = require('../ccbb-common');
+  const mux = new Mux({});
+  const id = '99999999-8888-4777-8666-555555555555';
+  const s = new Session(mux, { agent: 'fake', sessionId: id, cwd: '/tmp/proj', name: 'my name' });
+  mux.sessions.set(s.id, s);
+  assert.equal(s.state.title, 'my name', '-n shows while the agent has no title');
+  await s.rename('renamed early');
+  assert.equal(s.state.title, 'renamed early');
+  assert.equal(s.pendingName, 'renamed early');
+  const file = path.join(dir, 'projects', '-tmp-proj', id + '.jsonl');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ type: 'ai-title', aiTitle: 'Generated', sessionId: id }) + '\n');
+  s.refreshStats(0); await new Promise(r => setTimeout(r, 50));
+  assert.equal(s.pendingName, '');
+  assert.equal(common.getSessionStats(id, {}).title, 'renamed early', 'the pending name reached the transcript');
+  assert.equal(s.state.title, 'renamed early');
+  // The agent renaming it (Claude's /rename writes the same record) wins from then on.
+  fs.appendFileSync(file, JSON.stringify({ type: 'custom-title', customTitle: 'From /rename', sessionId: id }) + '\n');
+  s.refreshStats(0); await new Promise(r => setTimeout(r, 50));
+  assert.equal(s.state.title, 'From /rename');
+  await s.rename('from ccbb');
+  assert.equal(common.getSessionStats(id, {}).title, 'from ccbb');
+  assert.equal(s.state.title, 'from ccbb');
+  s.rawLog && s.rawLog.end();
+});
+
+test('the newest ai-title is the one shown', () => {
+  const common = require('../ccbb-common');
+  const id = '77777777-8888-4777-8666-555555555555';
+  const file = path.join(dir, 'projects', '-tmp-proj', id + '.jsonl');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, [{ type: 'ai-title', aiTitle: 'First' }, { type: 'ai-title', aiTitle: 'Second' }]
+    .map(x => JSON.stringify({ ...x, sessionId: id }) + '\n').join(''));
+  assert.equal(common.getSessionStats(id, {}).title, 'Second');
 });
 
 test('list and page use the same native title before and after discovery refresh', async () => {
   for (const name of [null, 'Native generated title']) {
     const active = mux(live({ name, preview }));
-    assert.equal(mergeMuxRows({ sessions: [] }, active).sessions[0].title, name || preview);
+    assert.equal(mergeMuxRows({ sessions: [] }, active).sessions[0].title, name || shown);
     for (let n = 0; n < 3; n++) {
-      assert.equal(mergeMuxRows(await discovery(name), active).sessions[0].title, name || preview);
+      assert.equal(mergeMuxRows(await discovery(name), active).sessions[0].title, name || shown);
     }
   }
 });
@@ -78,7 +116,7 @@ test('native first-prompt metadata replaces the unnamed live-page fallback', asy
     return { thread: { id: 'term', name: null, preview } };
   };
   await s.refreshTitle();
-  assert.equal(s.state.title, preview);
+  assert.equal(s.state.title, shown);
 });
 
 test('native rename events win over older metadata reads; clearing a name uses preview', async () => {
@@ -90,7 +128,7 @@ test('native rename events win over older metadata reads; clearing a name uses p
   finish({ thread: { name: 'Old native name', preview } }); await pending;
   assert.equal(s.state.title, 'New native name');
   s.onRpc({ method: 'thread/name/updated', params: { threadId: 'term', threadName: null } });
-  assert.equal(s.state.title, preview);
+  assert.equal(s.state.title, shown);
 });
 
 test('a newer native metadata read wins over a slower old read', async () => {
@@ -104,31 +142,24 @@ test('a newer native metadata read wins over a slower old read', async () => {
 });
 
 test('unattached history and Claude transcript title priority are unchanged', async () => {
-  assert.equal(mergeMuxRows(await discovery(null), { list: () => [] }).sessions[0].title, preview);
+  assert.equal(mergeMuxRows(await discovery(null), { list: () => [] }).sessions[0].title, shown);
   const payload = { sessions: [{ sessionId: 'claude', agent: 'claude', title: 'Saved Claude title' }] };
   mergeMuxRows(payload, { list: () => [{ id: 'claude', agent: 'claude', title: 'Old mux title' }] });
   assert.equal(payload.sessions[0].title, 'Saved Claude title');
 });
 
-test('a Codex reconnect keeps a pinned name without stepping it to name-2', () => {
-  const { Mux } = require('../ccbb-mux');
+test('a title shared by two sessions is refused as an address, never guessed', () => {
+  const { Mux, pickSession } = require('../ccbb-mux');
   const mux = new Mux({});
-  const rpc = new EventEmitter(); rpc.endpoint = 'ws://127.0.0.1:1';
-  const first = new CodexSession(mux, { label: 'api', pinned: true }, rpc,
-    { thread: { id: 'term', cwd: '/tmp', turns: [], name: 'Native', preview } });
-  first.emit = () => {};
-  mux.sessions.set(first.id, first);
-  first.state.status = 'disconnected';
-  // What createCodexSession does for the name on a reconnect, with the old holder present.
-  const held = mux.sessions.get('codex:term');
-  const opt = { };
-  if (held && opt.label == null) { opt.label = held.label; if (opt.pinned == null) opt.pinned = held.pinned; }
-  assert.equal(mux.uniqueLabel(opt.label, { id: 'codex:term' }), 'api');
-  assert.equal(opt.pinned, true);
-  // A different live session with the same name still forces a suffix.
-  const other = new CodexSession(mux, { label: 'api', pinned: true }, rpc,
-    { thread: { id: 'other', cwd: '/tmp', turns: [], name: null, preview: '' } });
-  other.emit = () => {};
-  mux.sessions.set(other.id, other);
-  assert.equal(mux.uniqueLabel('api', { id: 'codex:term' }), 'api-2');
+  const mk = id => { const rpc = new EventEmitter(); rpc.endpoint = 'ws://127.0.0.1:1';
+    const s = new CodexSession(mux, { label: 'api' }, rpc, { thread: { id, cwd: '/tmp', turns: [], name: 'Same', preview } });
+    s.emit = () => {}; mux.sessions.set(s.id, s); return s; };
+  const a = mk('aaaa1111'), b = mk('bbbb2222');
+  assert.equal(a.label, 'Same'); assert.equal(b.label, 'Same', 'no -2 suffix: the list and the page agree');
+  assert.equal(mux.get('Same'), null);
+  assert.equal(mux.get('codex:aaaa1111'), a);
+  const rows = mux.list();
+  assert.match(pickSession(rows, 'Same').error, /aaaa1111.*bbbb2222/);
+  b.state.status = 'exited';
+  assert.equal(mux.get('Same'), a, 'a live holder is unambiguous');
 });

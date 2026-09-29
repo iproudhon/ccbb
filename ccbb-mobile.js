@@ -1597,7 +1597,7 @@ function createSessionPanel(sid, server){
   var HIST_HEAD = 5, HIST_TAIL = 10, HIST_CHUNK = 25;
   var gapEl = null, gapFrom = 0, gapTo = 0, gapLoading = false, gapObserver = null;
   var insertAnchor = null;
-  var seenUuids = {}, msgEls = {}, toolEls = {}, askCards = {}, permEls = {}, toolStart = {};
+  var seenUuids = {}, msgEls = {}, thinkEls = {}, toolEls = {}, askCards = {}, permEls = {}, toolStart = {};
   var lastUserTs = null, lastAsstTs = null;
   var canDrive = false, cmdCwd = '';
 
@@ -1735,7 +1735,7 @@ function createSessionPanel(sid, server){
           if (b.type==='tool_use' && b.id) toolStart[b.id] = ts;
         }
       }
-      renderAssistant(msg, hist);
+      renderAssistant(msg, hist, entry.uuid);
       if (!hist && msg.usage) applyUsage(msg, entry.timestamp);
     } else if (entry.role === 'user') {
       var gap = (!isNaN(ts) && lastAsstTs != null) ? ts - lastAsstTs : null;
@@ -1746,7 +1746,10 @@ function createSessionPanel(sid, server){
     }
     repinPrompts();
   }
-  function renderAssistant(msg, hist){
+  // Keyed per transcript LINE, not message.id: one API message spans several lines
+  // (thinking, tool_use, thinking, text…), and each block belongs where it arrived.
+  function renderAssistant(msg, hist, uuid){
+    var key = uuid || msg.id;
     var textParts=[], toolBlocks=[], thinking=[];
     for (var i=0;i<(msg.content||[]).length;i++) {
       var b = msg.content[i];
@@ -1755,13 +1758,13 @@ function createSessionPanel(sid, server){
       else if (b.type==='tool_use') toolBlocks.push(b);
     }
     var think = thinking.join('').trim();
-    if (think) renderThinking(msg.id, think);
+    if (think) renderThinking(key, think);
     var joined = textParts.join(''), hasText = joined.trim().length > 0;
     if (hasText) {
-      var mEl = msgEls[msg.id];
+      var mEl = msgEls[key];
       if (!mEl) {
         mEl = el('div','msg','<div class="msg-label">Claude</div><div class="msg-body"></div>');
-        msgEls[msg.id] = mEl;
+        msgEls[key] = mEl;
         tAppend(mEl);
       }
       try { mEl.querySelector('.msg-body').innerHTML = marked.parse(joined); }
@@ -1771,10 +1774,10 @@ function createSessionPanel(sid, server){
     scrollBottom();
   }
   function renderThinking(msgId, text){
-    var id = 'think-'+msgId, card = document.getElementById(id);
+    var card = thinkEls[msgId];
     if (!card) {
       card = el('div','think-card');
-      card.id = id;
+      thinkEls[msgId] = card;
       card.innerHTML = '<div class="tool-hdr" data-toggle="1"><span class="think-label">&#10024; Thinking</span>'+
         '<span class="tool-toggle">&#9654;</span></div><div class="tool-body"><div class="think-body"></div></div>';
       tAppend(card);
@@ -2165,7 +2168,8 @@ function createSessionPanel(sid, server){
     var mine = ws;
     // The tail starts at end-of-file, so entries written while we were
     // disconnected are gone from this view unless we go back for them.
-    ws.onopen = function(){ if (ws !== mine) return; connected = true; if (!first) loadHistory(true); };
+    // Live lines wait for the catch-up fetch, or they land above what was missed.
+    ws.onopen = function(){ if (ws !== mine) return; connected = true; if (!first) { historyLoaded = false; loadHistory(true); } };
     ws.onmessage = function(e){
       if (ws !== mine) return;
       var m; try { m = JSON.parse(e.data); } catch(err) { return; }
@@ -2181,7 +2185,6 @@ function createSessionPanel(sid, server){
         }
       } else if (m.type === 'permission') showPermission(m);
       else if (m.type === 'permission_clear') clearPermission(m.fp);
-      else if (m.type === 'command') showCmd(m);
       else if (m.type === 'ask_block') {
         if (!historyLoaded) pendingAsk = m.block;
         else renderAsk(m.block);

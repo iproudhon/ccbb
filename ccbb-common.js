@@ -633,7 +633,8 @@ function computeSessionStats(sessionId, opts) {
       try { d = JSON.parse(line); } catch { continue; }
       if (isMain) {
         if (firstTs === null && d.timestamp) firstTs = d.timestamp;
-        if (d.type === 'ai-title' && aiTitle === undefined) aiTitle = d.aiTitle || '';
+        // The latest of each: Claude Code regenerates its title and shows the newest.
+        if (d.type === 'ai-title') aiTitle = d.aiTitle || '';
         else if (d.type === 'custom-title') customTitle = d.customTitle || '';
       }
       if (d.sessionId !== sessionId) continue;
@@ -804,9 +805,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 10 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 11 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 10, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 11, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 // The cache is a few hundred KB, and a watched server rebuilds its list every time a
@@ -1488,21 +1489,6 @@ function awsIdText(cli, profile) {
   const w = awsWhoami(cli, profile);
   return w.loggedIn ? `${w.userId} logged in.\n${w.raw}` : `not logged in\n${w.raw}`;
 }
-// Spawn `aws sso login --use-device-code` async; URL/code print early then it blocks until
-// the browser login completes. onData streams output; onDone(ok, tail) signals end.
-function awsLoginStream(cli, profile, onData, onDone) {
-  const args = ['sso', 'login', '--use-device-code'];
-  if (profile) args.splice(2, 0, '--profile', profile);
-  const child = spawn(cli, args);
-  let tail = '';
-  const feed = buf => { const s = buf.toString('utf8'); tail = (tail + s).slice(-4000); if (onData) onData(s); };
-  child.stdout.on('data', feed);
-  child.stderr.on('data', feed);
-  child.on('error', e => { if (onDone) onDone(false, `spawn failed: ${e.message}`); });
-  child.on('close', code => { if (onDone) onDone(code === 0, tail.trim()); });
-  return child;
-}
-
 // ── Session listing (shared by `ls` and `web`) ───────────────────────────────
 // Scope a cached all-time stats object to one period (day/week/month) using its byPeriod
 // breakdown — same shape the row builder reads, so no per-session re-read.
@@ -1766,7 +1752,7 @@ module.exports = {
   askQuestions, openAskEntry,
   // commands + aws
   BUILTIN_COMMANDS, loadCommands, truncTitle, expandRun, looksLikeDiff, langForFile,
-  awsWhoami, awsIdText, awsLoginStream,
+  awsWhoami, awsIdText,
 };
 
 // CLI: `node ccbb-common.js --update-pricing` (used by maybeRefreshPricing's child).

@@ -129,7 +129,7 @@ function write(rows) {
 }
 function save(session) {
   const rows = read().filter(r => r.id !== session.nativeId);
-  rows.push({ id: session.nativeId, endpoint: session.rpc.endpoint, identity: socketIdentity(session.rpc.endpoint), label: session.label, pinned: session.pinned });
+  rows.push({ id: session.nativeId, endpoint: session.rpc.endpoint, identity: socketIdentity(session.rpc.endpoint), label: session.label });
   write(rows);
 }
 function forget(id) { write(read().filter(r => r.id !== id)); }
@@ -138,7 +138,7 @@ async function restore(mux) {
     // A new inode is a new server lifetime. Never automatically resume on it.
     if (!b.identity || socketIdentity(b.endpoint) !== b.identity) continue;
     if (process.env.CCBB_CODEX_ENDPOINT && process.env.CCBB_CODEX_ENDPOINT !== b.endpoint) continue;
-    try { await mux.create({ agent: 'codex', resume: b.id, label: b.label, pinned: !!b.pinned }); } catch { /* Historical rows remain available. */ }
+    try { await mux.create({ agent: 'codex', resume: b.id, label: b.label }); } catch { /* Historical rows remain available. */ }
   }
 }
 
@@ -156,7 +156,7 @@ class CodexSession extends Session {
       cost: null, tokens: null, status: 'idle', capabilities: ['submit', 'steer', 'interrupt', 'approve', 'answerQuestion', 'rename', 'compact', 'terminalAttach'] };
     this.cwd = this.state.cwd;
     this.thread = result.thread;
-    this.setTitle(codexTitle(this.thread));
+    this.setTitle(codexTitle(this.thread, ''));
     this.completedTurns = new Set();
     this.inputAuthors = new Map();
     this.items = new Map(); this.queue = []; this.sending = false;
@@ -179,7 +179,7 @@ class CodexSession extends Session {
       if (!this.closing && this.socketIdentity) {
         this.reconnectTimer = setTimeout(() => {
           if (socketIdentity(rpc.endpoint) !== this.socketIdentity) return;
-          this.mux.create({agent:'codex',resume:this.nativeId,label:this.label,pinned:this.pinned}).catch(e=>this.emit('stderr',{text:'Codex reconnect: '+e.message}));
+          this.mux.create({agent:'codex',resume:this.nativeId,label:this.label}).catch(e=>this.emit('stderr',{text:'Codex reconnect: '+e.message}));
         }, 750);
         this.reconnectTimer.unref();
       }
@@ -202,7 +202,10 @@ class CodexSession extends Session {
   put(item, turnId, hist = false, streaming = false) {
     const key = turnId + ':' + item.id;
     this.items.set(key, { item, turnId });
-    if (streaming) {
+    // The first delta of an item claims its place in the list at once; only the updates
+    // after it are coalesced. Held for the timer, a reasoning item whose deltas began
+    // first was pushed after an agentMessage that started within the same 50ms.
+    if (streaming && this.messages.some(x => x.id === 'codex:' + key)) {
       this.deltaItems.set(key,{item,turnId});
       if(!this.deltaTimer)this.deltaTimer=setTimeout(()=>this.flushItems(),50);
       return;
@@ -275,7 +278,7 @@ class CodexSession extends Session {
       if ('threadName' in p || 'name' in p) {
         this._titleVersion = (this._titleVersion || 0) + 1;
         this.thread.name = p.threadName ?? p.name ?? null;
-        if (this.setTitle(codexTitle(this.thread))) this.emit('init', { state: this.state });
+        if (this.setTitle(codexTitle(this.thread, ''))) this.emit('init', { state: this.state });
       }
     } else if (m.method === 'turn/plan/updated' || m.method === 'turn/diff/updated') {
       this.put({ id: m.method, type: 'plan', text: p.diff || (p.plan || []).map(x => x.status + ': ' + x.step).join('\n') }, p.turnId);
@@ -379,7 +382,7 @@ class CodexSession extends Session {
     if (!thread || this.closing || version !== this._titleVersion) return;
     this.thread.name = thread.name;
     this.thread.preview = thread.preview;
-    if (this.setTitle(codexTitle(this.thread))) this.emit('init', { state: this.state });
+    if (this.setTitle(codexTitle(this.thread, ''))) this.emit('init', { state: this.state });
   }
   async refreshUsage() {
     const u = await readCodexUsage(this.thread, null);
@@ -388,8 +391,8 @@ class CodexSession extends Session {
   async rename(name) {
     await this.rpc.request('thread/name/set', { threadId: this.nativeId, name });
     this._titleVersion = (this._titleVersion || 0) + 1;
-    // A person chose this name: it is pinned, so a later generated title cannot undo it.
-    this.thread.name = name; this.setTitle(codexTitle(this.thread), { pin: true });
+    // Codex now holds the name; ccbb shows it the way it shows any native title.
+    this.thread.name = name; this.setTitle(codexTitle(this.thread, ''));
     this.emit('init', { state: this.state });
   }
   async compact() { await this.rpc.request('thread/compact/start', { threadId: this.nativeId }); }
@@ -420,14 +423,11 @@ async function createCodexSession(mux, opt) {
     const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref } : { cwd: opt.cwd || process.cwd(), ...(opt.model ? { model: opt.model } : {}), ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
     if (!result.thread || !result.thread.id) throw new Error('Codex returned no thread identity');
     if (opt.fork && result.thread.id === ref) throw new Error('Codex fork did not return a distinct thread ID');
-    // A reconnect to a thread this mux already holds keeps that session's name and
-    // its pin unless the caller says otherwise — the browser's Reconnect button sends
-    // neither — and must not count the old, disconnected holder of the name as taken,
-    // or every reconnect would step a pinned `api` to `api-2`, `api-2-2`, …
+    // A reconnect to a thread this mux already holds keeps what it was showing until
+    // the thread's own title is read back — the browser's Reconnect button sends none.
     const held = mux.sessions.get('codex:' + result.thread.id);
-    if (held && opt.label == null) { opt.label = held.label; if (opt.pinned == null) opt.pinned = held.pinned; }
-    opt.pinned = opt.pinned != null ? !!opt.pinned : !!opt.label;
-    opt.label = mux.uniqueLabel(opt.label || 'codex', { id: 'codex:' + result.thread.id });
+    if (held && opt.label == null) opt.label = held.label;
+    opt.label = opt.label || 'codex';
     if (prior && !opt.fork && prior.turns.length > (result.thread.turns || []).length) {
       const combined = new Map(prior.turns.map(t=>[t.id,t]));
       for(const t of result.thread.turns || [])combined.set(t.id,t);
@@ -436,6 +436,8 @@ async function createCodexSession(mux, opt) {
     const s = new CodexSession(mux, opt, rpc, result);
     rpc.removeListener('message', collect);
     for (const m of buffered) s.onRpc(m);
+    // -n is a name for the thread itself, set in Codex, not one ccbb keeps beside it.
+    if (opt.name) { try { await s.rename(String(opt.name).trim()); } catch (e) { s.emit('stderr', { text: 'Could not name the Codex thread: ' + e.message }); } }
     try { const data = await rpc.request('account/rateLimits/read', {}); s.state.rateLimits = data.rateLimits; } catch {}
     await s.refreshUsage();
     const old = mux.sessions.get(s.id);

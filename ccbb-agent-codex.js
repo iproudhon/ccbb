@@ -360,7 +360,18 @@ function summarizeCodex(sessions) {
 
 // Native title data is shared by history, discovery and live pages. A mux label
 // is a CCBB address; it must never replace the native name or preview.
-function codexTitle(thread) { return thread.name || thread.preview || 'Codex'; }
+// The preview is the first prompt verbatim; Codex's own UI shows it as plain text cut to
+// 60 characters, so the same thread reads the same in both.
+function cleanPreview(text) {
+  const line = String(text || '').split('\n').map(l => l.trim()).find(Boolean) || '';
+  const plain = line
+    .replace(/^(#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)+/, '')
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__|\*|_|~~|`)(.+?)\1/g, '$2')
+    .replace(/\s+/g, ' ').trim();
+  return plain.length > 60 ? plain.slice(0, 59).trimEnd() + '\u2026' : plain;
+}
+function codexTitle(thread, fallback = 'Codex') { return thread.name || cleanPreview(thread.preview) || fallback; }
 
 // Session discovery
 

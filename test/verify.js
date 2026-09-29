@@ -191,22 +191,21 @@ async function main() {
 
   // ── names ─────────────────────────────────────────────────────────────────
   // A name is an ADDRESS: `ccbb attach api-work` has to reach one session or none,
-  // never "one of these two". Everything here is about that being true — uniqueness
-  // when the name is minted, and resolution that refuses rather than guesses.
+  // never "one of these two". Titles are the agent's and are not made unique, so the
+  // guarantee is in resolution: a shared title is refused rather than guessed.
   console.log('\nnames (how `ccbb attach <name>` finds a session):');
   const { pickSession } = require('../ccbb-mux');
   const nx = new Mux({});
   const mk = o => { const s = nx.create(Object.assign({}, fake, o)); made.push(s.id); return s; };
   const a1 = mk({});
   const a2 = mk({});
-  check('a session is named after its directory', a1.label === 'tmp', a1.label);
-  check('a second session in that directory takes a suffix', a2.label === 'tmp-2', a2.label);
-  // The suffix must not ratchet. Exited sessions stay in the map so their transcript
-  // stays browsable, and counting those would walk the name up by one every time you
-  // restarted in the same directory, forever, with nothing running.
+  check('a session is named after its directory until the agent titles it', a1.label === 'tmp', a1.label);
+  check('a second session in that directory shows the same placeholder, no suffix', a2.label === 'tmp', a2.label);
+  check('a name two sessions share resolves to neither', nx.get('tmp') === null);
   a1.state.status = 'exited';
   const a3 = mk({});
-  check('a name is reclaimed once its holder has exited', a3.label === 'tmp', a3.label);
+  check('once one has exited, the name is ambiguous only among live ones',
+    nx.get('tmp') === null && (a2.state.status = 'exited', nx.get('tmp') === a3));
 
   const named = mk({ label: 'alpha' });
   const longer = mk({ label: 'alphabet' });

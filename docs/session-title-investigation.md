@@ -6,7 +6,9 @@ The previous mux-label override was incorrect. The corrected code uses native
 name/preview data in discovery, history and live pages, and never writes a mux
 label as a native name. (Superseded 2026-09-14: the separate label is gone — the
 title IS the address; an explicit `-n`/rename pins it, otherwise the native title
-becomes the name. See docs/ccbb-mux-plan.md.)
+becomes the name. Superseded again 2026-09-29: nothing is pinned — `-n` and renames are
+written to the agent as its native title, and ccbb only shows a placeholder until the
+agent has one. See docs/ccbb-mux-plan.md.)
 
 ## History reviewed
 

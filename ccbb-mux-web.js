@@ -762,6 +762,15 @@ function provisional(apiId, parent) {
   return S.stream[apiId];
 }
 
+// Streamed entries only live until their real message lands. One that never does — an
+// interrupt mid-reply, a tool_pending for an id that already finished — used to sit
+// after every message forever, and a // command anchored to it sank below every later
+// turn with it. A finished turn is proof nothing is still streaming.
+function clearStream() {
+  for (var k in S.stream) S.final[k] = 1;
+  S.stream = {};
+}
+
 function reset(snap) {
   S.seq = snap.seq || 0;
   // Whose count that seq is. Sent back on the next reconnect so the mux can tell a
@@ -821,7 +830,8 @@ function apply(ev) {
     }
 
     case 'tool_pending': {
-      var pm = provisional(ev.messageId, null);
+      if (!ev.messageId || S.final[ev.messageId]) return;
+      var pm = provisional(ev.messageId, ev.parentToolUseId);
       if (!pm.blocks.some(function (x) { return x && x.id === ev.id; }))
         pm.blocks.push({ type: 'tool_use', id: ev.id, name: ev.name, input: {}, status: 'running' });
       bump(pm);
@@ -891,6 +901,7 @@ function apply(ev) {
       S.info.turnStartedAt = ev.turnStartedAt || null;
       if (ev.exit) S.info.exit = ev.exit;
       setBusy(S.info.status === 'busy');
+      if (S.info.status !== 'busy' && Object.keys(S.stream).length) { clearStream(); return paintAll(); }
       return paintChrome();
 
     // A compaction that ended. Success is visible on its own (the context figure in the
@@ -911,6 +922,7 @@ function apply(ev) {
       return paintBusy();
 
     case 'result': {
+      if (Object.keys(S.stream).length) { clearStream(); paintAll(); }
       S.info.status = 'idle';
       S.info.activity = null;
       setBusy(false);
@@ -957,6 +969,7 @@ function apply(ev) {
     case 'interrupted':
       note('interrupted by ' + (ev.by || 'someone'));
       S.msgs.push(noticeEntry('Interrupted by ' + (ev.by || 'someone'), true));
+      clearStream();
       return paintAll();
     case 'auth':
       // A credential refresh mid-turn is indistinguishable from a hang unless the
@@ -1398,8 +1411,16 @@ function displayList() {
     if (ak && byAfter[ak]) { hold = (hold || []).concat(byAfter[ak]); heldApi = m.apiId; delete byAfter[ak]; }
   });
   flush();
+  // An anchor that is gone (a restart reissued its id, a snapshot no longer reaches it)
+  // falls back to the clock: the card goes before the first message newer than it, not
+  // to the end, where every later turn would slide in above it.
   for (var id in byAfter) orphan = orphan.concat(byAfter[id]);
-  return out.concat(orphan);
+  orphan.forEach(function (c) {
+    var at = -1;
+    if (c.at) for (var i = 0; i < out.length; i++) if (!out[i].command && out[i].ts && out[i].ts > c.at) { at = i; break; }
+    if (at < 0) out.push(c); else out.splice(at, 0, c);
+  });
+  return out;
 }
 
 function paintAll() {
@@ -1602,7 +1623,7 @@ function paintChrome() {
   var bar = Q('.mx-bar');
   if (bar) {
     bar.querySelector('.label').textContent = sessionName(i);
-    bar.querySelector('.label').title = i.agent === 'codex' ? 'Click to rename' : '';
+    bar.querySelector('.label').title = 'Click to rename';
     bar.querySelector('.label').style.cursor = i.agent === 'codex' ? 'text' : '';
     bar.querySelector('.cwd').textContent = i.cwd || '';
     var dot = bar.querySelector('.dot');
@@ -1909,7 +1930,7 @@ document.addEventListener('visibilitychange', onVisible);
 // (where it is just /mux). Passing an explicit option instead would mean BOOT_JS
 // had to compute the same thing and could compute it differently.
 function ccbbBase() { return BASE.replace(/\\/mux$/, ''); }
-var CMD_SEQ = 0;
+var CMD_SEQ = 0, CMD_CWD = '';
 // The plan windows. Read from ccbb rather than from the mux: it is a whole-account
 // fact, ccbb already computes it, and ccbbBase() reaches it from both hosts. Failure is
 // silent and the pills simply do not appear — a machine on an API key has no windows,
@@ -1935,10 +1956,10 @@ function runLocal(raw) {
   // reissued after a reconnect, and a card pinned to one would drift.
   // A reply still streaming is the last thing on screen, so the card goes under it —
   // by API id, since the streamed entry is replaced by the real message when it lands.
-  var after = null, sk = Object.keys(S.stream);
+  var after = null, sk = Object.keys(S.stream).filter(function (k) { return S.stream[k].apiId; });
   if (sk.length) after = 'api:' + S.stream[sk[sk.length - 1]].apiId;
   for (var i = S.msgs.length - 1; i >= 0 && !after; i--) if (S.msgs[i].role !== 'notice') after = S.msgs[i].id;
-  var entry = { id: 'local-' + (++CMD_SEQ), _rev: ++REV, after: after,
+  var entry = { id: 'local-' + (++CMD_SEQ), _rev: ++REV, after: after, at: new Date().toISOString(),
     command: { kind: 'running', name: name, args: args, local: true, stream: 'stdout', text: '' } };
   // The pseudo-message the transcript renders. It is its own shape rather than a
   // faked child message: nothing downstream should mistake this for something the
@@ -1950,9 +1971,10 @@ function runLocal(raw) {
   if (TOKEN) h['x-ccbb-token'] = TOKEN;
   fetch(ccbbBase() + '/api/session/' + encodeURIComponent(SESSION) + '/command',
     { method: 'POST', headers: h, credentials: 'same-origin',
-      body: JSON.stringify({ name: name, args: args, cwd: (S.info && S.info.cwd) || '' }) })
+      body: JSON.stringify({ name: name, args: args, cwd: CMD_CWD || (S.info && S.info.cwd) || '' }) })
     .then(function (r) { return r.json(); })
     .then(function (d) {
+      if (d && d.cwd) CMD_CWD = d.cwd;
       if (d && d.kind === 'clear') { S.cmds = []; nodes = {}; return paintAll(); }
       entry.command.kind = 'out';
       entry.command.stream = d && d.error ? 'stderr' : 'stdout';
@@ -2098,7 +2120,7 @@ function wire() {
   });
   var titleLabel = Q('.mx-bar .label');
   if (titleLabel) titleLabel.addEventListener('click', function(){
-    if (S.info.agent !== 'codex' || Q('.mx-title-input')) return;
+    if (Q('.mx-title-input')) return;
     var input = el('input', 'mx-title-input');
     input.value = sessionName(S.info); titleLabel.hidden = true; titleLabel.after(input);
     input.focus(); input.select();

@@ -260,9 +260,10 @@ class Session {
     this.id = opt.sessionId || (opt.resume && !opt.fork ? opt.resume : uuid());
     this.cwd = opt.cwd || process.cwd();
     this.opt = opt;
-    // Whether the name was chosen by a person (-n, a rename). A pinned name stays put;
-    // an unpinned one is only a seed the transcript's own title replaces. See setTitle.
-    this.pinned = !!opt.pinned;
+    // A name a person gave (-n) is not kept here: it is written to the agent as the
+    // session's real title, and read back like any other. Until the transcript exists
+    // to take it, it waits here and stands in as the placeholder.
+    this.pendingName = String(opt.name || '').trim();
 
     this.seq = 0;
     // Which INCARNATION of this session id this is. seq alone cannot say: a mux that
@@ -284,14 +285,14 @@ class Session {
     this.pendingCmd = null;           // a slash command whose output has not arrived
     this.lastCmd = null;              // the most recent command card, answered or not
     this._compactMeta = null;         // set by compact_boundary, claimed by the summary
-    const name = opt.label || path.basename(this.cwd);
+    const name = this.pendingName || opt.label || path.basename(this.cwd);
     this.state = {
       id: this.id, cwd: this.cwd, status: 'starting',
       // ONE name for this session. The title is what every UI shows AND the address
       // `ccbb attach` takes — a separate mux label meant one session answered to two
-      // different names depending on which screen you were looking at. It starts as
-      // the name given (or the directory), and unless that name was pinned by a person
-      // the transcript's own title takes over as it arrives (setTitle). `label` on the
+      // different names depending on which screen you were looking at. The agent owns
+      // it: this starts as a placeholder (the name given, or the directory) and the
+      // agent's own title replaces it as soon as there is one (setTitle). `label` on the
       // wire is the same string, kept for clients that still read it as the address.
       title: name, label: name,
       bin: opt.bin, model: null, permissionMode: opt.permissionMode || null,
@@ -321,19 +322,34 @@ class Session {
   // The address is the title; see the note on state.title.
   get label() { return this.state.title; }
 
-  // Apply a name. A pinned name (given by a person) ignores titles the transcript or
-  // the agent generate; pin:true is how a person's choice becomes pinned. The name is
-  // made unique among live sessions because it is an address, and a title two sessions
-  // happen to share would make `ccbb attach <name>` ambiguous. Returns whether it changed.
-  setTitle(title, { pin = false } = {}) {
+  // Apply the agent's title. There is no title of ccbb's own to protect: an empty one
+  // leaves the placeholder, anything else replaces whatever is shown. Not made unique —
+  // the list and the transcript must show the same string, and an address two sessions
+  // share is resolved by id instead (Mux.get). Returns whether it changed.
+  setTitle(title) {
     title = String(title || '').trim();
-    if (pin) this.pinned = true;
-    else if (this.pinned || !title) return false;
     if (!title) return false;
-    if (this.mux && this.mux.uniqueLabel) title = this.mux.uniqueLabel(title, this);
     if (title === this.state.title) return false;
     this.state.title = this.state.label = title;
     return true;
+  }
+
+  // A rename goes to the agent, never to a name of ccbb's own: Claude reads the same
+  // custom-title record /rename writes. Before the transcript exists it waits as the
+  // pending name, which is also what shows meanwhile.
+  async rename(title) {
+    title = String(title || '').trim();
+    if (!title) throw new Error('empty title');
+    if (common.findSessionJsonl(this.id)) {
+      const r = common.renameSession(this.id, title);
+      if (r.error) throw new Error(r.error);
+      this.pendingName = '';
+    } else this.pendingName = title;
+    if (this.setTitle(title)) {
+      this.emit('stats', { stats: this.state.stats, title: this.state.title });
+      this.mux.notifyChange();
+    }
+    this.refreshStats(0);
   }
 
   // What --resume does NOT give back. In print/stream-json the child replays nothing:
@@ -440,6 +456,9 @@ class Session {
     if (this._statsTimer) return;
     this._statsTimer = setTimeout(() => {
       this._statsTimer = null;
+      // A -n name reaches the transcript as soon as there is one to write it to.
+      if (this.pendingName && common.findSessionJsonl(this.id) &&
+          common.renameSession(this.id, this.pendingName).ok) this.pendingName = '';
       let st = null;
       try { st = common.getSessionStats(this.id, {}); } catch (e) { return; }
       if (!st) return;
@@ -1161,20 +1180,27 @@ class Session {
 
   onStreamEvent(m) {
     const e = m.event || {};
+    // One open message per stream: the main agent and each subagent (forwarded with
+    // their parent_tool_use_id) interleave, and a single session-wide id let a
+    // subagent's message_start relabel the main reply's deltas mid-stream.
+    const streamKey = m.parent_tool_use_id || '';
+    if (!this._streamMsgIds) this._streamMsgIds = new Map();
+    const streamMsgId = this._streamMsgIds.get(streamKey) || null;
     if (e.type === 'message_start') {
       this.flushDelta();
       // A turn can also begin without passing through submit — a session resumed with
       // one already in flight, a hook that prompts. The child answering is proof enough.
       this.beginTurn();
-      this._streamMsgId = (e.message && e.message.id) || null;
-      return this.emit('turn_start', { messageId: this._streamMsgId, parentToolUseId: m.parent_tool_use_id || null });
+      const id = (e.message && e.message.id) || null;
+      this._streamMsgIds.set(streamKey, id);
+      return this.emit('turn_start', { messageId: id, parentToolUseId: m.parent_tool_use_id || null });
     }
     if (e.type === 'content_block_start') {
       this.flushDelta();
       const cb = e.content_block || {};
       // index and parent ride along so a client can pair the input deltas that follow
       // (keyed by message + block index) with this call, and nest it where it belongs.
-      if (cb.type === 'tool_use') this.emit('tool_pending', { name: cb.name, id: cb.id, messageId: this._streamMsgId,
+      if (cb.type === 'tool_use') this.emit('tool_pending', { name: cb.name, id: cb.id, messageId: streamMsgId,
         index: e.index, parentToolUseId: m.parent_tool_use_id || null });
       return;
     }
@@ -1185,10 +1211,10 @@ class Session {
       if (!text) return;
       const deltaKind = d.type === 'thinking_delta' ? 'thinking'
         : d.type === 'input_json_delta' ? 'input' : 'text';
-      const key = `${this._streamMsgId}|${e.index}|${deltaKind}`;
+      const key = `${streamMsgId}|${e.index}|${deltaKind}`;
       if (this._deltaKey && this._deltaKey !== key) this.flushDelta();
       this._deltaKey = key;
-      this._deltaMeta = { deltaKind, index: e.index, messageId: this._streamMsgId,
+      this._deltaMeta = { deltaKind, index: e.index, messageId: streamMsgId,
         parentToolUseId: m.parent_tool_use_id || null };
       this._deltaBuf = (this._deltaBuf || '') + text;
       if (!this._deltaTimer) this._deltaTimer = setTimeout(() => this.flushDelta(), DELTA_COALESCE_MS);
@@ -1269,25 +1295,11 @@ class Mux {
         e.code = 'EBUSY'; e.reason = 'live-in-terminal'; throw e;
       }
     }
-    o.pinned = o.pinned != null ? !!o.pinned : !!o.label;
-    o.label = this.uniqueLabel(o.label || path.basename(o.cwd || process.cwd()));
     const s = new Session(this, o);
     this.sessions.set(s.id, s);
     this.notifyChange();
     return s;
   }
-  // Names are how a person addresses a session — `ccbb attach api-work` — so they have
-  // to be unique or the address is ambiguous. Uniqueness is checked against LIVE
-  // sessions only: an exited session stays in the map so its transcript stays
-  // browsable, and counting those would ratchet the suffix up every time you restart
-  // in the same directory (ccbb-mux, then -2, then -3, forever, with nothing running).
-  uniqueLabel(want, self = null) {
-    const taken = new Set([...this.sessions.values()]
-      .filter(s => s !== self && !(self && s.id === self.id) && s.state.status !== 'exited').map(s => s.label));
-    if (!taken.has(want)) return want;
-    for (let n = 2; ; n++) if (!taken.has(`${want}-${n}`)) return `${want}-${n}`;
-  }
-
   // Resolve a session the way a person names one: full id, name, or the short id
   // `ccbb ls` prints. Names beat short ids because a name is what the user chose, and
   // a live holder beats an exited one because "attach to foo" means the foo that is
@@ -1300,8 +1312,10 @@ class Mux {
     if (this.sessions.has(ref)) return this.sessions.get(ref);
     const all = [...this.sessions.values()];
     const live = all.filter(s => s.state.status !== 'exited');
-    const named = live.find(s => s.label === ref) || all.find(s => s.label === ref);
-    if (named) return named;
+    // Titles are the agent's and need not be unique; a title that names more than one
+    // session names none of them.
+    const named = [live, all].map(l => l.filter(s => s.label === ref)).find(l => l.length);
+    if (named) return named.length === 1 ? named[0] : null;
     const hits = all.filter(s => s.id.startsWith(ref) || (s.state.nativeId && s.state.nativeId.startsWith(ref)));
     return hits.length === 1 ? hits[0] : null;
   }
@@ -1344,7 +1358,7 @@ class Mux {
         const rpc = await new CodexSocket(await endpoint()).connect();
         try {
           const ids = await loadedThreads(rpc), threads = [];
-          for (const id of ids) { try { const r=await rpc.request('thread/read',{threadId:id}); threads.push({id,title:r.thread.name || r.thread.preview || id,cwd:r.thread.cwd}); } catch {} }
+          for (const id of ids) { try { const r=await rpc.request('thread/read',{threadId:id}); threads.push({id,title:require('./ccbb-agent-codex').codexTitle(r.thread, id),cwd:r.thread.cwd}); } catch {} }
           send(200,{threads,endpoint:rpc.endpoint});
         } finally {rpc.close();}
       })().catch(e=>send(503,{error:e.message})); return;
@@ -1509,13 +1523,16 @@ function pickSession(list, ref, opts = {}) {
   if (!ref) {
     if (live.length === 1) return live[0];
     return { error: live.length
-      ? `several sessions running — name one: ${live.map(s => s.label).join(', ')}`
+      ? `several sessions running — name one: ${live.map(s => `${s.label} (${String(s.nativeId || s.id).replace(/^codex:/, '').slice(0, 8)})`).join(', ')}`
       : 'no sessions running — start one with `ccbb new`' };
   }
   const byId = list.find(s => s.id === ref);
   if (byId) return byId;
-  const named = live.find(s => s.label === ref) || list.find(s => s.label === ref);
-  if (named) return named;
+  // Titles are the agent's and need not be unique: one shared by several sessions is
+  // refused with the ids that tell them apart, never guessed.
+  const named = [live, list].map(l => l.filter(s => s.label === ref)).find(l => l.length);
+  if (named && named.length === 1) return named[0];
+  if (named) return { error: `'${ref}' names ${named.length} sessions — use an id: ${named.map(s => String(s.nativeId || s.id).replace(/^codex:/, '').slice(0, 8)).join(', ')}` };
   const hits = list.filter(s => s.id.startsWith(ref) || (s.nativeId && s.nativeId.startsWith(ref)));
   if (hits.length === 1) return hits[0];
   if (opts.prefix) {
@@ -1582,7 +1599,7 @@ function parseNew(args) {
     else if (a === '-C' || a === '--cwd') o.cwd = path.resolve(args[++i]);
     else if (a === '-b' || a === '--bin') o.bin = args[++i];
     else if (a === '-m' || a === '--model') o.model = args[++i];
-    else if (a === '-n' || a === '--name' || a === '--label') o.label = args[++i];
+    else if (a === '-n' || a === '--name' || a === '--label') o.name = args[++i];
     else if (a === '--permission-mode') o.permissionMode = args[++i];
     else if (a === '--agent') o.agent = args[++i];
     else if (a === '--resume') o.resume = args[++i];
@@ -1594,7 +1611,7 @@ function parseNew(args) {
     // with whatever -b named, and the failure surfaced as a session that never started.
     else return { error: a.startsWith('-') ? `unknown option '${a}'` : `unexpected argument '${a}'` };
   }
-  for (const k of ['cwd', 'bin', 'model', 'label', 'permissionMode', 'agent', 'resume', 'effort'])
+  for (const k of ['cwd', 'bin', 'model', 'name', 'label', 'permissionMode', 'agent', 'resume', 'effort'])
     if (k in o && (o[k] == null || String(o[k]).startsWith('-'))) return { error: `option for ${k} is missing its value` };
   return o;
 }
