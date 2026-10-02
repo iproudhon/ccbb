@@ -175,7 +175,7 @@ class CodexSession extends Session {
       this.state.status = 'disconnected'; this.state.activity = null;
       this.queue = []; this.pending.clear();
       this.epoch = crypto.randomUUID(); this.events = []; this.seq = 0;
-      this.broadcast(this.snapshot()); this.mux.notifyChange();
+      for (const c of this.clients) c.send(this.snapshot(c.window)); this.mux.notifyChange();
       if (!this.closing && this.socketIdentity) {
         this.reconnectTimer = setTimeout(() => {
           if (socketIdentity(rpc.endpoint) !== this.socketIdentity) return;

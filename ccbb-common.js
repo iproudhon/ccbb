@@ -1078,6 +1078,122 @@ function injectToPane(pane, text, buffer) {
   tmux(['send-keys', '-t', pane, 'Enter']);
 }
 
+// ── Windowed transcripts ──────────────────────────────────────────
+// A long session opened in a browser used to ship whole: a resumed mux session full of
+// screenshots was a 7.7MB snapshot for a page that shows its last 25 turns collapsed.
+// So the opening load is the head and the tail, the middle is paged in as the reader
+// scrolls up, and a big tool result is replaced by what its collapsed card shows until
+// the card is opened. Shared by the mux (snapshot over its socket), the read-only Codex
+// history (over HTTP) and the plain transcript view.
+const ELIDE_RESULT_BYTES = 8192;
+
+// `win=5,25`: head and tail message counts.
+function parseWindow(v) {
+  const m = /^(\d+),(\d+)$/.exec(String(v || ''));
+  // At least one of each: the gap is placed after the last head message, so a window
+  // with no head would leave the omitted middle with nowhere to be loaded into.
+  return m ? { head: Math.max(1, Math.min(+m[1], 1000)), tail: Math.max(1, Math.min(+m[2], 1000)) } : null;
+}
+
+// Same flattening the mux web client's txt() does, so a summary made here reads the same.
+function resultText(v) {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.map(b => typeof b === 'string' ? b : (b && b.type === 'text' ? b.text : '[' + ((b && b.type) || 'block') + ']')).join('\n');
+  if (typeof v === 'object' && v.type === 'text') return v.text || '';
+  return JSON.stringify(v, null, 2);
+}
+
+// A mux tool_use block with its result swapped for what the collapsed card's header
+// needs: the line count, the first line, an edit's +/- counts, and the few meta fields
+// the summary and the background check read. The card fetches the rest when opened.
+// Only the stub is cached, never the block copy: the mux keeps updating a settled block
+// in place (a background run's outcome lands on blk.bg long after its result), and a
+// cached copy would freeze those for every client that attached later.
+const _lite = new WeakMap();   // block → { result, meta, stub } — results are replaced, not mutated
+function liteBlock(b) {
+  if (!b || b.type !== 'tool_use' || (b.result == null && b.resultMeta == null)) return b;
+  let hit = _lite.get(b);
+  if (!hit || hit.result !== b.result || hit.meta !== b.resultMeta) {
+    hit = { result: b.result, meta: b.resultMeta, stub: liteStub(b) };
+    _lite.set(b, hit);
+  }
+  return hit.stub ? { ...b, result: null, resultMeta: hit.stub.meta, elided: hit.stub.elided } : b;
+}
+function liteStub(b) {
+  const bytes = JSON.stringify(b.result || null).length + JSON.stringify(b.resultMeta || null).length;
+  if (bytes > ELIDE_RESULT_BYTES) {
+    const t = resultText(b.result), lines = t.split('\n').filter(x => x.trim());
+    const meta = b.resultMeta && typeof b.resultMeta === 'object' && !Array.isArray(b.resultMeta) ? b.resultMeta : {};
+    let add = 0, del = 0;
+    for (const h of meta.structuredPatch || []) for (const l of h.lines || []) {
+      if (l[0] === '+') add++; else if (l[0] === '-') del++;
+    }
+    const stub = {};
+    if (meta.isAsync) stub.isAsync = meta.isAsync;
+    if (meta.file && meta.file.numLines != null) stub.file = { numLines: meta.file.numLines };
+    return { meta: stub,
+      elided: { bytes, lines: lines.length, first: (lines[0] || '').slice(0, 200), add, del,
+                background: /^Command running in background/.test(t) } };
+  }
+  return null;
+}
+function liteMessage(m) {
+  if (!m || !Array.isArray(m.blocks) || !m.blocks.some(b => b && b.type === 'tool_use')) return m;
+  const blocks = m.blocks.map(liteBlock);
+  return blocks.every((b, i) => b === m.blocks[i]) ? m : { ...m, blocks };
+}
+
+// The head and tail of a mux message list, results elided, with where the gap sits.
+function windowMessages(messages, win) {
+  const n = messages.length;
+  if (n <= win.head + win.tail) return { messages: messages.map(liteMessage), omitted: 0 };
+  return {
+    messages: messages.slice(0, win.head).concat(messages.slice(n - win.tail)).map(liteMessage),
+    omitted: n - win.head - win.tail,
+    omittedAfter: win.head ? messages[win.head - 1].id : null,
+  };
+}
+
+// Up to `limit` messages just above `before` and below `after` (the window's head).
+// Ids rather than indices: the mux's list is capped and evicts from the front.
+function sliceMessages(messages, after, before, limit) {
+  const b = messages.findIndex(x => x.id === before);
+  if (b < 0) return { before, messages: [], remaining: 0 };
+  const a = after ? messages.findIndex(x => x.id === after) + 1 : 0;
+  const from = Math.max(a, b - Math.max(1, limit | 0));
+  return { before, messages: messages.slice(from, b).map(liteMessage), remaining: Math.max(0, from - a) };
+}
+
+function messageToolResult(messages, toolUseId) {
+  for (const m of messages) for (const b of m.blocks || [])
+    if (b && b.type === 'tool_use' && b.id === toolUseId) return { toolUseId, result: b.result, meta: b.resultMeta || null };
+  return { toolUseId, missing: true };
+}
+
+// The plain transcript view's counterpart: a tool_result keeps only its text (the view
+// never drew anything else — a screenshot was half a megabyte of base64 it threw away),
+// and text past ELIDE_RESULT_BYTES is cut, with the full length on the block so the
+// card can offer the rest.
+function liteEntry(e) {
+  const c = e && e.message && e.message.content;
+  const heavy = b => b && b.type === 'tool_result' && (typeof b.content !== 'string' || b.content.length > ELIDE_RESULT_BYTES);
+  if (!Array.isArray(c) || !c.some(heavy)) return e;
+  const content = c.map(b => {
+    if (!heavy(b)) return b;
+    const t = toolResultText(b.content);
+    if (t.length <= ELIDE_RESULT_BYTES) return { ...b, content: t };
+    return { ...b, content: t.slice(0, ELIDE_RESULT_BYTES), elided: t.length };
+  });
+  return { ...e, message: { ...e.message, content } };
+}
+// What the transcript view draws of a tool_result: its text parts, joined as it joins them.
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter(b => b && b.type === 'text').map(b => b.text).join('');
+  return '';
+}
+
 // ── Transcript / history ──────────────────────────────────────────
 // Reduce a raw JSONL entry to a display entry, or null if it isn't a shown turn.
 function transcriptEntry(d, opts) {
@@ -1113,30 +1229,112 @@ function getSessionCwd(sessionId) {
   if (live.cwd) return live.cwd;
   const filePath = findSessionJsonl(sessionId);
   if (!filePath) return null;
-  let text;
-  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    try { const d = JSON.parse(line); if (d.cwd) return d.cwd; } catch {}
-  }
-  return null;
+  // The first line that has a cwd is near the top; read the start rather than the whole
+  // file, and only fall back to all of it when the start has none.
+  const scan = text => {
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try { const d = JSON.parse(line); if (d.cwd) return d.cwd; } catch {}
+    }
+    return null;
+  };
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    let head;
+    try { const b = Buffer.alloc(256 * 1024); head = b.subarray(0, fs.readSync(fd, b, 0, b.length, 0)); }
+    finally { fs.closeSync(fd); }
+    // A short read is the whole file, last line and all; a full one may end mid-line.
+    const whole = head.length < 256 * 1024;
+    const hit = scan((whole ? head : head.subarray(0, head.lastIndexOf(0x0a) + 1)).toString('utf8'));
+    if (hit || whole) return hit;
+    return scan(fs.readFileSync(filePath, 'utf8'));
+  } catch { return null; }
 }
 
 // Full transcript for a session: each user/assistant entry, normalized via transcriptEntry.
+// Parsed once per file and then only as it grows: opening a session view used to parse
+// the whole JSONL three times over (the window, the socket's open-ask check, and again
+// on every page of older history), which on a 29MB session is half a second each.
+const _hist = new Map();   // filePath → { ino, offset, entries, mark, mtimeMs }, most recently used last
+const HIST_CACHE_MAX = 6;
+// Parsed entries weigh roughly what their file does, so the cache is also capped by the
+// bytes it has parsed: half a dozen 29MB sessions would otherwise all stay resident.
+const HIST_CACHE_BYTES = 128 * 1024 * 1024;
+// A sample of the parsed region: its first bytes, eight evenly spaced slices and the
+// bytes just before the cursor. The transcripts are append-only, so a rewrite is the
+// exception: a new inode or a shorter file is caught outright, a write that changed the
+// file without growing it is caught by its mtime, and this covers the one left — a
+// rewrite that also grew it. Reading all of it back would cost what the cache saves.
+const MARK_LEN = 64;
+function historyMark(fd, offset) {
+  const parts = [];
+  const at = [0];
+  for (let k = 1; k < 8; k++) at.push(Math.floor(offset * k / 8));
+  at.push(Math.max(0, offset - MARK_LEN));
+  for (const p of at) {
+    const n = Math.min(MARK_LEN, offset - p);
+    if (n <= 0) continue;
+    const b = Buffer.alloc(n);
+    parts.push(b.subarray(0, fs.readSync(fd, b, 0, n, p)));
+  }
+  return Buffer.concat(parts);
+}
+function historyEntries(filePath) {
+  let st;
+  try { st = fs.statSync(filePath); } catch { return []; }
+  let c = _hist.get(filePath);
+  if (c && (c.ino !== st.ino || st.size < c.offset)) c = null;   // replaced or truncated
+  if (c && c.offset && st.size === c.offset) {
+    if (st.mtimeMs === c.mtimeMs) return c.entries;
+    c = null;   // touched without growing: not an append, so a rewrite — start over
+  }
+  let fd;
+  try { fd = fs.openSync(filePath, 'r'); } catch { return c ? c.entries : []; }
+  try {
+    // Rewritten in place to the same length or longer: the parsed region no longer
+    // reads the way it did, so start over.
+    if (c && c.offset && !historyMark(fd, c.offset).equals(c.mark)) c = null;
+    if (!c) c = { ino: st.ino, offset: 0, entries: [], mark: null, mtimeMs: 0 };
+    let buf = Buffer.alloc(Math.max(0, st.size - c.offset));
+    buf = buf.subarray(0, buf.length ? fs.readSync(fd, buf, 0, buf.length, c.offset) : 0);
+    // Only whole lines: the writer may be mid-line, and that line is read next time.
+    const end = buf.lastIndexOf(0x0a) + 1;
+    for (const line of buf.subarray(0, end).toString('utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let d;
+      try { d = JSON.parse(line); } catch { continue; }
+      const e = transcriptEntry(d);
+      if (e) c.entries.push(e);
+    }
+    if (end) { c.offset += end; c.mark = historyMark(fd, c.offset); }
+    c.mtimeMs = st.mtimeMs;
+  } catch { return c ? c.entries : []; }
+  finally { fs.closeSync(fd); }
+  _hist.delete(filePath);
+  _hist.set(filePath, c);
+  let bytes = 0;
+  for (const v of _hist.values()) bytes += v.offset;
+  while (_hist.size > 1 && (_hist.size > HIST_CACHE_MAX || bytes > HIST_CACHE_BYTES)) {
+    const [k, v] = _hist.entries().next().value;
+    _hist.delete(k); bytes -= v.offset;
+  }
+  return c.entries;
+}
 function getSessionHistory(sessionId) {
   const filePath = findSessionJsonl(sessionId);
-  if (!filePath) return [];
-  let text;
-  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return []; }
-  const entries = [];
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
-    const e = transcriptEntry(d);
-    if (e) entries.push(e);
+  return filePath ? historyEntries(filePath).slice() : [];
+}
+
+// The full text of one tool_result, for a card whose window copy was cut short.
+function getSessionToolResult(sessionId, toolUseId) {
+  const filePath = findSessionJsonl(sessionId);
+  const entries = filePath ? historyEntries(filePath) : [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const c = entries[i].message.content;
+    for (const b of c) if (b && b.type === 'tool_result' && b.tool_use_id === toolUseId)
+      return { toolUseId, content: toolResultText(b.content) };
   }
-  return entries;
+  return { toolUseId, missing: true };
 }
 
 // A window onto the transcript, so a front-end need not download a session's whole life to
@@ -1146,23 +1344,24 @@ function getSessionHistory(sessionId) {
 //   { head, tail }   the opening and the latest entries, with the gap between them
 //   { from, to }     an explicit slice, [from, to)
 //
-// The file is still read and normalized in full — an entry's index isn't knowable without
-// normalizing it, since transcriptEntry drops some lines. The saving is the response body,
-// which on a long session is where the megabytes are.
+// The file is read through historyEntries' cache, so only what was appended since the
+// last call is parsed. Tool results are trimmed as liteEntry says.
 function getSessionHistoryWindow(sessionId, opts = {}) {
-  const all = getSessionHistory(sessionId);
+  const filePath = findSessionJsonl(sessionId);
+  const all = filePath ? historyEntries(filePath) : [];
   const total = all.length;
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+  const lite = a => a.map(liteEntry);
   if (opts.from != null || opts.to != null) {
     const from = clamp(Number(opts.from) || 0, 0, total);
     const to = clamp(opts.to == null ? total : Number(opts.to), from, total);
-    return { total, from, entries: all.slice(from, to) };
+    return { total, from, entries: lite(all.slice(from, to)) };
   }
   const head = clamp(Number(opts.head) || 0, 0, total);
   const tail = clamp(Number(opts.tail) || 0, 0, total);
   // Overlapping window means the whole thing fits: send it as one run, no gap.
-  if (head + tail >= total) return { total, from: 0, entries: all };
-  return { total, head: all.slice(0, head), tailFrom: total - tail, tail: all.slice(total - tail) };
+  if (head + tail >= total) return { total, from: 0, entries: lite(all) };
+  return { total, head: lite(all.slice(0, head)), tailFrom: total - tail, tail: lite(all.slice(total - tail)) };
 }
 
 // Full transcript for one subagent (Agent/Task) run, to nest under its parent tool card.
@@ -1743,7 +1942,9 @@ module.exports = {
   pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
   tmux, paneForSession, paneForPids, panesForLiveSessions, isCcbbGroupSession, injectToPane,
-  transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow,
+  transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow, getSessionToolResult,
+  // windowed transcripts
+  parseWindow, windowMessages, sliceMessages, messageToolResult, liteMessage,
   getSubagentHistory, getSessionInfo,
   startTail, stopTail, watchSessionChanges,
   // permission parsing

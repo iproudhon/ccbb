@@ -511,6 +511,38 @@ async function history(id) {
   } finally { rpc.close(); }
 }
 
+// A history view pages its middle in and fetches elided results as it is read, and each
+// of those would otherwise be a fresh app-server and a full thread read. So a thread
+// read for a view is held briefly; a newly opened view (no paging params) reads afresh.
+const histories = new Map();   // id → { at, promise, done }
+const HISTORY_TTL_MS = 10 * 60 * 1000;
+function heldHistory(id, fresh) {
+  const h = histories.get(id);
+  // A read still in flight is as fresh as it gets: two views opening the thread at once
+  // (the desktop and the phone) share it rather than each starting an app-server.
+  if (h && (!h.done || (!fresh && Date.now() - h.at < HISTORY_TTL_MS))) return h.promise;
+  const held = { at: Date.now(), promise: history(id), done: false };
+  histories.delete(id);
+  histories.set(id, held);
+  if (histories.size > 4) histories.delete(histories.keys().next().value);
+  held.promise.then(() => { held.done = true; held.at = Date.now(); },
+    () => { if (histories.get(id) === held) histories.delete(id); });
+  return held.promise;
+}
+// What GET /api/codex/history/<id> answers: the whole snapshot with no params; with
+// `win`, its head and tail; with `before` (and `after`, `limit`), a page of the middle;
+// with `tool`, one elided result.
+async function historyView(id, q) {
+  const common = require('./ccbb-common');
+  const win = common.parseWindow(q.get('win'));
+  if (!win && !q.has('before') && !q.has('tool')) return history(id);
+  const snap = await heldHistory(id, !!win);
+  if (q.has('tool')) return { op: 'tool_result', ...common.messageToolResult(snap.messages, q.get('tool')) };
+  if (q.has('before')) return { op: 'history', ...common.sliceMessages(snap.messages, q.get('after') || null, q.get('before'), Number(q.get('limit')) || 25) };
+  const w = common.windowMessages(snap.messages, win);
+  return { ...snap, messages: w.messages, ...(w.omitted ? { omitted: w.omitted, omittedAfter: w.omittedAfter } : {}) };
+}
+
 async function renameCodexThread(id, name, rpc = new CodexRpc()) {
   try {
     await rpc.initialize();
@@ -520,4 +552,4 @@ async function renameCodexThread(id, name, rpc = new CodexRpc()) {
 }
 
 module.exports = { subscription, codexTitle, CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts,
-  normalizeItem, readHistory, cached, refresh, history, error: month => entry(month).error };
+  normalizeItem, readHistory, cached, refresh, history, historyView, error: month => entry(month).error };

@@ -426,6 +426,8 @@ body.has-max .panel:not(.max){display:none}
   white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto}
 .subagent-block{border-top:1px solid var(--line);background:var(--bg-alt)}
 .subagent-hdr{padding:8px 11px;font-size:12px;color:var(--ink-soft);display:flex;gap:6px;align-items:center}
+.out-more{margin:6px 0 2px;font:inherit;font-size:12px;padding:6px 12px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--accent);cursor:pointer}
+.out-more:disabled{cursor:default;opacity:.7}
 .subagent-body{padding:4px 8px 8px}
 .subagent-loading{padding:8px;color:var(--ink-faint);font-size:12px}
 .sub-msg{margin:6px 0;font-size:12.5px;line-height:1.5}
@@ -1507,8 +1509,10 @@ function createMuxPanel(sid, server, snapshot){
 function openSession(sid, server){
   try { sid = decodeURIComponent(sid); } catch(e) {}
   if (sid.indexOf('codex:') === 0) {
-    fetch(apiBase(server)+'/api/codex/history/'+encodeURIComponent(sid.slice(6))).then(function(r){return r.json();}).then(function(snap){
+    var hurl=apiBase(server)+'/api/codex/history/'+encodeURIComponent(sid.slice(6));
+    fetch(hurl+'?win=5,10').then(function(r){return r.json();}).then(function(snap){
       if(snap.error)throw new Error(snap.error);
+      snap.historyUrl=hurl;
       var panel=createMuxPanel(sid,server||null,snap); addPanel(panel); setState(panel,'exp');
     }).catch(function(e){toast(e.message);}); return;
   }
@@ -1817,6 +1821,20 @@ function createSessionPanel(sid, server){
     tAppend(card);
     scrollBottom();
   }
+  function addOutputMore(outEl, id, total){
+    var b = el('button','out-more');
+    b.textContent = 'Show full output (' + Math.ceil(total / 1024) + ' KB)';
+    b.addEventListener('click', function(){
+      b.disabled = true; b.textContent = 'Loading…';
+      api('/api/session/'+sid+'/tool-result/'+encodeURIComponent(id)).then(function(r){ return r.json(); })
+        .then(function(d){
+          if (!d || d.missing) { b.textContent = 'Output no longer available'; return; }
+          outEl.innerHTML = '<pre>'+esc(d.content || '')+'</pre>';
+        })
+        .catch(function(){ b.disabled = false; b.textContent = 'Show full output (retry)'; });
+    });
+    outEl.appendChild(b);
+  }
   function renderToolResults(msg, resultTs, subagent){
     for (var i=0;i<(msg.content||[]).length;i++) {
       var block = msg.content[i];
@@ -1832,6 +1850,8 @@ function createSessionPanel(sid, server){
       else if (Array.isArray(block.content))
         content = block.content.filter(function(b){ return b.type==='text'; }).map(function(b){ return b.text; }).join('');
       outEl.innerHTML = '<pre>'+esc(content)+'</pre>';
+      // The window ships only the start of a long output; the rest is one tap away.
+      if (block.elided) addOutputMore(outEl, id, block.elided);
       if (subagent && subagent.toolUseId === id && !document.getElementById('sa-'+id)) {
         var sa = el('div','subagent-block');
         sa.id = 'sa-'+id;

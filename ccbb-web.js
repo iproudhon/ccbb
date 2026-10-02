@@ -32,7 +32,7 @@ const mux = muxLib ? new muxLib.Mux({}) : null;
 const { mobilePageHtml, isMobileUA, serveVendor, setMuxAssets } = require('./ccbb-mobile');
 const {
   serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable, isCcbbGroupSession,
-  CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow,
+  CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow, getSessionToolResult,
   getSubagentHistory, getSessionStats, watchSessionChanges,
   sessionLiveness, pidAlive, renameSession, paneForSession, paneForPids, panesForLiveSessions, injectToPane, transcriptEntry,
   getSessionCwd, findSessionJsonl, priceTable,
@@ -956,6 +956,8 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
 .subagent-body{padding:10px 12px;border-left:2px solid var(--accent);margin:8px 0 8px 12px;display:flex;flex-direction:column;gap:8px;align-items:flex-start}
 .subagent-body>*{max-width:100%}
 .subagent-loading{font-size:12px;color:var(--ink-faint);font-style:italic}
+.out-more{margin:6px 0 2px;font:inherit;font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--accent);cursor:pointer}
+.out-more:disabled{cursor:default;opacity:.7}
 .perm-card{border:1px solid var(--accent);border-radius:12px;overflow:hidden;width:100%;max-width:740px}
 .perm-hdr{padding:11px 16px;background:var(--accent-soft);border-bottom:1px solid var(--accent);font-size:13px;font-weight:600;color:var(--accent);display:flex;align-items:center;gap:6px}
 .perm-body{padding:12px 16px;background:var(--surface);font-size:14px;color:var(--ink)}
@@ -1642,8 +1644,10 @@ function openSession(sid, server, mux, title){
   // A mux session has no transcript-and-pane to fetch info for; the client's own
   // snapshot carries everything the bar shows, so it opens without a round trip.
   if (!mux && sid.indexOf('codex:') === 0) {
-    fetch(apiBase(srv)+'/api/codex/history/'+encodeURIComponent(sid.slice(6))).then(function(r){return r.json();}).then(function(snap){
+    var hurl = apiBase(srv)+'/api/codex/history/'+encodeURIComponent(sid.slice(6));
+    fetch(hurl+'?win=5,25').then(function(r){return r.json();}).then(function(snap){
       if (snap.error) throw new Error(snap.error);
+      snap.historyUrl = hurl;   // where the view pages its middle and elided results from
       var cv = createMuxSessionView({sessionId:sid, server:srv, title:snap.state.title, snapshot:snap});
       views.push(cv); viewsEl.appendChild(cv.el); relayout();
     }).catch(function(e){toast('Codex history: '+e.message);});
@@ -3074,6 +3078,8 @@ function createSessionView(INFO){
       if (typeof block.content==='string') content = block.content;
       else if (Array.isArray(block.content)) content = block.content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
       outputEl.innerHTML = '<pre>'+esc(content)+'</pre>';
+      // The window ships only the start of a long output; the rest is one click away.
+      if (block.elided) addOutputMore(outputEl, id, block.elided);
       // A finished Agent/Task call: nest the subagent's own transcript, collapsed, under its
       // output. Lazy-fetched on first expand (see toggleSubagent) so history stays light.
       if (subagent && subagent.toolUseId===id && !document.getElementById('sa-'+id)) {
@@ -3091,6 +3097,22 @@ function createSessionView(INFO){
       if (askCards[id]) settleAsk(id);
     }
     scrollBottom();   // results grow an existing card in place — keep following
+  }
+  function addOutputMore(outputEl, id, total) {
+    var b = document.createElement('button');
+    b.className = 'out-more';
+    b.textContent = 'Show full output (' + Math.ceil(total / 1024) + ' KB)';
+    b.addEventListener('click', function(){
+      b.disabled = true; b.textContent = 'Loading…';
+      qfetch('/api/session/'+INFO.sessionId+'/tool-result/'+encodeURIComponent(id))
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (!d || d.missing) { b.textContent = 'Output no longer available'; return; }
+          outputEl.innerHTML = '<pre>'+esc(d.content || '')+'</pre>';
+        })
+        .catch(function(){ b.disabled = false; b.textContent = 'Show full output (retry)'; });
+    });
+    outputEl.appendChild(b);
   }
   // Expand/collapse a subagent transcript nested under an Agent/Task card. The nested tree is
   // fetched and built once (on first expand); later toggles just flip visibility.
@@ -6256,7 +6278,7 @@ function runWeb(args) {
       return send(res, 200, require('./ccbb-agent-codex').nativeActivity(decodeURIComponent(m[1])));
     }
     if (method === 'GET' && (m = pathname.match(/^\/api\/codex\/history\/([^/]+)$/))) {
-      return require('./ccbb-agent-codex').history(decodeURIComponent(m[1])).then(d => send(res, 200, d), e => send(res, 500, {error:e.message}));
+      return require('./ccbb-agent-codex').historyView(decodeURIComponent(m[1]), query).then(d => send(res, 200, d), e => send(res, 500, {error:e.message}));
     }
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');
@@ -6322,6 +6344,8 @@ function runWeb(args) {
         return send(res, 200, { history: getSessionHistory(m[1]) });
       return send(res, 200, getSessionHistoryWindow(m[1], { head, tail, from, to }));
     }
+    if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/tool-result\/([^/]+)$/)))
+      return send(res, 200, getSessionToolResult(m[1], decodeURIComponent(m[2])));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/subagent\/([^/]+)$/)))
       return send(res, 200, { history: getSubagentHistory(m[1], m[2]) });
     // Claude Code prompt-capture hooks POST here (permission dialogs, AskUserQuestion).

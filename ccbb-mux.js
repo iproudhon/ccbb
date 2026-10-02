@@ -522,14 +522,29 @@ class Session {
     return ev;
   }
 
-  snapshot() {
-    return {
+  // A client that asked for a window (`win` on its socket) gets the first `head` and
+  // last `tail` messages, and fetches the middle with a 'history' op as it scrolls up.
+  // Its tool results are elided past ELIDE_RESULT_BYTES too: a resumed session full of
+  // screenshots was a 7.7MB snapshot for a page that shows its last 25 turns collapsed.
+  // A client without a window (the TUI, the HTTP route) still gets everything.
+  snapshot(win) {
+    const w = win ? common.windowMessages(this.messages, win) : { messages: this.messages };
+    const snap = {
       op: 'snapshot', seq: this.seq, epoch: this.epoch,
       state: this.state,
-      messages: this.messages,
+      messages: w.messages,
       pending: [...this.pending.entries()].map(([requestId, p]) => ({ requestId, ...p })),
       clients: [...this.clients].map(c => ({ label: c.label, kind: c.kind, pid: c.pid || null })),
     };
+    if (w.omitted) { snap.omitted = w.omitted; snap.omittedAfter = w.omittedAfter; }
+    return snap;
+  }
+
+  // The full result of a tool call a windowed snapshot elided.
+  toolResult(toolUseId) {
+    const blk = this.byToolUseId.get(toolUseId);
+    return blk ? { toolUseId, result: blk.result, meta: blk.resultMeta || null }
+      : common.messageToolResult(this.messages, toolUseId);
   }
 
   broadcast(msg) { for (const c of this.clients) c.send(msg); }
@@ -546,7 +561,7 @@ class Session {
       client.send({ op: 'resumed', seq: this.seq, epoch: this.epoch, from: sinceSeq });
       for (const ev of this.events) if (ev.seq > sinceSeq) client.send(ev);
     } else {
-      client.send(this.snapshot());
+      client.send(this.snapshot(client.window));
     }
     this.presence();
   }
@@ -1409,6 +1424,7 @@ class Mux {
       // is sitting in — that pane is where "$>" for a mux session should land. Absent
       // for a browser, which has no process on this host to find.
       pid: Number(url.searchParams.get('pid')) || null,
+      window: common.parseWindow(url.searchParams.get('win')),
       session: null,
       send: obj => { if (ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); } catch {} } },
     };
@@ -1483,7 +1499,9 @@ class Mux {
       case 'steer': return reply({ ok: await s.steer(m.text, client.label) });
       case 'rename': await s.rename(m.title); return reply({ ok: true });
       case 'compact': await s.compact(); return reply({ ok: true });
-      case 'snapshot':  return client.send(s.snapshot());
+      case 'snapshot':  return client.send(s.snapshot(client.window));
+      case 'history':   return client.send({ op: 'history', ...common.sliceMessages(s.messages, m.after, m.before, m.limit) });
+      case 'tool_result': return client.send({ op: 'tool_result', ...s.toolResult(m.toolUseId) });
       case 'ping':      return reply({ pong: true });
       default:          return reply({ error: 'unknown op ' + m.op });
     }

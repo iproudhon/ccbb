@@ -703,25 +703,91 @@ var S = {
   touched: {},
 };
 var nodes = {}, REV = 0;
-var historyStart = null, historyExpanded = false;
+var historyStart = null, historyExpanded = false, historyFetching = false;
 var following = true, scrollFrame = null, logObserver = null, gapObserver = null;
 var historyHead = 5, historyTail = opts.historyTail || 25;
+// The gap has two parts: messages this page holds but is not drawing, and messages the
+// mux never sent (S.omitted — a windowed snapshot ships the head and the tail). Both sit
+// right after the head, so one marker counts and loads them, local ones first.
+function gapIndex(list) {
+  if (S.omittedAfter) { var a = list.findIndex(function(m){return m.id === S.omittedAfter;}); if (a >= 0) return a + 1; }
+  return Math.min(historyHead, list.length);
+}
 function historyWindow(list) {
-  if (historyExpanded || list.length <= historyHead + historyTail) return list;
-  var from = list.findIndex(function(m){return m.id === historyStart;});
-  if (from < 0) { from = Math.max(historyHead, list.length - historyTail); historyStart = list[from].id; }
-  if (from <= historyHead) return list;
-  return list.slice(0, historyHead).concat([{id:'ccbb:history-gap', _rev:from, historyGap:from-historyHead}],list.slice(from));
+  var at = gapIndex(list), from = at;
+  if (!historyExpanded && list.length > at + historyTail) {
+    from = list.findIndex(function(m){return m.id === historyStart;});
+    if (from < 0) { from = Math.max(at, list.length - historyTail); historyStart = list[from].id; }
+    if (from < at) from = at;
+  }
+  var hidden = from - at + (S.omitted || 0);
+  if (hidden <= 0) return list;
+  return list.slice(0, at).concat([{id:'ccbb:history-gap', _rev:hidden, historyGap:hidden}],list.slice(from));
 }
 function loadOlder(all) {
+  var list = displayList(), at = gapIndex(list), from = list.findIndex(function(m){return m.id === historyStart;});
+  if (!historyExpanded && from > at) {
+    var log = Q('.mx-log'), oldHeight = log.scrollHeight, oldTop = log.scrollTop;
+    following = false;
+    from = all ? at : Math.max(at, from - 25);
+    historyStart = list[from].id; historyExpanded = from === at;
+    paintAll();
+    log.scrollTop = oldTop + log.scrollHeight - oldHeight;
+    if (!all) return;
+  }
+  if (!S.omitted || historyFetching) return;
+  historyFetching = request({ op: 'history', after: S.omittedAfter, before: S.gapBefore, limit: all ? 1000000 : 25 });
+}
+// Paging and elided results ride the socket. A read-only history view has none, so it
+// asks the URL its snapshot came from, which answers the same two shapes.
+function request(o) {
+  if (WS) {
+    // Not open yet (or closing): say nothing was sent, so no flag is left set. A
+    // card still open when the socket comes up is fetched by retryFetches().
+    if (WS.readyState !== 1) return false;
+    send(o); return true;
+  }
+  var url = opts.snapshot && opts.snapshot.historyUrl;
+  if (!url) return false;
+  var q = o.op === 'tool_result' ? 'tool=' + encodeURIComponent(o.toolUseId)
+    : 'after=' + encodeURIComponent(o.after || '') + '&before=' + encodeURIComponent(o.before) + '&limit=' + o.limit;
+  fetch(url + '?' + q).then(function (r) { return r.json(); }).then(function (m) {
+    if (m.op === 'history') onHistory(m);
+    else if (m.op === 'tool_result') onToolResult(m);
+    else throw new Error(m.error || 'bad reply');
+  }).catch(function (e) {
+    if (o.op === 'history') historyFetching = false;
+    else { var t = S.tools[o.toolUseId]; if (t) t.block.fetching = false; }
+    note('could not load: ' + e.message);
+  });
+  return true;
+}
+// The mux's answer to loadOlder: the slice just above the gap, spliced in above the
+// message the gap ended at, with the reading position held while the page grows.
+function onHistory(m) {
+  historyFetching = false;
+  if (!m.before || m.before !== S.gapBefore || !S.byId[m.before]) return;
   var log = Q('.mx-log'), oldHeight = log.scrollHeight, oldTop = log.scrollTop;
-  var list = displayList(), from = list.findIndex(function(m){return m.id === historyStart;});
-  if (from <= historyHead) return;
+  var add = (m.messages || []).filter(function (x) { return !S.byId[x.id]; });
+  var at = S.msgs.indexOf(S.byId[m.before]);
+  S.msgs.splice.apply(S.msgs, [at, 0].concat(add));
+  add.forEach(function (x) { S.byId[x.id] = x; indexTools(x); bump(x); });
+  S.omitted = m.remaining || 0;
+  if (add.length) { S.gapBefore = add[0].id; if (!historyExpanded) historyStart = add[0].id; }
   following = false;
-  from = all ? historyHead : Math.max(historyHead, from - 25);
-  historyStart = list[from].id; historyExpanded = from === historyHead;
+  if (ON_HISTORY) ON_HISTORY();
   paintAll();
   log.scrollTop = oldTop + log.scrollHeight - oldHeight;
+}
+// An elided tool result, fetched because its card was opened.
+function onToolResult(m) {
+  var t = S.tools[m.toolUseId];
+  if (!t || !t.block.elided) return;
+  t.block.fetching = false;
+  if (m.missing) t.block.elided.missing = true;
+  else { t.block.result = m.result; t.block.resultMeta = m.meta; delete t.block.elided; }
+  bump(t.msg);
+  paintAll();
 }
 function historyGapNode(m) {
   var gap = el('div', 'hist-gap');
@@ -785,6 +851,12 @@ function reset(snap) {
   if (S.info.turnStartedAt) turnStart = S.info.turnStartedAt;
   S.msgs = []; S.byId = {}; S.tools = {}; S.stream = {}; S.final = {};
   (snap.messages || []).forEach(function (m) { upsert(m); });
+  S.omitted = snap.omitted || 0; S.omittedAfter = S.omitted ? snap.omittedAfter : null; S.gapBefore = null;
+  if (S.omitted) {
+    var ga = S.msgs.indexOf(S.byId[S.omittedAfter]);
+    if (ga >= 0 && S.msgs[ga + 1]) S.gapBefore = S.msgs[ga + 1].id; else S.omitted = 0;
+  }
+  historyFetching = false;
   S.pending = {};
   (snap.pending || []).forEach(function (p) { S.pending[p.requestId] = p; });
   S.clients = snap.clients || [];
@@ -812,6 +884,9 @@ function apply(ev) {
 
     case 'message': {
       var m = ev.message;
+      // A rewrite of a message in the part of history this page was never sent. Pushing
+      // it would surface an old turn at the bottom; the page that holds it will carry it.
+      if (ev.replaced && !S.byId[m.id] && S.omitted) return;
       if (m.apiId) { S.final[m.apiId] = 1; delete S.stream[m.apiId]; }
       upsert(m);
       return paintAll();
@@ -873,6 +948,7 @@ function apply(ev) {
       t.block.endAt = t.block.endAt || Date.now();
       t.block.result = ev.result;
       t.block.resultMeta = ev.meta;
+      delete t.block.elided;
       bump(t.msg);
       return paintAll();
     }
@@ -1050,11 +1126,14 @@ function toolNode(b) {
     toggleTool(hdr);
     S.open[b.id] = body.classList.contains('open');
     S.touched[b.id] = true;
+    if (S.open[b.id]) fetchResult(b);
   });
   d.appendChild(hdr);
 
   var body = el('div', 'tool-body');
-  var made = r.body ? r.body(input, b.result, b.resultMeta, isError) : null;
+  // A windowed snapshot leaves big results behind; the card fetches its own on opening.
+  var made = b.elided ? el('div', 'meta', b.elided.missing ? '(output no longer held)' : 'loading…')
+    : r.body ? r.body(input, b.result, b.resultMeta, isError) : null;
   if (made) body.appendChild(made);
   else {
     // The plugin's base renderer: the input as pretty JSON, then the output.
@@ -1068,8 +1147,21 @@ function toolNode(b) {
   d.appendChild(body);
   // Open while it runs, shut when it lands — unless the reader has taken the card over.
   var open = S.touched[b.id] ? !!S.open[b.id] : b.status === 'running';
-  if (open) { body.classList.add('open'); tw.innerHTML = '&#9660;'; }
+  if (open) { body.classList.add('open'); tw.innerHTML = '&#9660;'; fetchResult(b); }
   return d;
+}
+// A socket that dropped took its unanswered requests with it. Clear their flags, and
+// once it is back re-ask for the results of cards the reader still has open.
+function dropFetches() {
+  historyFetching = false;
+  for (var k in S.tools) S.tools[k].block.fetching = false;
+}
+function retryFetches() {
+  for (var k in S.tools) { var b = S.tools[k].block; if (b.elided && S.open[b.id]) fetchResult(b); }
+}
+function fetchResult(b) {
+  if (!b.elided || b.elided.missing || b.fetching) return;
+  b.fetching = request({ op: 'tool_result', toolUseId: b.id });
 }
 
 // The line the CLI prints under a settled tool call. Per-renderer where the tool has a
@@ -1096,7 +1188,7 @@ function countLines(v) {
 // normalized messages and never sees that moment — the two must read the same block the
 // same way or a reattach quietly changes what the card says.
 function isBackgrounded(b) {
-  return !!(b.resultMeta && b.resultMeta.isAsync) ||
+  return !!(b.resultMeta && b.resultMeta.isAsync) || !!(b.elided && b.elided.background) ||
     /^Command running in background/.test(txt(b.result));
 }
 function toolSummary(b, input, isError) {
@@ -1104,6 +1196,7 @@ function toolSummary(b, input, isError) {
   // A backgrounded call's summary is the news it eventually sent back, not the
   // "Command running in background with ID: bzxsnq2zc" it answered with at launch.
   if (isBackgrounded(b)) return b.bg ? clip(b.bg.description) : 'running in background\u2026';
+  if (b.elided) return elidedSummary(b, input, isError);
   if (isError) return firstLine(b.result) || 'failed';
   var meta = b.resultMeta || {};
   var name = b.name === 'Task' ? 'Agent' : b.name;
@@ -1152,6 +1245,27 @@ function toolSummary(b, input, isError) {
     // would be the same words twice.
     case 'ExitPlanMode': case 'AskUserQuestion': case 'Skill': return '';
     default: return firstLine(b.result);
+  }
+}
+
+// toolSummary for a card whose result the mux held back: the same lines, read off the
+// counts it sent in place of the result.
+function elidedSummary(b, input, isError) {
+  var e = b.elided, name = b.name === 'Task' ? 'Agent' : b.name;
+  if (isError) return clip(e.first) || 'failed';
+  switch (name) {
+    case 'Read': {
+      var n = b.resultMeta && b.resultMeta.file && b.resultMeta.file.numLines != null ? b.resultMeta.file.numLines : e.lines;
+      return n + ' line' + (n === 1 ? '' : 's');
+    }
+    case 'Write': case 'Edit': case 'NotebookEdit':
+      if (e.add || e.del) return '+' + e.add + ' −' + e.del;
+      return name === 'Write' ? countLines(input.content) + ' lines' : '';
+    case 'Grep': case 'Search': return e.lines + ' match' + (e.lines === 1 ? '' : 'es');
+    case 'Glob': return e.lines + ' path' + (e.lines === 1 ? '' : 's');
+    case 'Bash': case 'PowerShell': return e.lines <= 1 ? clip(e.first) : e.lines + ' lines';
+    case 'ExitPlanMode': case 'AskUserQuestion': case 'Skill': return '';
+    default: return clip(e.first);
   }
 }
 
@@ -1884,7 +1998,7 @@ function connect() {
   if (dead) return;
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var u = proto + '//' + location.host + BASE + '/mux?session=' + encodeURIComponent(SESSION) +
-    '&label=' + encodeURIComponent(LABEL) + '&kind=web';
+    '&label=' + encodeURIComponent(LABEL) + '&kind=web&win=' + historyHead + ',' + historyTail;
   // sinceSeq is what makes a backgrounded phone cheap to bring back: the mux
   // replays only what was missed, or falls back to a snapshot if the ring moved on.
   if (S.seq && S.epoch) u += '&since=' + S.seq + '&epoch=' + encodeURIComponent(S.epoch);
@@ -1902,14 +2016,16 @@ function connect() {
       // snapshot outright rather than sit on it.
       if (m.seq != null && m.seq < S.seq) { S.seq = 0; send({ op: 'snapshot' }); return; }
       S.epoch = m.epoch || S.epoch;
-      S.seq = m.from || S.seq; return paintChrome();
+      S.seq = m.from || S.seq; retryFetches(); return paintChrome();
     }
     if (m.op === 'presence') { S.clients = m.clients || []; return paintChrome(); }
     if (m.op === 'ack') { if (m.error) note(m.error); return; }
     if (m.op === 'event') return apply(m);
+    if (m.op === 'history') return onHistory(m);
+    if (m.op === 'tool_result') return onToolResult(m);
   };
   ws.onclose = function () {
-    WS = null; paintChrome(); paintBusy();
+    WS = null; dropFetches(); paintChrome(); paintBusy();
     if (dead) return;
     retry = Math.min(retry + 1, 6);
     reconnectTimer = setTimeout(connect, 250 * retry * retry);
