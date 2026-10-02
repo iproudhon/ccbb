@@ -148,6 +148,47 @@ test('unattached history and Claude transcript title priority are unchanged', as
   assert.equal(payload.sessions[0].title, 'Saved Claude title');
 });
 
+test('a -n session reads the same in the list and on the page before its name is written', () => {
+  const common = require('../ccbb-common');
+  const row = (title, extra) => ({ sessionId: 'c', agent: 'claude', title, ...extra });
+  const m = (extra) => ({ list: () => [{ id: 'c', agent: 'claude', title: 'abc', ...extra }] });
+  // No transcript yet: the disk row has only Claude's derived registry name.
+  assert.equal(mergeMuxRows({ sessions: [row('ccbb-a5', { titleDerived: true })] }, m()).sessions[0].title, 'abc');
+  // Transcript with Claude's generated title, -n not yet written over it.
+  assert.equal(mergeMuxRows({ sessions: [row('Generated')] }, m({ titlePending: true })).sessions[0].title, 'abc');
+  // Once written, the transcript's title is the authority again.
+  assert.equal(mergeMuxRows({ sessions: [row('From /rename')] }, m()).sessions[0].title, 'From /rename');
+  // The registry's name is marked derived unless a person set it.
+  const empty = common.getSessionStats('00000000-0000-4000-8000-0000000000ff', {});   // no transcript
+  assert.equal(common.sessionRow('c', '/tmp', empty, { name: 'ccbb-a5', nameSource: 'derived' }).titleDerived, true);
+  assert.equal(common.sessionRow('c', '/tmp', empty, { name: 'Set by hand', nameSource: 'user' }).titleDerived, undefined);
+  assert.equal(common.muxTitle(row('Set by hand'), { title: 'abc' }), 'Set by hand');
+});
+
+test('a -n name is written as soon as the transcript appears, not at the end of the first turn', async () => {
+  const { Mux, Session } = require('../ccbb-mux');
+  const common = require('../ccbb-common');
+  const mux = new Mux({});
+  const id = '99999999-8888-4777-8666-555555555556';
+  const s = new Session(mux, { agent: 'fake', sessionId: id, cwd: '/tmp/proj', name: 'abc' });
+  mux.sessions.set(s.id, s);
+  s.emit = () => {};
+  s.onModelMessage({ type: 'user', message: { role: 'user', content: 'hi' } }, 'user');
+  await new Promise(r => setTimeout(r, 800));
+  assert.equal(s.pendingName, 'abc', 'no transcript yet: still pending');
+  assert.equal(mux.list()[0].titlePending, true);
+  const file = path.join(dir, 'projects', '-tmp-proj', id + '.jsonl');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ type: 'ai-title', aiTitle: 'Generated', sessionId: id }) + '\n');
+  s.onModelMessage({ type: 'assistant', message: { id: 'msg_1', role: 'assistant', content: [{ type: 'text', text: 'x' }] } }, 'assistant');
+  await new Promise(r => setTimeout(r, 800));
+  assert.equal(s.pendingName, '');
+  assert.equal(mux.list()[0].titlePending, false);
+  assert.equal(common.getSessionStats(id, {}).title, 'abc');
+  assert.equal(s.state.title, 'abc');
+  s.rawLog && s.rawLog.end();
+});
+
 test('a title shared by two sessions is refused as an address, never guessed', () => {
   const { Mux, pickSession } = require('../ccbb-mux');
   const mux = new Mux({});

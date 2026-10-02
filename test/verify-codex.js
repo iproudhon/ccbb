@@ -373,7 +373,7 @@ test('read-only users can browse Codex history but cannot create or control sess
   fs.writeFileSync(path.join(dir, 'ccbb-config.json'), JSON.stringify({peerToken:'fixture-write',readToken:'fixture-read'}));
   const browserModule = require.resolve('../ccbb-agent-codex');
   const preload = path.join(dir, 'preload.js');
-  fs.writeFileSync(preload, `require.cache[${JSON.stringify(browserModule)}]={exports:{...require(${JSON.stringify(browserModule)}),cached:()=>[],renameCodexThread:async(id,name)=>{if(id!=='example'||name!=='Renamed')throw new Error('Wrong rename parameters');},history:async()=>({state:{agent:'codex'},messages:[]})}};`);
+  fs.writeFileSync(preload, `require.cache[${JSON.stringify(browserModule)}]={exports:{...require(${JSON.stringify(browserModule)}),cached:()=>[],renameCodexThread:async(id,name)=>{if(id!=='example'||name!=='Renamed')throw new Error('Wrong rename parameters');},history:async()=>({state:{agent:'codex'},messages:[]}),historyView:async()=>({state:{agent:'codex'},messages:[]})}};`);
   const listener = net.createServer(); await new Promise(r=>listener.listen(0,'127.0.0.1',r));
   const port=listener.address().port; await new Promise(r=>listener.close(r));
   const child=spawn(process.execPath,['--require',preload,require.resolve('../ccbb-web'),'-p',String(port)],{env:{...process.env,CLAUDE_CONFIG_DIR:dir,CCBB_HOME:dir},stdio:'ignore'});

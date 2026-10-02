@@ -466,6 +466,18 @@ const PERMISSION_QUESTION = {
   ExitPlanMode: () => 'Would you like to proceed?',
 };
 
+// The slash commands ccbb answers itself rather than passing to the child: they are about
+// the mux session, not the conversation. The child's own /exit would end the claude
+// process out from under every other attached client.
+const MUX_COMMANDS = {
+  exit: 'leave this client; the session keeps running',
+  quit: 'same as /exit',
+  term: 'terminate the mux session, for every attached client',
+  terminate: 'same as /term',
+  stop: 'same as /term',
+};
+const muxCommand = t => { const m = /^\/(\w+)$/.exec(t); return m && MUX_COMMANDS[m[1]] ? m[1] : null; };
+
 function attachHelp() {
   console.log(`ccbb attach — terminal client for a ccbb-mux session
 
@@ -485,7 +497,9 @@ In the session:
   <text>            send a turn (queued if one is already running)
   /                 list slash commands (the live list, straight from the child)
   /<partial> Tab    complete a command name
-  /<command>        run it — slash commands are interpreted by the child
+  /<command>        run it — slash commands are interpreted by the child, except:
+  /exit, /quit      leave this client; the session keeps running
+  /term             terminate the mux session (also /terminate, /stop)
 On an open card:
   ↑ / ↓             move the cursor        Enter        choose
   1, 2, 3 …         jump to an option      Space        toggle (multi-select)
@@ -612,11 +626,12 @@ class TuiClient {
       ? this.state.commands : (this.state.slashCommands || []);
     const names = raw.map(c => (typeof c === 'string' ? c : (c && (c.name || c.command)) || ''))
       .map(n => String(n).replace(/^\//, '')).filter(Boolean);
-    return [...new Set(names)].sort();
+    return [...new Set(names.concat(Object.keys(MUX_COMMANDS)))].sort();
   }
   // Descriptions only exist when commands_changed sent objects; keyed by name so
   // the menu can show them when they're there and stay quiet when they're not.
   commandHelp(name) {
+    if (MUX_COMMANDS[name]) return MUX_COMMANDS[name];
     const c = (this.state.commands || []).find(x => x && typeof x === 'object' &&
       String(x.name || x.command || '').replace(/^\//, '') === name);
     return c ? String(c.description || c.argumentHint || '') : '';
@@ -645,7 +660,7 @@ class TuiClient {
     if (!names.length) return this.out(A.gray(`  no command matches /${filter}`));
     // With descriptions, one per line; without, packed into columns so a
     // fifty-command list doesn't bury the transcript.
-    const described = names.filter(n => this.commandHelp(n));
+    const described = names.filter(n => !MUX_COMMANDS[n] && this.commandHelp(n));
     if (described.length) {
       const pad = Math.min(24, Math.max(...names.map(n => n.length)) + 2);
       return this.out(names.map(n =>
@@ -1089,6 +1104,11 @@ class TuiClient {
     if (!t) return this.drawPrompt();
 
     if (t.startsWith('//')) return this.localCommand(t.slice(2));
+    const mc = muxCommand(t);
+    if (mc === 'exit' || mc === 'quit') return this.quit('detached');
+    // Sent, then gone: the mux replies before it starts the stop, which can take as long
+    // as the child takes to drain.
+    if (mc) { try { this.ws.send(JSON.stringify({ op: 'stop' }), () => this.quit('terminated')); } catch { this.quit('terminated'); } return; }
     // A digit while a card is open answers the card, not the model — same as the CLI.
     if (this.open && /^[?\d]/.test(t)) return this.answerOpen(t);
     // A bare "/" — or one that matches nothing — lists instead of sending a turn

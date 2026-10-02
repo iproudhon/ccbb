@@ -1354,6 +1354,7 @@ function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
 function priceFor(model, provider){
   var t=PRICE_TABLE||{}, byId=t.byId||{}, tiers=t.tiers||{}, id=normId(model);
   var trimmed=id.replace(/-\\d{6,}$/,''), base;
+  if(provider!=='bedrock'&&!/claude|opus|sonnet|haiku|fable/.test(id))return {input:0,output:0,cacheRead:0,cacheWrite:0,cacheWrite5m:0,cacheWrite1h:0};
   if(byId[id])base=byId[id];
   else if(trimmed!==id&&byId[trimmed])base=byId[trimmed];
   else if(id.indexOf('opus')!==-1)base=tiers.opus;
@@ -1368,7 +1369,8 @@ function priceFor(model, provider){
     cacheWrite:base.cacheWrite*k, cacheWrite5m:base.cacheWrite5m*k, cacheWrite1h:base.cacheWrite1h*k };
 }
 // The only provider signal a message carries: Bedrock stamps ids with a msg_bdrk_ prefix.
-function provOf(id){ return String(id||'').indexOf('msg_bdrk_')===0?'bedrock':'anthropic'; }
+function provOf(id, model){ if(String(id||'').indexOf('msg_bdrk_')===0)return 'bedrock';
+  return model&&model!=='<synthetic>'&&!/claude|opus|sonnet|haiku|fable/.test(normId(model))?'local':'anthropic'; }
 var toastTimer;
 function toast(msg){
   var t = document.getElementById('toast');
@@ -2056,7 +2058,7 @@ function createListView(){
     refreshedEl.textContent = fmtAge(Date.now() - lastChange);
     refreshedEl.title = 'Last change ' + new Date(lastChange).toLocaleTimeString();
   }
-  var PROV_LABEL = { bedrock:'Bedrock', anthropic:'Sub' };
+  var PROV_LABEL = { bedrock:'Bedrock', anthropic:'Sub', local:'Local' };
   function gsub(s){ return '<span class="c-sub">'+s+'</span>'; }
   function buildScopeOptions() {
     var sel = body.querySelector('#sumScope');
@@ -2143,7 +2145,7 @@ function createListView(){
     var tbody = keys.map(function(k){ return provRowHtml(PROV_LABEL[k]||k, map[k]); }).join('');
     var tfoot = (keys.length > 1 && !RO) ? '<tfoot>'+provRowHtml('Total', scope.all)+'</tfoot>' : '';
     var thead = '<thead><tr><th>&nbsp;</th><th>USD</th><th>Tokens</th><th>Turns</th>'
-      + '<th>Cache Read</th><th>Cache Write</th><th>Cache Miss</th><th>Out</th><th>In</th><th>Time</th></tr></thead>';
+      + '<th>Cache Read</th><th>Cache Write</th><th>Cache Miss</th><th>Out</th><th>In</th><th title="output tokens per second of whole response time (queue + prefill + decode), not decode speed">Time · out/s</th></tr></thead>';
     return '<table class="sum-table prov">'+thead+'<tbody>'+tbody+'</tbody>'+tfoot+'</table>';
   }
   function renderSummary() {
@@ -2405,7 +2407,7 @@ function renderHdrStats(projEl, statsEl, st, projectPath, sub, sessionId){
   function cat(label,key){ var x=c[key]||{tokens:0,cost:0}; return '<span class="rl-lbl">'+label+'</span> '+fmtTokShort(x.tokens)+' <span class="rl-pct">'+fmtPct(x.cost,totCost)+'</span>'; }
   var tokStr = cat('cr','cacheRead')+'  '+cat('cw','cacheWrite')+'  '+cat('cm','cacheMiss')+'  '+cat('out','output')+'  '+cat('in','input')+
     (fmtDur(st.avgResponseMs)?'  <span class="rl-lbl">t</span> '+fmtDur(st.avgResponseMs)+
-      (st.avgOutTps?' '+st.avgOutTps.toFixed(1)+'/s':''):'');
+      (st.avgOutTps?' <span title="output tokens per second of whole response time (queue + prefill + decode), not decode speed">'+st.avgOutTps.toFixed(1)+' out/s</span>':''):'');
   var ctx = st.context, cmax = st.contextMax;
   var peakStr = ctx && cmax && fmtTokShort(cmax.tokens)!==fmtTokShort(ctx.tokens)
     ? ' <span class="subturns">peak '+fmtTokShort(cmax.tokens)+'</span>' : '';
@@ -2653,6 +2655,7 @@ function createMuxSessionView(INFO){
   // socket lands on <base>/mux — the outer /mux is this server's prefix, the inner one
   // is the mux's own WebSocket path — and a peer's mux rides the peer proxy the same way.
   v.client = window.createMuxView(host, {
+    onExit: function(){ closeView(v); },
     base: API + '/mux',
     snapshot: INFO.snapshot || null,
     session: INFO.sessionId,
@@ -2948,7 +2951,7 @@ function createSessionView(INFO){
     var cacheRead=u.cache_read_input_tokens||0, cacheWrite=u.cache_creation_input_tokens||0;
     var totalTok = input+output+cacheRead+cacheWrite;
     if (!totalTok) return;
-    var p = priceFor(msg.model, provOf(msg.id));
+    var p = priceFor(msg.model, provOf(msg.id, msg.model));
     var cIn=input*p.input/1e6, cOut=output*p.output/1e6;
     var cCr=cacheRead*p.cacheRead/1e6, cCw=cacheWrite*p.cacheWrite/1e6;
     var cost = cIn+cOut+cCr+cCw;

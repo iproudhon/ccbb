@@ -176,6 +176,8 @@ Columns adapt to terminal width. A wide terminal (or -x) adds turns, the
 context column: current / largest / would-be cost (largest is shown only when
 it differs), and for sessions the mux is running, BIN and CLI (attached clients).
 Context is all-time, shown even in period-scoped views.
+TIME is the average response time; OUT/S is output tokens per second of that
+time (queue + prefill + decode), not the model's decode speed.
 
 Sessions running in the mux (ccbb new) are marked with * in AGENT (claude*, codex*)
 and listed even when they have no usage in scope.
@@ -261,7 +263,7 @@ function currentPeriod(period) {
 }
 
 // Print a compact provider cost summary (mirrors the web list page's summary table).
-const PROV_LABEL_CLI = { bedrock: 'Bedrock', anthropic: 'Sub' };
+const PROV_LABEL_CLI = { bedrock: 'Bedrock', anthropic: 'Sub', local: 'Local' };
 function printCostSummary(scope, label, extended) {
   const map = scope.byProvider || {};
   const keys = Object.keys(map).filter(k => map[k].tokens > 0).sort((a, b) => map[b].cost - map[a].cost);
@@ -303,7 +305,7 @@ function printCostSummary(scope, label, extended) {
     { head: extended ? 'CACHE MISS' : 'CM',  align: 'r', w: cw, get: r => r.cm,  color: extended ? null : c.gray },
     { head: 'OUT', align: 'r', w: extended ? 12 : 6, get: r => r.out, color: extended ? null : c.gray },
     { head: 'IN',  align: 'r', w: extended ? 12 : 6, get: r => r.in,  color: extended ? null : c.gray },
-    { head: 'TIME', align: 'r', w: 11, get: r => r.time, color: c.gray },
+    { head: 'TIME OUT/S', align: 'r', w: 11, get: r => r.time, color: c.gray },
   ];
   console.log(c.bold(`Cost summary${label ? ' — ' + label : ''}`));
   // gap 1: with TIME added, gap 2 ran to 89 cols worst-case ("Bedrock"/"Total" rows).
@@ -341,7 +343,8 @@ async function runLs(args) {
   const live = (await require('./ccbb-mux').muxSessionsQuiet())
     .filter(m => m.status !== 'exited' && (opt.agent === 'all' || (m.agent || 'claude') === opt.agent));
   const byKey = new Map(live.map(m => [(m.agent || 'claude') === 'codex' ? m.id : `claude:${m.id}`, m]));
-  for (const s of sessions) { const m = byKey.get(s.sessionKey); if (m) { s.mux = m; byKey.delete(s.sessionKey); } }
+  // Same title rule as ccbb web's list, so a running session reads the same in both.
+  for (const s of sessions) { const m = byKey.get(s.sessionKey); if (m) { s.mux = m; s.title = common.muxTitle(s, m); byKey.delete(s.sessionKey); } }
   for (const [sessionKey, m] of byKey) {
     sessions.push({
       agent: m.agent || 'claude', sessionKey, sessionId: String(m.nativeId || m.id).replace(/^codex:/, ''),

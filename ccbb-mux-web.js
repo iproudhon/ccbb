@@ -383,6 +383,8 @@ var MACHINE = opts.machine || '';
 // chain for exactly one family of tools.
 var HAS_BAR = opts.bar !== false;
 var ON_CHROME = typeof opts.onChrome === 'function' ? opts.onChrome : null;
+// /exit closes the view the way its X does, so the host that owns the X does it.
+var ON_EXIT = typeof opts.onExit === 'function' ? opts.onExit : null;
 // The host's header block wants the whole stats object, not the handful of numbers the
 // status line prints. Separate from onChrome because it changes on a different clock.
 var ON_STATS = typeof opts.onStats === 'function' ? opts.onStats : null;
@@ -993,6 +995,13 @@ function apply(ev) {
 
     // The counter the CLI prints beside its spinner. The mux coalesces the child's
     // events down to a few a second before any of this is reached.
+    // The main agent's last response, timed off the stream: time to first token and the
+    // decode rate after it. Subagents' are on the wire too but would make the figure jump.
+    case 'gen':
+      if (ev.parentToolUseId) return;
+      S.info.lastGen = ev;
+      return paintChrome();
+
     case 'thinking_tokens':
       S.info.outTokens = ev.tokens || 0;
       return paintBusy();
@@ -1683,6 +1692,7 @@ var LVL = (typeof FOOT_LVL_CTX_LABEL === 'number')
 // exit code, the last transient note — goes to the right, out of the way of the numbers
 // people actually scan for. lvl is the shrink level fitFoot is trying; see the ladder in
 // ccbb web's SHARED_JS, which both footers share so they give up detail in one order.
+function fmtSecs(ms) { var s = (ms || 0) / 1000; return (s < 10 ? s.toFixed(1) : String(Math.round(s))) + 's'; }
 function footHtml(i, lvl) {
   var money = i.cost == null ? '<b>cost: —</b>' : '<b>' + (i.agent === 'codex' ? '~' : '') + '$' + Number(i.cost).toFixed(2) + '</b>';
   // The plan windows, as ccbb's own pills. On a Claude.ai plan the dollars are notional
@@ -1709,6 +1719,14 @@ function footHtml(i, lvl) {
       '<b>' + fmtTokShort(i.contextTokens) + '</b>' + (peak ? '/' + fmtTokShort(peak) : '') +
       (ctxCost != null ? '/$' + Number(ctxCost).toFixed(2) : '') + '</span>';
   }
+  var gen = i.lastGen, genStr = '';
+  if (gen && lvl < LVL.clients && (gen.ttftMs != null || gen.tps)) {
+    var gb = [];
+    if (gen.ttftMs != null) gb.push((lvl >= LVL.pct ? '' : 'ttft ') + fmtSecs(gen.ttftMs));
+    if (gen.tps) gb.push('<b>' + gen.tps.toFixed(1) + '</b> tok/s');
+    genStr = '<span class="sl-gen" title="Last response: time to first token, then decode rate (' +
+      (gen.outTokens || 0) + ' output tokens in ' + fmtSecs(gen.decodeMs) + ')">' + gb.join(' \u00b7 ') + '</span>';
+  }
   var right = [];
   // "2 controllers" spelled out is four times the width of the fact it carries, and the
   // fact is only ever a small number of people.
@@ -1720,7 +1738,7 @@ function footHtml(i, lvl) {
   var last = fresh[fresh.length - 1];
   if (pin) right.push(pin.text);
   if (last && last !== pin) right.push(last.text);
-  return [money, pills, turns, ctxStr,
+  return [money, pills, turns, ctxStr, genStr,
     right.length ? '<span class="sl-note">' + esc(right.join(' \u00b7 ')) + '</span>' : ''
   ].filter(Boolean).join('');
 }
@@ -2106,6 +2124,23 @@ function runLocal(raw) {
     });
 }
 
+// The child's own /exit would end the claude process under every attached client.
+// /exit and /quit leave this view, as its X does — which ends the session only if
+// nobody else is attached. /term, /terminate and /stop end it for everyone.
+function muxCommand(t) {
+  if (opts.snapshot) return null;
+  if (t === '/exit' || t === '/quit') return exitView;
+  if (t === '/term' || t === '/terminate' || t === '/stop') return function () { send({ op: 'stop' }); exitView(); };
+  return null;
+}
+function exitView() {
+  if (ON_EXIT) return ON_EXIT();
+  // The standalone page has no X to stand in for: close the session the way one would,
+  // and leave the page saying so rather than a dead composer.
+  handle.destroy({ closeSession: true });
+  root.appendChild(el('div', 'mx-closed', 'Session closed. Reload to reattach.'));
+}
+
 function wire() {
   // asTextarea() comes from ccbb-web.js's SHARED_JS — the same call its own composer
   // makes. It is a contenteditable, not a textarea: the send button sits in a notch
@@ -2121,7 +2156,10 @@ function wire() {
     var text = input.value;
     if (!text.trim()) return;
     histAdd(text);
-    // // is ccbb's; everything else, / included, is the child's to interpret.
+    // // is ccbb's; everything else, / included, is the child's to interpret — except
+    // the few that are about the mux session rather than the conversation (muxCommand).
+    var mc = muxCommand(text.trim());
+    if (mc) { input.value = ''; return mc(); }
     if (text.trim().slice(0, 2) === '//') runLocal(text.trim());
     else send({ op: 'submit', text: text });
     input.value = '';
@@ -2469,6 +2507,7 @@ function muxRows(mux) {
   return mux.list().map(x => ({
     sessionId: x.id, agent: x.agent || 'claude',
     title: x.title || x.label || '',
+    titlePending: !!x.titlePending,
     live: x.status !== 'exited',
     liveStatus: x.status || null,
     projectPath: x.cwd || '',
@@ -2500,7 +2539,7 @@ function mergeMuxRows(payload, mux) {
     Object.assign(payload.sessions[i], {
       mux: true, live: r.live, liveStatus: r.liveStatus,
       muxClients: r.muxClients, muxPending: r.muxPending,
-      title: payload.sessions[i].title || r.title,
+      title: require('./ccbb-common').muxTitle(payload.sessions[i], r),
       lastActivity: r.lastActivity || payload.sessions[i].lastActivity,
     });
   }

@@ -79,6 +79,8 @@ async function stream(id, text) {
     await sleep(40);
   }
   out({ type: 'stream_event', uuid: uid(), event: { type: 'content_block_stop', index: 0 } });
+  out({ type: 'stream_event', uuid: uid(), event: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: Math.ceil(text.length / 4) } } });
+  out({ type: 'stream_event', uuid: uid(), event: { type: 'message_stop' } });
   // …and then the same message in full, with the same api id. A client that
   // appends instead of replacing renders the turn twice; one that suppresses the
   // final copy without drawing the deltas renders it zero times.
@@ -216,6 +218,8 @@ const extra = async () => {
 let scene = 0;
 let buf = '';
 process.stdin.setEncoding('utf8');
+// The CLI's stream-json mode ends at EOF, which is how the mux stops it.
+process.stdin.on('end', () => process.exit(0));
 process.stdin.on('data', d => {
   buf += d;
   let i;

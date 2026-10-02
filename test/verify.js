@@ -556,6 +556,8 @@ async function main() {
   const foot = await f.page.evaluate('(document.querySelector(".sv-foot .sl")||{}).innerHTML||""');
   check('the footer leads with the money', /^<b>\$\d/.test(foot), foot.slice(0, 80));
   check('and carries context as current/peak', foot.indexOf('sl-ctx') >= 0, foot.slice(0, 200));
+  // The fixture's stream is shorter than the quarter second a rate needs, so only ttft shows.
+  check('and times the last streamed response from its first token', /sl-gen[^>]*>ttft [\d.]+s</.test(foot), foot.slice(-400));
 
   // ── an open permission card ──────────────────────────────────────────────
   f.page.close(); kill();

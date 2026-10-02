@@ -746,6 +746,7 @@ function normId(m){ m=String(m||'').toLowerCase().replace(/^\\s+|\\s+$/g,'');
 function priceFor(model, provider){
   var t=PRICE_TABLE||{}, byId=t.byId||{}, tiers=t.tiers||{}, id=normId(model);
   var trimmed=id.replace(/-\\d{6,}$/,''), base;
+  if(provider!=='bedrock'&&!/claude|opus|sonnet|haiku|fable/.test(id))return {input:0,output:0,cacheRead:0,cacheWrite:0,cacheWrite5m:0,cacheWrite1h:0};
   if(byId[id])base=byId[id];
   else if(trimmed!==id&&byId[trimmed])base=byId[trimmed];
   else if(id.indexOf('opus')!==-1)base=tiers.opus;
@@ -760,7 +761,8 @@ function priceFor(model, provider){
     cacheWrite:base.cacheWrite*k, cacheWrite5m:base.cacheWrite5m*k, cacheWrite1h:base.cacheWrite1h*k };
 }
 // The only provider signal a message carries: Bedrock stamps ids with a msg_bdrk_ prefix.
-function provOf(id){ return String(id||'').indexOf('msg_bdrk_')===0?'bedrock':'anthropic'; }
+function provOf(id, model){ if(String(id||'').indexOf('msg_bdrk_')===0)return 'bedrock';
+  return model&&model!=='<synthetic>'&&!/claude|opus|sonnet|haiku|fable/.test(normId(model))?'local':'anthropic'; }
 var toastTimer;
 function toast(msg){
   var t=document.getElementById('toast');
@@ -1444,6 +1446,7 @@ function createMuxPanel(sid, server, snapshot){
 
   var resumeButton = snapshot ? muxStartButton(head, sid, server, 'codex', function(){removePanel(p);}) : null;
   var client = window.createMuxView(host, {
+    onExit: function(){ removePanel(p); },
     base: API + '/mux',
     snapshot: snapshot || null,
     historyTail: 10,
@@ -1709,13 +1712,13 @@ function createSessionPanel(sid, server){
     var cc = u.cache_creation || null;
     var cw5 = cc ? (cc.ephemeral_5m_input_tokens||0) : cw;
     var cw1 = cc ? (cc.ephemeral_1h_input_tokens||0) : 0;
-    var pr = priceFor(msg.model, provOf(msg.id)) || {};
+    var pr = priceFor(msg.model, provOf(msg.id, msg.model)) || {};
     STATS.cost = (STATS.cost||0) + (inp*(pr.input||0) + out*(pr.output||0) + cr*(pr.cacheRead||0) +
       cw5*(pr.cacheWrite5m||0) + cw1*(pr.cacheWrite1h||0)) / 1e6;
     STATS.totalTokens = (STATS.totalTokens||0) + inp+out+cr+cw;
     if (msg.id && !seenTurnIds[msg.id]) { seenTurnIds[msg.id] = 1; STATS.turns = (STATS.turns||0) + 1; }
     var ctxTok = inp+cr+cw+out;
-    STATS.context = { tokens: ctxTok, cost: ctxTok*(pr.cacheRead||0)/1e6, model: msg.model||null, provider: provOf(msg.id) };
+    STATS.context = { tokens: ctxTok, cost: ctxTok*(pr.cacheRead||0)/1e6, model: msg.model||null, provider: provOf(msg.id, msg.model) };
     if (!STATS.contextMax || ctxTok > (STATS.contextMax.tokens||0)) STATS.contextMax = { tokens: ctxTok };
     if (cw1 > 0) STATS.cacheTtl = 3600; else if (cw5 > 0) STATS.cacheTtl = 300;
     STATS.lastAssistantAt = ts || new Date().toISOString();

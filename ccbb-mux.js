@@ -457,7 +457,8 @@ class Session {
     this._statsTimer = setTimeout(() => {
       this._statsTimer = null;
       // A -n name reaches the transcript as soon as there is one to write it to.
-      if (this.pendingName && common.findSessionJsonl(this.id) &&
+      if (!this._transcriptSeen) this._transcriptSeen = !!common.findSessionJsonl(this.id);
+      if (this.pendingName && this._transcriptSeen &&
           common.renameSession(this.id, this.pendingName).ok) this.pendingName = '';
       let st = null;
       try { st = common.getSessionStats(this.id, {}); } catch (e) { return; }
@@ -635,7 +636,7 @@ class Session {
       if (this.attribution.length > 64) this.attribution.shift();
     }
     const ok = this.write({ type: 'user', message: { role: 'user', content: body }, parent_tool_use_id: null });
-    if (ok) this.beginTurn(null, true);
+    if (ok) { this.beginTurn(null, true); this.markRequest(''); }
     // The card for a slash command, made HERE rather than waited for. Over stream-json
     // the child echoes nothing when a command is submitted — no <command-name>, no
     // replay — and answers synthetically whenever it is done, which for /compact is
@@ -781,6 +782,7 @@ class Session {
         // the child idling, not working.
         this.endTurn();
         this.settlePendingCmd();
+        this._firstResult = true;
         const u = m.usage || {};
         // Provisional: the turn's own numbers, so the footer moves the instant the turn
         // ends. refreshStats replaces them with the transcript's a moment later, which is
@@ -1015,6 +1017,11 @@ class Session {
   //   • parent_tool_use_id ≠ null means a subagent — kept, tagged, and left for
   //     the client to nest or collapse.
   onModelMessage(m, role) {
+    // Through the first turn every message is a chance the transcript now exists, or has
+    // a title: write the -n name to it, or take the one Claude generated, without waiting
+    // for the turn to end. Debounced; after that, stats refresh at turn ends as before.
+    if (!this._seeding && (this.pendingName || !this._transcriptSeen ||
+        (!this._firstResult && !(this.state.stats && this.state.stats.title)))) this.refreshStats();
     const msg = m.message || {};
     const content = Array.isArray(msg.content) ? msg.content
       : (msg.content != null ? [{ type: 'text', text: String(msg.content) }] : []);
@@ -1022,6 +1029,7 @@ class Session {
     // A user message that is only tool_results is not a turn — it's the answer to
     // tool calls already on screen. Fold and emit updates instead of a message.
     if (role === 'user' && content.length && content.every(b => b.type === 'tool_result')) {
+      this.markRequest(m.parent_tool_use_id || '');
       for (const b of content) {
         const blk = this.byToolUseId.get(b.tool_use_id);
         if (blk) {
@@ -1193,6 +1201,50 @@ class Session {
     if (text) this.emit('delta', { ...this._deltaMeta, text });
   }
 
+  // ── generation timing ──────────────────────────────────────────────────────
+  // What the transcript can't say: a JSONL entry is stamped when its block is written, so
+  // history only knows the whole response time, queueing and prefill included. The stream
+  // does know. Per stream (main agent, each subagent): time to first token from the
+  // request that started it — the prompt sent, or the tool results that went back — and
+  // the decode rate between the first and last token. Output tokens come from
+  // message_delta's usage, the count the model itself reports.
+  markRequest(key) {
+    if (!this._reqAt) this._reqAt = new Map();
+    this._reqAt.set(key, Date.now());
+  }
+  trackGen(key, e) {
+    if (!this._gen) this._gen = new Map();
+    const now = Date.now();
+    if (e.type === 'message_start') {
+      const req = this._reqAt && this._reqAt.get(key);
+      this._gen.set(key, { reqAt: req || null, firstAt: null, lastAt: null,
+        out: (e.message && e.message.usage && e.message.usage.output_tokens) || 0 });
+      if (this._reqAt) this._reqAt.delete(key);
+      return;
+    }
+    const g = this._gen.get(key);
+    if (!g) return;
+    if (e.type === 'content_block_delta') {
+      if (!g.firstAt) g.firstAt = now;
+      g.lastAt = now;
+    } else if (e.type === 'message_delta' && e.usage && e.usage.output_tokens != null) {
+      g.out = e.usage.output_tokens;
+    } else if (e.type === 'message_stop') {
+      this._gen.delete(key);
+      if (!g.firstAt) return;
+      const decodeMs = g.lastAt - g.firstAt;
+      // Under a quarter second of deltas is one buffered burst, not a rate.
+      const gen = {
+        ttftMs: g.reqAt != null ? g.firstAt - g.reqAt : null,
+        decodeMs, outTokens: g.out,
+        tps: decodeMs >= 250 && g.out > 1 ? (g.out - 1) / (decodeMs / 1000) : null,
+        parentToolUseId: key || null,
+      };
+      if (!key) this.state.lastGen = gen;
+      this.emit('gen', gen);
+    }
+  }
+
   onStreamEvent(m) {
     const e = m.event || {};
     // One open message per stream: the main agent and each subagent (forwarded with
@@ -1201,6 +1253,7 @@ class Session {
     const streamKey = m.parent_tool_use_id || '';
     if (!this._streamMsgIds) this._streamMsgIds = new Map();
     const streamMsgId = this._streamMsgIds.get(streamKey) || null;
+    this.trackGen(streamKey, e);
     if (e.type === 'message_start') {
       this.flushDelta();
       // A turn can also begin without passing through submit — a session resumed with
@@ -1339,7 +1392,8 @@ class Mux {
     // client that opens a session and by nothing that merely lists them.
     return [...this.sessions.values()].map(s => {
       const { stats, ...state } = s.state;
-      return { ...state, clients: s.clients.size, pending: s.pending.size, messages: s.messages.length };
+      return { ...state, clients: s.clients.size, pending: s.pending.size, messages: s.messages.length,
+        titlePending: !!s.pendingName };
     });
   }
 
@@ -1491,6 +1545,15 @@ class Mux {
         const last = s.clients.size === 0 && s.state.agent !== 'codex';
         reply({ ok: true, stopped: last });
         if (last) s.stop(false).then(() => { this.sessions.delete(s.id); this.notifyChange(); }, () => {});
+        return;
+      }
+      // /term from a client: end the session whoever else is attached — what
+      // POST /api/sessions/<id>/stop does, without a client needing the HTTP address and
+      // token. Reply first, for the same reason as close.
+      case 'stop': {
+        if (s.agent === 'codex') require('./ccbb-codex-session').forget(s.nativeId);
+        reply({ ok: true });
+        s.stop(false).then(() => { this.sessions.delete(s.id); this.notifyChange(); }, () => {});
         return;
       }
       case 'interrupt': await s.interrupt(client.label); return reply({ ok: true });

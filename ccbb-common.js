@@ -244,6 +244,11 @@ function loadTable() {
   return table;
 }
 
+// A local model (see providerOf) has no list price to estimate from, so it costs nothing
+// rather than borrowing Sonnet's. Bedrock is exempt — its ids can be opaque profile ARNs.
+const ZERO_PRICE = priceObj(0, 0, 0, 0, 0);
+const isClaudeId = id => /claude|opus|sonnet|haiku|fable/.test(id);
+
 function basePriceIn(model, table) {
   const byId = table.byId || {};
   const id = normalizeId(model);
@@ -254,6 +259,9 @@ function basePriceIn(model, table) {
   if (id.includes('haiku')) return table.tiers.haiku;
   if (id.includes('sonnet')) return table.tiers.sonnet;
   return table.default || table.tiers.sonnet;
+}
+function priceOrZero(model, table, provider) {
+  return provider === 'local' || (provider !== 'bedrock' && !isClaudeId(normalizeId(model))) ? ZERO_PRICE : null;
 }
 
 function bedrockMultIn(model, table) {
@@ -268,6 +276,8 @@ function bedrockMultIn(model, table) {
 // provider: 'bedrock' applies the regional-inference premium; anything else (or omitted) is
 // first-party list price. Scaled prices are memoized — this is called per billed message.
 function priceForModelIn(model, table, provider) {
+  const zero = priceOrZero(model, table, provider);
+  if (zero) return zero;
   const base = basePriceIn(model, table);
   if (provider !== 'bedrock') return base;
   const k = bedrockMultIn(model, table);
@@ -344,7 +354,13 @@ const PRICING = PRICE_TABLE.tiers;
 function priceForModel(model, provider) { return priceForModelIn(model, PRICE_TABLE, provider); }
 // A message id prefixed `msg_bdrk_` came through AWS Bedrock; everything else is first-party
 // (Claude subscription or API key). This is the only provider signal a transcript carries.
-function providerOf(messageId) { return String(messageId || '').startsWith('msg_bdrk_') ? 'bedrock' : 'anthropic'; }
+// 'local': a model that isn't Claude, reached through ANTHROPIC_BASE_URL (a local or
+// gateway model such as claude.dsa's). Not the subscription, not Bedrock, and free here.
+// <synthetic> is Claude Code's own placeholder on an error turn, not a model.
+function providerOf(messageId, model) {
+  if (String(messageId || '').startsWith('msg_bdrk_')) return 'bedrock';
+  return model && model !== '<synthetic>' && !isClaudeId(normalizeId(model)) ? 'local' : 'anthropic';
+}
 function contextMaxFor(model) { return 200000; }
 
 // ── Subscription usage windows ───────────────────────────────────────────────
@@ -574,6 +590,32 @@ function sessionUsagePaths(sessionId, mainPath) {
   return paths;
 }
 
+// Claude Code writes one transcript entry per content block, all under the response's
+// message id. Anthropic stamps every entry with the final usage, but other gateways (a
+// LiteLLM-fronted local model) leave output_tokens 0 on all but the block that carries
+// stop_reason. So a response's usage is read off that entry (else the last one), and it
+// ends when its last block was written. Keyed like the dedup below: id|requestId.
+function parseJsonl(text) {
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* torn tail */ }
+  }
+  return out;
+}
+function finalResponses(entries) {
+  const fin = new Map();
+  for (const d of entries) {
+    if (d.type !== 'assistant' || !d.message || !d.message.usage || !d.message.id) continue;
+    const key = d.message.id + '|' + (d.requestId || '');
+    let f = fin.get(key);
+    if (!f) fin.set(key, f = { usage: null, endTs: null, done: false });
+    if (d.timestamp) f.endTs = d.timestamp;
+    if (!f.done) { f.usage = d.message.usage; f.done = !!d.message.stop_reason; }
+  }
+  return fin;
+}
+
 // ── Per-session stats (single pass over the session's files) ──────────────────
 // Aggregates the session's own JSONL plus subagent transcripts (group-by-sessionId,
 // matching ccusage). Cost is estimated from usage × pricing. In ONE read it also derives
@@ -625,12 +667,10 @@ function computeSessionStats(sessionId, opts) {
   const mainPath = usagePaths[0];
   for (const filePath of usagePaths) {
     const isMain = filePath === mainPath;
-    let text;
-    try { text = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      let d;
-      try { d = JSON.parse(line); } catch { continue; }
+    let entries;
+    try { entries = parseJsonl(fs.readFileSync(filePath, 'utf8')); } catch { continue; }
+    const fin = finalResponses(entries);
+    for (const d of entries) {
       if (isMain) {
         if (firstTs === null && d.timestamp) firstTs = d.timestamp;
         // The latest of each: Claude Code regenerates its title and shows the newest.
@@ -655,16 +695,18 @@ function computeSessionStats(sessionId, opts) {
       if (d.type === 'assistant' && d.message && d.message.usage &&
           inPeriod(d.timestamp) && !(dkey && seenMsgIds.has(dkey))) {
         if (dkey) seenMsgIds.add(dkey);
-        if (isMain && d.timestamp && lastUserTs != null) {
-          const r = Date.parse(d.timestamp) - lastUserTs;
+        const f = dkey && fin.get(dkey);
+        const u = (f && f.usage) || d.message.usage;
+        const endTs = (f && f.endTs) || d.timestamp;
+        if (isMain && endTs && lastUserTs != null) {
+          const r = Date.parse(endTs) - lastUserTs;
           // respOut tracks the output tokens of exactly the messages that contribute to
           // respSum, so avgOutTps below is the rate over the same measured window as `t`.
-          if (r >= 0) { respSum += r; respCount++; respOut += d.message.usage.output_tokens || 0; }
+          if (r >= 0) { respSum += r; respCount++; respOut += u.output_tokens || 0; }
         }
-        const u = d.message.usage;
         const inp = u.input_tokens || 0, out = u.output_tokens || 0;
         const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
-        const prov = providerOf(d.message.id);
+        const prov = providerOf(d.message.id, d.message.model);
         const p = priceForModel(d.message.model, prov);
         const cInp = inp * p.input / 1e6, cOut = out * p.output / 1e6;
         const cCr = cr * p.cacheRead / 1e6;
@@ -805,9 +847,9 @@ function loadStatsCache() {
   if (_statsCache) return _statsCache;
   try {
     const d = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    if (d && d.version === 11 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
+    if (d && d.version === 13 && d.sessions && d.pricingSig === PRICING_SIG) _statsCache = d;
   } catch { /* missing/corrupt → start fresh */ }
-  if (!_statsCache) _statsCache = { version: 11, pricingSig: PRICING_SIG, sessions: {} };
+  if (!_statsCache) _statsCache = { version: 13, pricingSig: PRICING_SIG, sessions: {} };
   return _statsCache;
 }
 // The cache is a few hundred KB, and a watched server rebuilds its list every time a
@@ -1706,12 +1748,24 @@ function periodView(st, kind, key) {
   };
 }
 
+// A running mux session's title in a list row. The transcript's title wins — it is the agent's, and the mux only reads it back at
+// turn ends — except where the disk row has none of its own: a title that is only the
+// registry's derived name (ccbb-a5), or one a -n name the mux has not yet written over.
+// In both the page already shows the mux's title, and the list must match it.
+function muxTitle(disk, r) {
+  if (disk.title && !disk.titleDerived && !r.titlePending) return disk.title;
+  return r.title || disk.title;
+}
+
 // One list row from a session's stats, plus its live-registry record when it has one.
 function sessionRow(sessionId, projectPath, stats, rec) {
   const cat = stats.categories;
   return {
     sessionId,
     title: stats.title || (rec ? rec.name : '') || '',
+    // Claude's registry name when the transcript has no title: derived (ccbb-a5) unless
+    // set by hand. A mux row's own title outranks it (mergeMuxRows).
+    ...(!stats.title && rec && rec.name && rec.nameSource !== 'user' ? { titleDerived: true } : {}),
     live: !!rec,
     liveStatus: rec ? rec.status : null,
     liveStatusAt: rec ? rec.statusUpdatedAt : null,
@@ -1835,12 +1889,10 @@ function sessionContribution(usagePaths) {
   let lastUserTs = null;
   for (const fp of usagePaths) {
     const isSub = fp !== mainPath;
-    let text;
-    try { text = fs.readFileSync(fp, 'utf8'); } catch { continue; }
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      let d;
-      try { d = JSON.parse(line); } catch { continue; }
+    let entries;
+    try { entries = parseJsonl(fs.readFileSync(fp, 'utf8')); } catch { continue; }
+    const fin = finalResponses(entries);
+    for (const d of entries) {
       // Anchor for response time: the last user entry (prompt or tool_result) before an
       // assistant message. Main transcript only — subagent turns are billed but their
       // timings aren't part of the session's measured response. Mirrors computeSessionStats.
@@ -1852,10 +1904,12 @@ function sessionContribution(usagePaths) {
       const dkey = d.message.id ? d.message.id + '|' + (d.requestId || '') : null;
       if (dkey && seen.has(dkey)) continue;
       if (dkey) seen.add(dkey);
-      const u = d.message.usage;
+      const f = dkey && fin.get(dkey);
+      const u = (f && f.usage) || d.message.usage;
+      const endTs = (f && f.endTs) || d.timestamp;
       const inp = u.input_tokens || 0, out = u.output_tokens || 0;
       const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
-      const prov = providerOf(d.message.id);
+      const prov = providerOf(d.message.id, d.message.model);
       const p = priceForModel(d.message.model, prov);
       const cc = u.cache_creation || null;
       const cw5 = cc ? (cc.ephemeral_5m_input_tokens || 0) : cw;
@@ -1868,8 +1922,8 @@ function sessionContribution(usagePaths) {
       const miss = (cr === 0 && !isFirst);
       // null (not 0) when unmeasurable, so addToBucket can tell "no sample" from "0ms".
       let respMs = null;
-      if (!isSub && d.timestamp && lastUserTs != null) {
-        const r = Date.parse(d.timestamp) - lastUserTs;
+      if (!isSub && endTs && lastUserTs != null) {
+        const r = Date.parse(endTs) - lastUserTs;
         if (r >= 0) respMs = r;
       }
       const m = {
@@ -1922,6 +1976,7 @@ function codexWindows(limits) {
 }
 
 module.exports = {
+  muxTitle, sessionRow,
   codexWindows,
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
