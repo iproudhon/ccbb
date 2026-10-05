@@ -25,9 +25,9 @@ let ws;
  const send=(method,params={})=>new Promise(r=>{const n=++id;waiting.set(n,r);ws.send(JSON.stringify({id:n,method,params}));});
  const evaluate=async expression=>{const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.result.exceptionDetails)throw new Error(JSON.stringify(r.result.exceptionDetails));return r.result.result.value;};
  await send('Page.enable');await send('Page.addScriptToEvaluateOnNewDocument',{source:'window.testErrors=[];window.addEventListener("error",e=>window.testErrors.push(e.message));window.addEventListener("unhandledrejection",e=>window.testErrors.push(String(e.reason)));'});await send('Emulation.setDeviceMetricsOverride',{width:1280,height:900,deviceScaleFactor:1,mobile:false});await send('Page.navigate',{url:base+'/'+q});
- for(let i=0;i<100;i++){if(await evaluate('!!Array.from(document.querySelectorAll("button")).find(b=>b.getAttribute("aria-label")==="New session")'))break;await sleep(100);}
+ for(let i=0;i<100;i++){if(await evaluate('!!document.querySelector(".chip-term[data-menu]")'))break;await sleep(100);}
  assert(await evaluate('!document.querySelector("#agentFilter")'),'agent filter removed');
- assert(await evaluate('Array.from(document.querySelectorAll("button")).find(b=>b.getAttribute("aria-label")==="New session").textContent==="+"'),'new-session button is just plus');
+ assert(await evaluate('(function(){var b=document.querySelector(".chip-term[data-menu]");b.click();var ok=Array.from(document.querySelectorAll(".ns-menu .ns-mi")).map(function(m){return m.textContent;}).join("|")==="+New session|>_Terminal|Explorer";var m=document.querySelector(".ns-menu");if(m)m._close();return ok;})()'),'server chip menu offers new session, terminal, explorer');
  assert.equal(await evaluate('shortSessionId("codex:01a08f8a-37fe-7492-a82c-f5480b18874c")'),'01a08f8a','native Codex ID is displayed');
  async function checkHistoryWindow(tail) {
    for (const agent of ['codex','claude']) {
@@ -83,7 +83,7 @@ let ws;
  assert(await evaluate('document.body?.textContent.includes("Shared client works.")'),'mobile Codex history renders');
  assert(await evaluate('getComputedStyle(document.querySelector(".muxv .input-area")).display==="none"'),'mobile history has no composer');
  assert(await evaluate('getComputedStyle(document.querySelector(".phead .dot")).width==="14px"'),'activity circle is 14px');
- assert(await evaluate('!!Array.from(document.querySelectorAll("button")).find(b=>b.textContent==="+ Codex")'),'phone offers Codex creation');
+ assert(await evaluate('(function(){var b=document.querySelector(".cterm[data-menu]");if(!b)return false;b.click();var ok=Array.from(document.querySelectorAll(".ns-menu .ns-mi")).some(function(m){return m.textContent.indexOf("New session")>=0;});var m=document.querySelector(".ns-menu");if(m)m._close();return ok;})()'),'phone offers session creation from the server chip');
  assert(await evaluate('!document.querySelector("select[data-r=agent]")'),'mobile agent filter removed');
  assert(await evaluate('document.querySelector(".phead .dot svg").getAttribute("fill")==="#fff"'),'mobile Codex mark is white');
  await evaluate('document.querySelector(".phead [data-r=title]").click()');

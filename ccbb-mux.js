@@ -109,6 +109,34 @@ function resolveBin(bin) {
   e.code = 'EINVAL'; throw e;
 }
 
+// Every claude*/codex* executable on PATH, first hit per name — what the new-session
+// dialog offers. Names, not paths, because that is what resolveBin is handed back.
+function scanBins() {
+  const seen = new Map();
+  for (const d of String(process.env.PATH || '').split(path.delimiter)) {
+    let names; try { names = fs.readdirSync(d); } catch { continue; }
+    for (const n of names) {
+      if (seen.has(n) || !/^(claude|codex)/i.test(n)) continue;
+      const f = path.join(d, n);
+      try { if (!fs.statSync(f).isFile()) continue; fs.accessSync(f, fs.constants.X_OK); } catch { continue; }
+      seen.set(n, { name: n, path: f, agent: agentOfBin(n) });
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// `~` expanded and the result required to be a directory — a typo'd cwd would otherwise
+// spawn in it anyway (claude) or fail deep inside an RPC (codex).
+function resolveCwd(cwd) {
+  if (!cwd) return cwd;
+  let d = String(cwd).trim();
+  if (d === '~' || d.startsWith('~/')) d = path.join(os.homedir(), d.slice(1));
+  d = path.resolve(d);
+  let st; try { st = fs.statSync(d); } catch {}
+  if (!st || !st.isDirectory()) { const e = new Error(`working directory '${cwd}' ${st ? 'is not a directory' : 'does not exist'}`); e.code = 'EINVAL'; throw e; }
+  return d;
+}
+
 function buildArgs(opt) {
   const a = [
     '--print',
@@ -1326,6 +1354,8 @@ class Mux {
   create(o) {
     o = o || {};
     if (o.agent && !['claude', 'codex'].includes(o.agent)) throw new Error('Unknown agent');
+    // A remote codex app-server resolves its cwd on its own machine, not this one.
+    if (o.cwd && !(o.agent === 'codex' && process.env.CCBB_CODEX_ENDPOINT)) o.cwd = resolveCwd(o.cwd);
     if (o.agent === 'codex') {
       if (!this.codexCreates) this.codexCreates = new Map();
       const key = o.resume && !o.fork ? o.resume.replace(/^codex:/, '') : uuid();
@@ -1432,6 +1462,7 @@ class Mux {
         } finally {rpc.close();}
       })().catch(e=>send(503,{error:e.message})); return;
     }
+    if (p === '/api/bins' && req.method === 'GET') return send(200, { bins: scanBins() });
     if (p === '/api/sessions' && req.method === 'GET') return send(200, { sessions: this.list() });
     if (p === '/api/sessions' && req.method === 'POST') {
       let body = '';

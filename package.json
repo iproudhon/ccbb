@@ -28,7 +28,8 @@
     "docs/proxy.md",
     "ccbb-mobile.js",
     "LICENSE",
-    "ccbb-codex-session.js"
+    "ccbb-codex-session.js",
+    "ccbb-newsession-ui.js"
   ],
   "engines": {
     "node": ">=18"

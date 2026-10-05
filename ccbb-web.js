@@ -252,6 +252,7 @@ function webManifest(self) {
 // ccbb's behaviour for them — hoisted rather than copied, for the same reason APP_CSS was.
 const SHARED_JS = `
 ${require('./ccbb-common').codexWindows.toString()}
+${require('./ccbb-newsession-ui').JS}
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -270,7 +271,8 @@ function fmtStatDate(iso){ return fd(iso); }
 var OPENAI_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"></path></svg>';
 var CLAUDE_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"></path></svg>';
 function shortSessionId(id) { return String(id || '').replace(/^codex:/, '').slice(0, 8); }
-function activityGlyph(agent, mux) { return agent === 'codex' ? OPENAI_GLYPH : (mux ? CLAUDE_GLYPH : ''); }
+// Every session carries its agent's mark, running or not; the circle's colour is the activity.
+function activityGlyph(agent) { return agent === 'codex' ? OPENAI_GLYPH : CLAUDE_GLYPH; }
 
 // ── subscription windows ──
 // A Claude.ai plan runs out of WINDOW, not money, so the two rolling limits travel next
@@ -546,17 +548,37 @@ function renderCmdOutput(d) {
 // transcript instead of eating half of it. In-page rather than a real popup: one
 // window.open per output is blocked as often as it is allowed, and the phone has no
 // second window at all.
-var FLW_SEQ = 0;
-function floatWin(title, fill, host, onClose) {
+var FLW_SEQ = 0, FLW_Z = 60;
+// opts.persist: a localStorage key the window's place and size are kept under — restored
+// on open, written when a drag or resize ends. Minimized and maximized are not states
+// anyone wants to reopen into, so they are never what gets written.
+function floatWin(title, fill, host, onClose, opts) {
   var root = host || document.body;
   var w = document.createElement('div');
   w.className = 'flw';
   // Cascade, so a second detach does not land exactly on the first.
   var n = (FLW_SEQ++ % 6) * 26;
-  w.style.left = Math.max(8, Math.min(60 + n, window.innerWidth - 340)) + 'px';
-  w.style.top = Math.max(8, Math.min(70 + n, window.innerHeight - 200)) + 'px';
-  w.style.width = Math.max(300, Math.min(880, window.innerWidth - 100)) + 'px';
-  w.style.height = Math.max(220, Math.min(620, window.innerHeight - 160)) + 'px';
+  var g = null, key = opts && opts.persist;
+  if (key) { try { g = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { g = null; } }
+  if (g && isFinite(g.x) && isFinite(g.y) && isFinite(g.w) && isFinite(g.h)) {
+    var gw = Math.max(260, Math.min(g.w, window.innerWidth)), gh = Math.max(140, Math.min(g.h, window.innerHeight));
+    w.style.width = gw + 'px'; w.style.height = gh + 'px';
+    w.style.left = Math.max(0, Math.min(g.x, window.innerWidth - 60)) + 'px';
+    w.style.top = Math.max(0, Math.min(g.y, window.innerHeight - 40)) + 'px';
+  } else {
+    w.style.left = Math.max(8, Math.min(60 + n, window.innerWidth - 340)) + 'px';
+    w.style.top = Math.max(8, Math.min(70 + n, window.innerHeight - 200)) + 'px';
+    w.style.width = Math.max(300, Math.min(880, window.innerWidth - 100)) + 'px';
+    w.style.height = Math.max(220, Math.min(620, window.innerHeight - 160)) + 'px';
+  }
+  if (key) w._saveGeom = function () {
+    if (w.classList.contains('min') || w.classList.contains('max')) return;
+    var r = w.getBoundingClientRect();
+    try { localStorage.setItem(key, JSON.stringify({ x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) })); } catch (e) {}
+  };
+  // The one you touch comes to the front, as windows do.
+  w.style.zIndex = ++FLW_Z;
+  w.addEventListener('pointerdown', function () { w.style.zIndex = ++FLW_Z; }, true);
   // The same three as the docked panel, in the same glyphs: minimize to the title bar,
   // maximize to the viewport, and the one you are in toggles back to normal.
   w.innerHTML = '<div class="flw-head"><span class="flw-title"></span>'+
@@ -630,6 +652,7 @@ function flwDrag(w, handle, mode) {
       handle.removeEventListener('pointerup', up);
       handle.removeEventListener('pointercancel', up);
       w.classList.remove('dragging');
+      if (w._saveGeom) w._saveGeom();
     }
     handle.addEventListener('pointermove', move);
     handle.addEventListener('pointerup', up);
@@ -717,8 +740,7 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
    one dots button now, and that button unfolds the rest: the buttons open in the bar
    itself, to the left of the dots, and the header hangs down from the bar's lower edge.
    Click again — or outside, or Escape — to fold it all away. */
-.vb-acts{display:none;gap:2px}
-.bar-btns.open .vb-acts{display:flex}
+.bar-btns.open .vb-dots{background:var(--accent-soft);color:var(--accent)}
 /* Fixed and placed as it opens, because in horizontal mode the bar is a grid cell with
    overflow:hidden and a block positioned against it would be clipped away. Placed at the
    bar's own left edge and width, so it reads as the bar continuing downwards. */
@@ -747,6 +769,13 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
    grid-template-columns and the maxed body's column span are set per-relayout in JS. ── */
 #views.horizontal{display:grid;grid-template-rows:auto minmax(0,1fr)}
 #views.horizontal .view{display:contents}
+.drag-ghost{position:fixed;z-index:200;pointer-events:none;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding:5px 10px;border-radius:7px;background:var(--bg);border:1px solid var(--accent);box-shadow:0 8px 24px rgba(0,0,0,.2);
+  font-size:12.5px;font-weight:600;color:var(--ink)}
+.drag-line{position:fixed;z-index:199;pointer-events:none;height:3px;background:var(--accent);border-radius:2px}
+.drag-line.v{width:3px;height:auto}
+body.view-dragging,body.view-dragging *{cursor:grabbing!important;user-select:none!important}
+.view.dragging .view-bar,.view.dragging>.view-body{opacity:.45}
 /* min-width:0 so the bar can be narrower than its own content, and overflow:hidden so
    what does not fit is clipped inside its own column instead of spilling across the
    neighbour's. The body already had both; the bar is the grid item that did not. */
@@ -1265,8 +1294,8 @@ body{font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helve
   font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:3px 6px;text-align:right}
 .term-cfg input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .term-cfg .cx{color:var(--ink-faint)}
-.lv .chip-term{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:11px;color:#8c959f;
-  border-radius:5px;padding:0 4px;margin:-2px -6px -2px 0;line-height:1.6}
+.lv .chip-term{font-weight:700;font-size:13px;color:#8c959f;
+  border-radius:5px;padding:0 5px;margin:-2px -6px -2px 0;line-height:1.4}
 .lv .chip-term:hover{background:#d0d7de;color:#1f2328}
 /* toast (replaces alert(): alerts block browser automation and yank focus) */
 #toast{position:fixed;bottom:18px;right:18px;background:#3d3d3a;color:#fff;border-radius:10px;padding:10px 16px;font-size:13px;z-index:99;display:none;max-width:420px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
@@ -1403,6 +1432,12 @@ function toggleOrientation(){
   relayout();
 }
 function relayout(){
+  // Maximize reads differently depending on where the view already is; every bar's
+  // copy is rewritten here, since every path that changes it comes through.
+  views.forEach(function(v){
+    var mb = v.barEl && v.barEl.querySelector('.vb-btn[data-act="max"]');
+    if (mb) { mb.innerHTML = v.maxed ? '&#10064;' : '&#9633;'; mb.title = v.maxed ? 'Normal size' : 'Maximize'; }
+  });
   // Folding the ONLY view would leave a bar over a blank page with nothing to reveal —
   // so a lone view is never folded, and closing the last session unfolds the list again.
   if (views.length < 2) views.forEach(function(v){ v.folded = false; });
@@ -1470,7 +1505,7 @@ function toggleFold(v){
 }
 function closeView(v){
   var idx = views.indexOf(v);
-  if (idx <= 0) return;   // list view (idx 0) is not closable
+  if (idx < 0 || v.kind === 'list') return;   // the list is not closable, wherever it sits
   if (v.destroy) v.destroy();
   viewsEl.removeChild(v.el);
   views.splice(idx, 1);
@@ -1487,6 +1522,13 @@ function setUnseen(v, on){
 // opens, with the same remembered place, font and grid.
 function viewBtnsHtml(buttons){
   var menu = !!(buttons && buttons.menu);
+  // A session bar: the window buttons stay in the bar — ▶ when there is something to
+  // resume, then minimize, maximize, close — and everything else is in the ⋮ menu.
+  if (menu) return (buttons.resume && !RO ? '<button class="vb-btn vb-resume" data-act="resume" hidden '+
+      'aria-label="Start mux session" title="Resume this session in the mux">&#9654;</button>' : '')+
+    '<button class="vb-btn" data-act="fold" title="Minimize">&#8211;</button>'+
+    '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
+    (buttons.close ? '<button class="vb-btn" data-act="close" title="Close">&#10005;</button>' : '');
   return '<button class="vb-btn" data-act="refresh" title="Refresh">&#8635;</button>'+
     (menu ? '<button class="vb-btn" data-act="fold" title="Minimize">&#8211;</button>' : '')+
     '<button class="vb-btn" data-act="max" title="Maximize">&#9633;</button>'+
@@ -1558,7 +1600,7 @@ function makeViewBar(v, barMain, buttons){
   btns.className = 'bar-btns';
   var head = null, foldable = !!(buttons && buttons.menu);
   if (foldable) {
-    btns.innerHTML = '<span class="vb-acts">' + viewBtnsHtml(buttons) + '</span>' +
+    btns.innerHTML = viewBtnsHtml(buttons) +
       '<button class="vb-btn vb-dots" data-act="menu" title="Actions and details">&#8942;</button>';
     if (buttons.headEl) {
       head = document.createElement('div');
@@ -1570,13 +1612,19 @@ function makeViewBar(v, barMain, buttons){
   }
   bar.appendChild(btns);
   if (head) bar.appendChild(head);
+  if (foldable) nsWatchWidth(bar, bar);
+  wireViewDrag(v, bar);
 
+  // ⋮ opens the header block hanging from the bar, with the view's menu docked in it
+  // as a right-hand column (sessionMenuDock) — one panel, nothing floating over it.
+  var pop = null;
   function menuIsOpen(){ return btns.classList.contains('open'); }
   function onDocDown(e){ if (!bar.contains(e.target)) closeMenu(); }
   function onDocKey(e){ if (e.key === 'Escape') closeMenu(); }
   function closeMenu(){
     if (!menuIsOpen()) return;
     btns.classList.remove('open');
+    if (pop) { pop.remove(); pop = null; if (head) head.classList.remove('docked'); }
     if (head) head.classList.remove('open');
     document.removeEventListener('mousedown', onDocDown, true);
     document.removeEventListener('keydown', onDocKey, true);
@@ -1584,10 +1632,6 @@ function makeViewBar(v, barMain, buttons){
   }
   function openMenu(){
     if (!foldable || menuIsOpen()) return;
-    // Maximize is the one button that reads differently depending on where the view
-    // already is, so it is written as it unfolds rather than left stale.
-    var mb = btns.querySelector('.vb-btn[data-act="max"]');
-    if (mb) { mb.innerHTML = v.maxed ? '&#10064;' : '&#9633;'; mb.title = v.maxed ? 'Normal size' : 'Maximize'; }
     btns.classList.add('open');
     if (head) {
       // Measured after the buttons are in, since showing them can grow the bar.
@@ -1600,6 +1644,9 @@ function makeViewBar(v, barMain, buttons){
     document.addEventListener('mousedown', onDocDown, true);
     document.addEventListener('keydown', onDocKey, true);
     window.addEventListener('resize', closeMenu);
+    var m = v.menu && head ? v.menu() : null;
+    if (m) m.win = btns.querySelectorAll('.vb-btn:not(.vb-dots)');
+    if (m) { pop = sessionMenuDock(m, closeMenu); head.appendChild(pop); head.classList.add('docked'); }
   }
   v.closeMenu = closeMenu;
 
@@ -1631,6 +1678,77 @@ function makeViewBar(v, barMain, buttons){
   });
   v.barEl = bar;
   return bar;
+}
+// ── drag to rearrange ──
+// A view is picked up by its bar. Nothing happens until the pointer has travelled 6px,
+// so a click — on the title to rename it, on a collapsed bar to reveal it — is still a
+// click; buttons, inputs and the open header block are never handles. The drop slot is
+// shown as a line between views, along whichever axis the layout stacks them, and the
+// click that ends a drag is swallowed so it cannot also act on what is under it.
+function viewSpan(v){
+  // Horizontal flattens each .view (display:contents), so its box is its bar plus body.
+  var a = v.barEl.getBoundingClientRect(), b = v.bodyEl ? v.bodyEl.getBoundingClientRect() : a;
+  if (!b.width && !b.height) b = a;
+  return { left: Math.min(a.left, b.left), right: Math.max(a.right, b.right), top: Math.min(a.top, b.top), bottom: Math.max(a.bottom, b.bottom) };
+}
+function wireViewDrag(v, bar){
+  bar.addEventListener('pointerdown', function(e){
+    if (e.button !== 0 || e.target.closest('button, input, .vb-head, .bar-btns')) return;
+    var x0 = e.clientX, y0 = e.clientY, dragging = false, ghost = null, line = null, slot = -1;
+    var horiz = orientation === 'horizontal';
+    function others(){ return views.filter(function(o){ return o !== v; }); }
+    function start(){
+      dragging = true;
+      if (v.closeMenu) v.closeMenu();
+      ghost = document.createElement('div'); ghost.className = 'drag-ghost';
+      var t = bar.querySelector('.hdr-title, .bar-title');
+      ghost.textContent = t ? t.textContent : '';
+      line = document.createElement('div'); line.className = 'drag-line' + (horiz ? ' v' : '');
+      document.body.appendChild(ghost); document.body.appendChild(line);
+      v.el.classList.add('dragging');
+      document.body.classList.add('view-dragging');
+    }
+    function move(ev){
+      if (!dragging) {
+        if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) < 6) return;
+        start();
+      }
+      ghost.style.left = (ev.clientX + 12) + 'px'; ghost.style.top = (ev.clientY + 8) + 'px';
+      var os = others(), pos = horiz ? ev.clientX : ev.clientY;
+      slot = 0;
+      os.forEach(function(o){ var r = viewSpan(o); if (pos > (horiz ? (r.left + r.right) / 2 : (r.top + r.bottom) / 2)) slot++; });
+      var vr = viewsEl.getBoundingClientRect(), at;
+      if (!os.length) at = horiz ? vr.left : vr.top;
+      else if (slot === 0) { var f = viewSpan(os[0]); at = horiz ? f.left : f.top; }
+      else { var p = viewSpan(os[slot - 1]); at = horiz ? p.right : p.bottom; }
+      if (horiz) { line.style.left = (at - 1) + 'px'; line.style.top = vr.top + 'px'; line.style.height = vr.height + 'px'; line.style.width = ''; }
+      else { line.style.top = (at - 1) + 'px'; line.style.left = vr.left + 'px'; line.style.width = vr.width + 'px'; line.style.height = ''; }
+    }
+    function up(){
+      document.removeEventListener('pointermove', move, true);
+      document.removeEventListener('pointerup', up, true);
+      document.removeEventListener('pointercancel', up, true);
+      if (!dragging) return;
+      ghost.remove(); line.remove();
+      v.el.classList.remove('dragging');
+      document.body.classList.remove('view-dragging');
+      // The click a drop produces lands right after pointerup; one that never comes must
+      // not leave a trap for the next real click.
+      function swallow(ce){ ce.stopPropagation(); ce.preventDefault(); document.removeEventListener('click', swallow, true); }
+      document.addEventListener('click', swallow, true);
+      setTimeout(function(){ document.removeEventListener('click', swallow, true); }, 300);
+      var os = others();
+      if (slot < 0) return;
+      os.splice(slot, 0, v);
+      if (os.every(function(o, i){ return o === views[i]; })) return;
+      views.length = 0; Array.prototype.push.apply(views, os);
+      views.forEach(function(o){ viewsEl.appendChild(o.el); });
+      relayout();
+    }
+    document.addEventListener('pointermove', move, true);
+    document.addEventListener('pointerup', up, true);
+    document.addEventListener('pointercancel', up, true);
+  });
 }
 function openSession(sid, server, mux, title){
   try { sid = decodeURIComponent(sid); } catch(e) {}
@@ -1686,32 +1804,6 @@ function createListView(){
     '<span class="bar-title" id="barTitle"></span><span class="bar-refreshed" id="refreshed"></span>';
   barMain.querySelector('#barTitle').textContent = 'ccbb — ' + SELF.name;
   el.appendChild(makeViewBar(v, barMain, { close:false, orient:true }));
-  if (!RO) {
-    var createBtn = document.createElement('button'); createBtn.className = 'vb-btn'; createBtn.textContent = '+'; createBtn.title = 'New session'; createBtn.setAttribute('aria-label', 'New session');
-    createBtn.onclick = function(){
-      var dialog = document.createElement('dialog');
-      dialog.innerHTML = '<form><h3>Open session</h3><p><label>Agent <select name="agent"><option value="claude">Claude</option><option value="codex">Codex</option></select></label></p><p class="claude-bin"><label>Claude binary <input name="bin" placeholder="claude, claude.pass, or path"></label></p><p><label>Working directory <input name="cwd" placeholder="Server working directory"></label></p><p><label>Loaded Codex thread ID (optional) <input name="resume" list="codexLoaded" placeholder="New thread when empty"><datalist id="codexLoaded"></datalist></label></p><p><label><input type="checkbox" name="fork"> Fork into a new session</label></p><p class="error"></p><button type="submit">Open</button> <button type="button" class="cancel">Cancel</button></form>';
-      document.body.appendChild(dialog); dialog.showModal();
-      dialog.querySelector('select[name=agent]').onchange = function(){
-        dialog.querySelector('.claude-bin').hidden = this.value === 'codex';
-        if(this.value !== 'codex') return;
-        fetch('/mux/api/codex/loaded').then(function(r){return r.json();}).then(function(d){
-          var list=dialog.querySelector('datalist'); list.innerHTML='';
-          (d.threads||[]).forEach(function(t){var o=document.createElement('option');o.value=t.id;o.textContent=t.title;list.appendChild(o);});
-          if(d.error)dialog.querySelector('.error').textContent=d.error;
-        }).catch(function(e){dialog.querySelector('.error').textContent=e.message;});
-      };
-      dialog.querySelector('.cancel').onclick = function(){dialog.remove();};
-      dialog.querySelector('form').onsubmit = async function(e){
-        e.preventDefault(); var f=e.target; var b=f.querySelector('button[type=submit]'); b.disabled=true;
-        try {
-          var r=await fetch('/mux/api/sessions', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:f.elements.agent.value,bin:f.elements.agent.value==='claude'?f.elements.bin.value.trim():undefined,cwd:f.elements.cwd.value||undefined,resume:f.elements.resume.value||undefined,fork:f.elements.fork.checked})});
-          var d=await r.json(); if(!r.ok) throw new Error(d.error||'Could not open session');
-          dialog.remove(); openSession(d.session.id,null,true,d.session.title); v.refresh();
-        } catch(err){f.querySelector('.error').textContent=err.message;b.disabled=false;}
-      };
-    }; barMain.appendChild(createBtn);
-  }
   var refreshedEl = barMain.querySelector('#refreshed');
   // The chevron reflects THIS view's fold, not whether it happens to be collapsed —
   // a list hidden because a session is maximized still shows itself as unfolded.
@@ -1795,7 +1887,7 @@ function createListView(){
       return '<span class="chip'+(on?' on':'')+'" data-srv="'+esc(s.name)+'" title="'+esc(tip)+'">'
         + '<span class="sdot '+esc(s.status||'unknown')+'"></span>'
         + '<span class="cname">'+esc(s.name)+'</span>'
-        + (RO ? '' : '<span class="chip-term" data-term="'+esc(s.name)+'" title="Open a terminal on '+esc(s.name)+'">&gt;_</span>')
+        + (RO ? '' : '<span class="chip-term" data-menu="'+esc(s.name)+'" title="New session, terminal, explorer on '+esc(s.name)+'">&#8942;</span>')
         + '</span>';
     }).join('');
   }
@@ -2308,8 +2400,14 @@ function createListView(){
       ? 'Claude total: '+(tc?fc(totals.totalCost):'')+(tc&&tt?' | ':'')+(tt?ft(totals.totalTokens)+' tokens':'') : '';
   }
   body.addEventListener('click', function(e) {
-    var tbtn = e.target.closest('.chip-term[data-term]');
-    if (tbtn) { openTerminalWindow(tbtn.dataset.term); return; }
+    var tbtn = e.target.closest('.chip-term[data-menu]');
+    if (tbtn) {
+      var name = tbtn.dataset.menu;
+      serverChipMenu(tbtn, { server: name, base: apiBase(name),
+        onTerm: function(){ openTerminalWindow(name); },
+        onOpened: function(s){ openSession(s.id, name, true, s.title || ''); v.refresh(); } });
+      return;
+    }
     var chip = e.target.closest('.chip[data-srv]');
     if (chip) { toggleServer(chip.dataset.srv); return; }
     // Session links open a stacked view instead of navigating (middle-click still works).
@@ -2550,6 +2648,7 @@ function wireSessionTerm(v, el, body, INFO, SRV, hooks){
     if (hooks.onClose) hooks.onClose();
   }
   v.onTerm = function(){ if (termRef) closeSessionTerm(); else openSessionTerm(); };
+  v.termOn = function(){ return !!termRef; };
   // For the view's own teardown: a terminal left running would keep a tmux client
   // attached to a window nobody is looking at.
   v.closeTerm = closeSessionTerm;
@@ -2681,11 +2780,14 @@ function createMuxSessionView(INFO){
   });
   v.onResume = async function(){
     if (RO || !INFO.snapshot) return;
+    // Used only when the app-server has to be launched, but chosen like any other start.
+    var bin = await pickBinary({ server: SRV, base: API, agent: 'codex', title: INFO.title || '' });
+    if (!bin) return;
     var btn = el.querySelector('.vb-resume');
     if (btn) btn.disabled = true;
     try {
       var r = await fetch(API+'/mux/api/sessions', {method:'POST', headers:{'content-type':'application/json'},
-        body:JSON.stringify({agent:'codex', resume:INFO.sessionId, startInactive:true})});
+        body:JSON.stringify({agent:'codex', bin:bin, resume:INFO.sessionId, startInactive:true})});
       var d = await r.json();
       if (!r.ok) throw new Error(d.error || 'Could not start mux session');
       closeView(v); openSession(d.session.id, INFO.server, true, d.session.title);
@@ -2703,8 +2805,36 @@ function createMuxSessionView(INFO){
     try { v.client.destroy({ closeSession: true }); } catch(e){}
   };
   v.onExpanded = function(){ v.client.onVisible(); };
-  v.refresh = function(){};
+  // A live session resyncs by reconnecting: the mux sends a fresh snapshot on attach.
+  v.refresh = function(){ if (v.client && v.client.drop) v.client.drop(); fetchSub(); };
+  // Mux sessions only: the mux owns the process, so it can end it. Confirmed, because
+  // there is no taking it back.
+  v.onTerminate = function(){
+    if (!window.confirm('Terminate "' + (titleEl.textContent || shortSessionId(INFO.sessionId)) + '" on ' + SRV + '?')) return;
+    fetch(API+'/mux/api/sessions/'+encodeURIComponent(INFO.sessionId)+'/stop', { method:'POST' })
+      .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(d){ if (!r.ok) throw new Error(d.error || 'Could not terminate'); }); })
+      .then(function(){ closeView(v); })
+      .catch(function(e){ toast(e.message); });
+  };
+  v.menu = function(){
+    var live = !INFO.snapshot;
+    return {
+      refresh: v.refresh,
+      explore: RO ? null : function(){ sessionExplore(SRV, API, INFO.server, (lastChrome && lastChrome.cwd) || INFO.projectPath); },
+      term: !RO && live ? v.onTerm : null, termOn: v.termOn,
+      termWin: !RO && live ? v.onTermWin : null,
+      terminate: RO ? false : live ? v.onTerminate : null, terminateWhy: 'Not running',
+    };
+  };
   return v;
+}
+
+// The explorer a session's ⋮ opens: that session's server, at its working directory.
+function sessionExplore(srvName, api, server, cwd){
+  openExplorer({ server: srvName, base: api, start: cwd || undefined, onNewHere: function(dir){
+    openNewSession({ server: srvName, base: api, cwd: dir,
+      onOpened: function(s){ openSession(s.id, server, true, s.title || ''); } });
+  } });
 }
 
 function createSessionView(INFO){
@@ -2721,7 +2851,7 @@ function createSessionView(INFO){
   // — bar: status dot + originating server + renamable title —
   var barMain = document.createElement('div');
   barMain.style.cssText = 'display:flex;align-items:center;gap:10px;flex:1;min-width:0';
-  barMain.innerHTML = '<div class="status-dot"></div>'
+  barMain.innerHTML = '<div class="status-dot">'+activityGlyph('claude')+'</div>'
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
     + '<div class="hdr-title">Loading…</div>';
   // The header block. It is built here — renderStats writes into these same elements
@@ -3758,6 +3888,14 @@ function createSessionView(INFO){
     }
   });
 
+  v.menu = function(){
+    return {
+      refresh: v.refresh,
+      explore: RO ? null : function(){ sessionExplore(SRV, API, INFO.server, INFO.projectPath); },
+      term: RO ? null : v.onTerm, termOn: v.termOn, termWin: RO ? null : v.onTermWin,
+      terminate: RO ? false : null, terminateWhy: 'Runs in a terminal \u2014 stop it there',
+    };
+  };
   // — refresh / destroy —
   v.refresh = function(){
     transcript.innerHTML = '';
@@ -3796,17 +3934,13 @@ function createSessionView(INFO){
   // the session id, so the row, the file on disk and this view all go on naming one
   // thing — which is also why the transcript view has to close before the mux view
   // opens: openSession dedupes on (server, id) and would otherwise just re-focus this.
-  v.onResume = function(){
+  v.onResume = async function(){
     if (RO) return;
     // The mux does not pick a binary: claude / claude.pass / claude.aws are different
     // accounts on the same host, so the choice is asked for every time and only the
-    // last answer is remembered, per browser.
-    var last = ''; try { last = localStorage.getItem('ccbb.muxBin') || ''; } catch(e) {}
-    var bin = window.prompt('Claude binary to resume with (claude, claude.pass, claude.aws, or a path)', last);
-    if (bin == null) return;
-    bin = bin.trim();
-    if (!bin) { toast('A binary is required'); return; }
-    try { localStorage.setItem('ccbb.muxBin', bin); } catch(e) {}
+    // last answer is remembered, per server.
+    var bin = await pickBinary({ server: SRV, base: API, agent: 'claude', title: INFO.title || '' });
+    if (!bin) return;
     var btn = el.querySelector('.vb-resume');
     if (btn) btn.disabled = true;
     fetch(API+'/mux/api/sessions', { method:'POST', headers:{'content-type':'application/json'},
@@ -4395,7 +4529,7 @@ if (INIT_OPEN) openSession(INIT_OPEN.sessionId, INIT_OPEN.server);
 function appPageHtml(initOpenSessionId, initOpenServer, ro) {
   const open = initOpenSessionId ? { sessionId: initOpenSessionId, server: initOpenServer || null } : null;
   return APP_HTML
-    .replace('__CCBB_CSS__', () => APP_CSS)
+    .replace('__CCBB_CSS__', () => APP_CSS + require('./ccbb-newsession-ui').CSS)
     .replace('__MUX_CSS__', () => (muxWeb ? muxWeb.APP_CSS : ''))
     .replace('__MUX_JS__', () => (muxWeb ? muxWeb.APP_JS : ''))
     .replace('__APP_JS__',
@@ -5622,6 +5756,52 @@ function authLevel(req, query) {
   if (ro && safeEq(got, ro)) return 'read';
   return null;
 }
+// `~` expanded, then made absolute and normalized — every answer carries the path it
+// actually looked at, so the client can show (and fill in) the canonical form.
+function fsResolve(p) {
+  p = String(p || '~').trim() || '~';
+  if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
+  return path.resolve(os.homedir(), p);
+}
+const FS_CAT_MAX = 1 << 20;
+function fsRequest(op, raw) {
+  const p = fsResolve(raw);
+  let st; try { st = fs.statSync(p); } catch (e) {
+    if (op === 'stat') return { path: p, exists: false, dir: false };
+    return { error: e.code === 'ENOENT' ? `no such file: ${p}` : e.message, code: e.code === 'ENOENT' ? 404 : 400, path: p };
+  }
+  if (op === 'stat') return { path: p, exists: true, dir: st.isDirectory(), size: st.size };
+  if (op === 'ls') {
+    if (!st.isDirectory()) return { error: `not a directory: ${p}`, path: p };
+    let names; try { names = fs.readdirSync(p); } catch (e) { return { error: e.message, code: 403, path: p }; }
+    const entries = [];
+    for (const name of names) {
+      // stat, not lstat: a symlink to a directory should be enterable like one.
+      let s; try { s = fs.statSync(path.join(p, name)); } catch { entries.push({ name, dir: false, size: 0, mtime: 0, broken: true }); continue; }
+      entries.push({ name, dir: s.isDirectory(), size: s.size, mtime: s.mtimeMs });
+    }
+    entries.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+    return { path: p, parent: path.dirname(p) === p ? null : path.dirname(p), entries };
+  }
+  if (st.isDirectory()) return { error: `is a directory: ${p}`, path: p };
+  let fd, buf;
+  try {
+    fd = fs.openSync(p, 'r');
+    buf = Buffer.alloc(Math.min(st.size, FS_CAT_MAX));
+    buf = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0));
+  } catch (e) { return { error: e.message, code: 403, path: p }; }
+  finally { if (fd != null) try { fs.closeSync(fd); } catch {} }
+  if (buf.subarray(0, 8192).includes(0)) return { error: `binary file: ${p}`, code: 415, path: p };
+  // Shaped like a //cat reply, so renderCmdOutput draws it the same way.
+  const content = buf.toString('utf8'), ext = path.extname(p).slice(1).toLowerCase();
+  const r = { path: p, size: st.size, truncated: st.size > buf.length, title: p, content };
+  // md and html come back as their rendered kind, with `lang` for the viewer's Text mode.
+  if (ext === 'md' || ext === 'markdown') { r.kind = 'markdown'; r.lang = 'markdown'; }
+  else if (ext === 'html' || ext === 'htm') { r.kind = 'html'; r.lang = 'xml'; }
+  else if (ext === 'diff' || ext === 'patch' || looksLikeDiff(content)) { r.kind = 'source'; r.lang = 'diff'; }
+  else { r.kind = 'source'; r.lang = langForFile(p); }
+  return r;
+}
 function sendForbidden(res, what) {
   send(res, 403, { error: `read-only token cannot ${what}` });
 }
@@ -6311,6 +6491,14 @@ function runWeb(args) {
       return send(res, 200, { months: Object.keys(getCostSummary().months).sort().reverse() });
     if (method === 'GET' && (m = pathname.match(/^\/session\/([^/]+)$/)))
       return sendHtml(res, appPageHtml(m[1], null, ro));   // deep link: app with this session opened
+    // ── server filesystem: the new-session dialog's cwd check and the explorer ──
+    // The whole filesystem, refused only to read-only callers: the same trust as >_,
+    // which already hands the caller a shell.
+    if (method === 'GET' && /^\/api\/fs\/(stat|ls|cat)$/.test(pathname)) {
+      if (ro) return sendForbidden(res, 'browse files');
+      const r = fsRequest(pathname.slice(8), query.get('path') || '~');
+      return send(res, r.error ? r.code || 400 : 200, r);
+    }
     // ── host terminals ──
     if (method === 'POST' && pathname === '/api/term/open') {
       if (ro) return sendForbidden(res, 'open a terminal');

@@ -224,6 +224,13 @@ body{
 .panel.exp,.panel.max{flex:1 1 auto}
 .panel.min .pbody{display:none}
 body.has-max .panel:not(.max){display:none}
+.panel.lifted{opacity:.5}
+.drag-ghost{position:fixed;z-index:200;pointer-events:none;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding:8px 12px;border-radius:10px;background:var(--bg);border:1px solid var(--accent);box-shadow:0 10px 28px rgba(0,0,0,.25);
+  font-size:14px;font-weight:600;color:var(--ink);transform:scale(1.04)}
+.drag-line{position:fixed;z-index:199;pointer-events:none;height:3px;background:var(--accent);border-radius:2px}
+.phead{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;touch-action:none}
+.phead input{-webkit-user-select:text;user-select:text}
 .phead{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;
   min-height:var(--head-h);background:var(--bg-alt);border-bottom:1px solid var(--line)}
 .panel.min .phead{border-bottom:none}
@@ -260,8 +267,6 @@ body.has-max .panel:not(.max){display:none}
    block cost two of the lines the transcript wanted. ⋮ unfolds the buttons where they
    were and the block below them; the next tap anywhere folds it back, so nothing stays
    open behind you. */
-.pacts{display:none;align-items:center;gap:2px}
-.panel.menu .pacts{display:flex}
 .panel:not(.menu) .subhead{display:none}
 .pbtn.pdots{font-size:18px}
 .panel.menu .pbtn.pdots{color:var(--accent)}
@@ -286,7 +291,7 @@ body.has-max .panel:not(.max){display:none}
   border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--ink-soft);background:var(--bg-alt)}
 .chip.on{border-color:var(--accent);color:var(--ink);background:var(--accent-soft)}
 .chip.down{opacity:.5}
-.chip .cterm{margin:-4px -6px -4px 2px;padding:4px 6px;font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:11px;border-radius:6px}
+.chip .cterm{margin:-4px -8px -4px 0;padding:4px 8px;background:none;border:none;color:inherit;font:inherit;font-weight:700;font-size:15px;line-height:1;border-radius:6px}
 .rows{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch}
 .srow{display:flex;flex-direction:column;gap:3px;padding:10px 12px;border-bottom:1px solid var(--line);min-height:56px;justify-content:center}
 .srow:active{background:var(--bg-alt)}
@@ -896,6 +901,71 @@ function addPanel(p){
   panels.push(p);
   stackEl.appendChild(p.el);
   applyState(p);
+  wirePanelDrag(p);
+}
+// Long-press a header (400ms, still) to pick the panel up, then drag it to a new place in
+// the stack. A tap is still a tap and a button is still a button: moving before the
+// press matures cancels it, and the click that ends a drag is swallowed. Not while a
+// panel is maximized — there is no stack on screen to drop into.
+function wirePanelDrag(p){
+  var head = p.el.querySelector('.phead');
+  if (!head) return;
+  head.addEventListener('pointerdown', function(e){
+    if (e.target.closest('button, input') || document.body.classList.contains('has-max')) return;
+    var x0 = e.clientX, y0 = e.clientY, pid = e.pointerId, dragging = false, ghost = null, line = null, slot = -1;
+    var timer = setTimeout(start, 400);
+    function others(){ return panels.filter(function(q){ return q !== p; }); }
+    function start(){
+      dragging = true;
+      try { head.setPointerCapture(pid); } catch (err) {}
+      if (navigator.vibrate) try { navigator.vibrate(10); } catch (err) {}
+      p.el.classList.add('lifted');
+      ghost = el('div', 'drag-ghost'); ghost.textContent = (head.querySelector('.ptitle') || {}).textContent || '';
+      line = el('div', 'drag-line');
+      document.body.appendChild(ghost); document.body.appendChild(line);
+      place(x0, y0);
+    }
+    function place(x, y){
+      ghost.style.left = Math.max(8, Math.min(x - 40, window.innerWidth - 200)) + 'px'; ghost.style.top = (y - 44) + 'px';
+      var os = others(), sr = stackEl.getBoundingClientRect(), at;
+      slot = 0;
+      os.forEach(function(q){ var r = q.el.getBoundingClientRect(); if (y > (r.top + r.bottom) / 2) slot++; });
+      if (!os.length) at = sr.top;
+      else if (slot === 0) at = os[0].el.getBoundingClientRect().top;
+      else at = os[slot - 1].el.getBoundingClientRect().bottom;
+      line.style.top = (at - 1) + 'px'; line.style.left = sr.left + 'px'; line.style.width = sr.width + 'px';
+    }
+    function move(ev){
+      if (ev.pointerId !== pid) return;
+      if (!dragging) { if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) > 8) stop(); return; }
+      ev.preventDefault();
+      place(ev.clientX, ev.clientY);
+    }
+    function stop(){
+      clearTimeout(timer);
+      document.removeEventListener('pointermove', move, true);
+      document.removeEventListener('pointerup', up, true);
+      document.removeEventListener('pointercancel', up, true);
+    }
+    function up(ev){
+      if (ev.pointerId !== pid) return;
+      stop();
+      if (!dragging) return;
+      ghost.remove(); line.remove(); p.el.classList.remove('lifted');
+      function swallow(ce){ ce.stopPropagation(); ce.preventDefault(); document.removeEventListener('click', swallow, true); }
+      document.addEventListener('click', swallow, true);
+      setTimeout(function(){ document.removeEventListener('click', swallow, true); }, 300);
+      if (ev.type === 'pointercancel' || slot < 0) return;
+      var os = others();
+      os.splice(slot, 0, p);
+      if (os.every(function(q, i){ return q === panels[i]; })) return;
+      panels.length = 0; Array.prototype.push.apply(panels, os);
+      panels.forEach(function(q){ stackEl.appendChild(q.el); });
+    }
+    document.addEventListener('pointermove', move, { capture: true, passive: false });
+    document.addEventListener('pointerup', up, true);
+    document.addEventListener('pointercancel', up, true);
+  });
 }
 function removePanel(p){
   var i = panels.indexOf(p);
@@ -905,15 +975,15 @@ function removePanel(p){
   p.el.remove();
   document.body.classList.toggle('has-max', panels.some(function(q){ return q.state==='max'; }));
   // Something has to be open, and the list is the only panel that is always there.
-  if (!panels.some(function(q){ return q.state !== 'min'; })) setState(panels[0], 'exp');
+  if (!panels.some(function(q){ return q.state !== 'min'; }))
+    setState(panels.filter(function(q){ return q.kind === 'list'; })[0] || panels[0], 'exp');
 }
-// menu:true folds the buttons behind a ⋮, as the desktop's session bar does. The buttons
-// are still built and still in the bar — only hidden — so everything that reaches for one
-// by data-k, p.onState included, finds it whether the menu is open or not.
+// menu:true adds a ⋮ after the buttons, as the desktop's session bar has: the window
+// buttons stay in the bar, and what the session can do is in the menu ⋮ opens (see
+// panelMenu).
 function headButtons(specs, menu){
   var wrap = el('div','pbtns');
   var host = wrap;
-  if (menu) { host = el('span','pacts'); wrap.appendChild(host); }
   specs.forEach(function(s){
     var b = el('button','pbtn', s.html);
     b.title = s.title || '';
@@ -927,6 +997,38 @@ function headButtons(specs, menu){
     wrap.appendChild(d);
   }
   return wrap;
+}
+// A session panel's ⋮: it unfolds the subhead (dir and status) with the session menu
+// docked in it as a right-hand column; a tap anywhere else folds it. menuFn builds the
+// items' handlers when it opens, so they read the panel's state as it is then.
+function panelMenu(root, head, menuFn){
+  var pop = null, sub = root.querySelector('.subhead');
+  nsWatchWidth(root, head, 360);
+  function onOutside(e){ if (!head.contains(e.target) && !(pop && pop.contains(e.target))) fold(); }
+  function fold(){
+    if (!root.classList.contains('menu')) return;
+    root.classList.remove('menu');
+    document.removeEventListener('click', onOutside, true);
+    if (pop) { pop.remove(); pop = null; }
+    if (sub) sub.classList.remove('has-menu');
+  }
+  function toggle(){
+    if (root.classList.contains('menu')) return fold();
+    root.classList.add('menu');
+    document.addEventListener('click', onOutside, true);
+    var o = menuFn();
+    o.win = head.querySelectorAll('.pbtn:not(.pdots)');
+    if (sub) { pop = sessionMenuDock(o, fold); sub.appendChild(pop); sub.classList.add('has-menu'); }
+  }
+  return { fold: fold, toggle: toggle };
+}
+// The explorer a session's ⋮ opens, at the session's directory on its server.
+function sessionExplore(server, cwd){
+  var name = server || SELF.name;
+  openExplorer({ server: name, base: apiBase(server), start: cwd || undefined, onNewHere: function(dir){
+    openNewSession({ server: name, base: apiBase(server), cwd: dir,
+      onOpened: function(s){ openMuxSession(s.id, server); } });
+  } });
 }
 var ICON = { refresh:'&#8635;', min:'&#8211;', max:'&#9723;', restore:'&#9724;', term:'&gt;_',
   close:'&#10005;', up:'&#9650;', down:'&#9660;', send:'&#8593;', expand:'&#9633;' };
@@ -981,18 +1083,6 @@ function createListPanel(){
   var srvEl = body.querySelector('[data-r="srv"]');
   var scopeEl = body.querySelector('[data-r="scope"]');
   var rowsEl = body.querySelector('[data-r="rows"]');
-  if (!RO) {
-    var newCodex=el('button','pbtn');newCodex.textContent='+ Codex';newCodex.title='New Codex session';
-    newCodex.onclick=function(){
-      var dialog=document.createElement('dialog');dialog.innerHTML='<form><h3>Codex session</h3><p><input name="cwd" placeholder="Working directory (optional)"></p><p><input name="resume" placeholder="Loaded thread ID (optional)"></p><p class="error"></p><button>Open</button> <button type="button">Cancel</button></form>';
-      document.body.appendChild(dialog);dialog.showModal();dialog.querySelector('button[type=button]').onclick=function(){dialog.remove();};
-      dialog.querySelector('form').onsubmit=async function(e){e.preventDefault();var f=e.target;f.querySelector('button').disabled=true;
-        try{var r=await fetch('/mux/api/sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:'codex',cwd:f.elements.cwd.value||undefined,resume:f.elements.resume.value||undefined})});var d=await r.json();if(!r.ok)throw new Error(d.error);dialog.remove();openMuxSession(d.session.id,null);}
-        catch(err){f.querySelector('.error').textContent=err.message;f.querySelector('button').disabled=false;}
-      };
-    };head.appendChild(newCodex);
-  }
-
   var totEl = body.querySelector('[data-r="tot"]');
 
   var sessions = [], servers = [{ name:SELF.name, self:true, status:'up' }], errors = [];
@@ -1024,12 +1114,18 @@ function createListPanel(){
       var on = sel.indexOf(s.name) !== -1;
       return '<span class="chip'+(on?' on':'')+(s.status==='down'?' down':'')+'" data-srv="'+esc(s.name)+'">'+
         esc(s.name)+(s.self?'':'')+
-        (RO ? '' : '<button class="cterm" data-term="'+esc(s.name)+'" title="Terminal on '+esc(s.name)+'">&gt;_</button>')+'</span>';
+        (RO ? '' : '<button class="cterm" data-menu="'+esc(s.name)+'" title="New session, terminal, explorer on '+esc(s.name)+'" aria-label="Actions for '+esc(s.name)+'">&#8942;</button>')+'</span>';
     }).join('');
   }
   srvEl.addEventListener('click', function(e){
-    var t = e.target.closest('[data-term]');
-    if (t) { e.stopPropagation(); return openTerminal(t.dataset.term === SELF.name ? null : t.dataset.term, null); }
+    var t = e.target.closest('[data-menu]');
+    if (t) {
+      e.stopPropagation();
+      var name = t.dataset.menu, srv = name === SELF.name ? null : name;
+      return serverChipMenu(t, { server: name, base: apiBase(srv),
+        onTerm: function(){ openTerminal(srv, null); },
+        onOpened: function(s){ openMuxSession(s.id, srv); load(); } });
+    }
     var c = e.target.closest('[data-srv]');
     if (c) toggleServer(c.dataset.srv);
   });
@@ -1371,17 +1467,15 @@ function muxStartButton(head, sid, server, agent, onStarted){
   var button = el('button', 'pbtn');
   button.innerHTML = '&#9654;'; button.title = 'Start mux session'; button.setAttribute('aria-label', button.title);
   button.hidden = true;
-  head.appendChild(button);
+  // Ahead of the window buttons, as on the desktop: ▶ – □ ✕ ⋮.
+  head.insertBefore(button, head.querySelector('.pbtns'));
   button.addEventListener('click', async function(e){
     e.stopPropagation();
     var options = {agent:agent, resume:sid};
     if (agent === 'codex') options.startInactive = true;
-    else {
-      var last = 'claude'; try { last = localStorage.getItem('ccbb.muxBin') || last; } catch(e) {}
-      var bin = window.prompt('Claude binary to resume with', last);
-      if (!bin || !bin.trim()) return;
-      options.bin = bin.trim(); try { localStorage.setItem('ccbb.muxBin', options.bin); } catch(e) {}
-    }
+    var title = (head.querySelector('.ptitle') || {}).textContent || '';
+    options.bin = await pickBinary({ server: server || SELF.name, base: apiBase(server), agent: agent, title: title });
+    if (!options.bin) return;
     button.disabled = true;
     try {
       var r = await fetch(apiBase(server)+'/mux/api/sessions', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(options)});
@@ -1405,10 +1499,10 @@ function createMuxPanel(sid, server, snapshot){
     '<span class="srv'+(isLocal(server)?' local':'')+'">'+esc(SRV)+'</span>'+
     '<span class="ptitle" data-r="title">'+esc(shortSessionId(sid))+'</span>');
   head.appendChild(headButtons([
+    { k:'min', html:ICON.min, title:'Minimize' },
     { k:'max', html:ICON.max, title:'Maximize' },
-    { k:'term', html:ICON.term, title:'Terminal' },
     { k:'close', html:ICON.close, title:'Close' },
-  ].filter(function(b){ return !((RO || snapshot) && b.k === 'term'); }), true));
+  ], true));
   root.appendChild(head);
 
   var body = el('div','pbody',
@@ -1445,6 +1539,7 @@ function createMuxPanel(sid, server, snapshot){
   var whenEl = body.querySelector('[data-r="when"]');
 
   var resumeButton = snapshot ? muxStartButton(head, sid, server, 'codex', function(){removePanel(p);}) : null;
+  var lastCwd = (snapshot && snapshot.state && snapshot.state.cwd) || '';
   var client = window.createMuxView(host, {
     onExit: function(){ removePanel(p); },
     base: API + '/mux',
@@ -1454,6 +1549,7 @@ function createMuxPanel(sid, server, snapshot){
     label: 'phone-' + shortSessionId(sid),
     bar: false,
     onChrome: function(c){
+      lastCwd = c.cwd || lastCwd;
       titleEl.textContent = c.title || shortSessionId(sid);
       dirEl.textContent = ltr(c.cwd || '');
       // 'exited' is the case the desktop used to miss too: the child is gone but the
@@ -1470,26 +1566,35 @@ function createMuxPanel(sid, server, snapshot){
     },
   });
 
-  function foldMenu(){
-    root.classList.remove('menu');
-    document.removeEventListener('click', onOutside, true);
+  // Mux sessions only: the mux owns the process, so it can end it. Confirmed first.
+  function terminate(){
+    if (!window.confirm('Terminate "' + (titleEl.textContent || shortSessionId(sid)) + '" on ' + SRV + '?')) return;
+    fetch(API + '/mux/api/sessions/' + encodeURIComponent(sid) + '/stop', { method:'POST' })
+      .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(d){ if (!r.ok) throw new Error(d.error || 'Could not terminate'); }); })
+      .then(function(){ removePanel(p); })
+      .catch(function(e){ toast(e.message); });
   }
-  function onOutside(e){ if (!head.contains(e.target)) foldMenu(); }
+  var menu = panelMenu(root, head, function(){
+    return {
+      // A live session resyncs by reconnecting: the mux sends a fresh snapshot on attach.
+      refresh: function(){ if (client.drop) client.drop(); },
+      explore: RO ? null : function(){ sessionExplore(server, lastCwd); },
+      // The server resolves this: the pane a ccbb attach is sitting in if there is one,
+      // otherwise a fresh tmux window in the session's directory, otherwise a login shell
+      // there. Nothing about that is the phone's business.
+      term: RO || snapshot ? null : function(){ openTerminal(server, sid); }, termLabel: 'Terminal', termIcon: '&gt;_',
+      terminate: RO ? false : snapshot ? null : terminate, terminateWhy: 'Not running',
+    };
+  });
+  var foldMenu = menu.fold;
   head.addEventListener('click', function(e){
     var b = e.target.closest('.pbtn');
     if (!b) { if (p.state === 'min') setState(p, 'exp'); return; }
     var k = b.dataset.k;
-    if (k === 'menu') {
-      if (root.classList.toggle('menu')) document.addEventListener('click', onOutside, true);
-      else document.removeEventListener('click', onOutside, true);
-      return;
-    }
+    if (k === 'menu') return menu.toggle();
     foldMenu();
-    if (k === 'max') setState(p, p.state === 'max' ? 'exp' : 'max');
-    // The server resolves this: the pane a ccbb attach is sitting in if there is one,
-    // otherwise a fresh tmux window in the session's directory, otherwise a login shell
-    // there. Nothing about that is the phone's business.
-    else if (k === 'term') openTerminal(server, sid);
+    if (k === 'min') setState(p, 'min');
+    else if (k === 'max') setState(p, p.state === 'max' ? 'exp' : 'max');
     else if (k === 'close') removePanel(p);
   });
   p.onShow = function(){ client.onVisible(); };
@@ -1536,15 +1641,14 @@ function createSessionPanel(sid, server){
   p.el = root;
 
   var head = el('div','phead',
-    '<span class="dot" data-r="dot"></span>'+
+    '<span class="dot" data-r="dot">'+activityGlyph('claude')+'</span>'+
     '<span class="srv'+(isLocal(server)?' local':'')+'">'+esc(SRV)+'</span>'+
     '<span class="ptitle" data-r="title">Loading…</span>');
   head.appendChild(headButtons([
-    { k:'refresh', html:ICON.refresh, title:'Reload' },
+    { k:'min', html:ICON.min, title:'Minimize' },
     { k:'max', html:ICON.max, title:'Maximize' },
-    { k:'term', html:ICON.term, title:'Terminal' },
     { k:'close', html:ICON.close, title:'Close' },
-  ].filter(function(b){ return !(RO && b.k === 'term'); }), true));
+  ], true));
   root.appendChild(head);
 
   var body = el('div','pbody',
@@ -2411,11 +2515,15 @@ function createSessionPanel(sid, server){
   // Unfolded, the menu listens on the way DOWN through the document, so a tap meant for
   // something else folds it before that something else acts on the tap. Taps inside the
   // bar are the exception: the buttons it just revealed are in there.
-  function onOutside(e){ if (!head.contains(e.target)) foldMenu(); }
-  function foldMenu(){
-    root.classList.remove('menu');
-    document.removeEventListener('click', onOutside, true);
-  }
+  var menu = panelMenu(root, head, function(){
+    return {
+      refresh: function(){ loadInfo(); loadSub(); refreshDrivable(); },
+      explore: RO ? null : function(){ sessionExplore(server, INFO && INFO.projectPath); },
+      term: RO ? null : function(){ openTerminal(server, sid); }, termLabel: 'Terminal', termIcon: '&gt;_',
+      terminate: RO ? false : null, terminateWhy: 'Runs in a terminal \u2014 stop it there',
+    };
+  });
+  var foldMenu = menu.fold;
   head.addEventListener('click', function(e){
     var b = e.target.closest('.pbtn');
     if (!b) {
@@ -2424,16 +2532,11 @@ function createSessionPanel(sid, server){
       return;
     }
     var k = b.dataset.k;
-    if (k === 'menu') {
-      if (root.classList.toggle('menu')) document.addEventListener('click', onOutside, true);
-      else document.removeEventListener('click', onOutside, true);
-      return;
-    }
+    if (k === 'menu') return menu.toggle();
     // Every other button is the end of the errand the menu was opened for.
     foldMenu();
-    if (k === 'refresh') { loadInfo(); loadSub(); refreshDrivable(); }
+    if (k === 'min') setState(p, 'min');
     else if (k === 'max') setState(p, p.state === 'max' ? 'exp' : 'max');
-    else if (k === 'term') openTerminal(server, sid);
     else if (k === 'close') removePanel(p);
   });
   p.onState = function(){
@@ -2943,7 +3046,7 @@ function mobilePageHtml(initOpenSessionId, initOpenServer, self, priceTable, ro,
     : null;
   return MOBILE_HTML
     .replace('__MUX_HOST_CSS__', () => (MUX && MUX.hostCss) || '')
-    .replace('__MUX_CSS__', () => (MUX && MUX.muxCss) || '')
+    .replace('__MUX_CSS__', () => ((MUX && MUX.muxCss) || '') + require('./ccbb-newsession-ui').CSS)
     .replace('__MUX_SHARED_JS__', () => (MUX && MUX.sharedJs) || '')
     .replace('__MUX_JS__', () => (MUX && MUX.muxJs) || '')
     .replace('__APP_JS__',
