@@ -259,8 +259,8 @@ async function readCodexUsage(thread, periodFilter) {
         nativeStatuses.set(thread.id, payload.type === 'task_started' ? 'busy' : 'idle');
       }
       if (!meta) {
-        if (record.type !== 'session_meta' || payload.id !== thread.id ||
-            !/^0\.(135|153|154)\./.test(payload.cli_version || '')) return null;
+        // Any CLI version: the counter/delta/ledger checks below fail closed on format drift.
+        if (record.type !== 'session_meta' || payload.id !== thread.id) return null;
         meta = payload;
         provider = payload.model_provider || provider;
         if (payload.forked_from_id) {

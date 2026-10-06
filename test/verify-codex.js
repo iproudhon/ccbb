@@ -322,15 +322,18 @@ test('unknown models and custom providers retain tokens without inventing cost',
   }
 });
 
-test('unreadable, mismatched, unsupported and reset histories stay unknown', async () => {
+test('unreadable, mismatched and reset histories stay unknown', async () => {
   assert.equal(await readCodexUsage({ path: '/nonexistent/ccbb-rollout' }), null);
   for (const records of [
     [meta({ id: 'different' }), event(after, first)],
-    [meta({ cli_version: '0.999.0' }), event(after, first)],
     [meta(), event(before, second), event(after, first)],
     [meta(), 'broken record', event(after, first)],
     [meta()],
   ]) assert.equal(await read(records), null);
+});
+
+test('newer CLI versions are read when the format validates', async () => {
+  assert.ok(await read([meta({ cli_version: '0.999.0' }), event(after, first)]));
 });
 
 test('complete response ledger includes compaction once and respects period boundaries', async () => {
