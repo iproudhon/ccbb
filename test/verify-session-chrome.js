@@ -60,7 +60,7 @@ wss.on('connection',(ws,req)=>ws.send(JSON.stringify(req.url.includes('/mux/mux'
   const devtools=path.join(cfg,'browser','DevToolsActivePort');await until(()=>fs.existsSync(devtools),'DevTools');
   const port=fs.readFileSync(devtools,'utf8').split('\n')[0];
   const tabs=await(await fetch('http://127.0.0.1:'+port+'/json')).json();
-  cdp=new WebSocket(tabs[0].webSocketDebuggerUrl);await new Promise(r=>cdp.once('open',r));
+  cdp=new WebSocket(tabs.find(tab=>tab.type==='page').webSocketDebuggerUrl);await new Promise(r=>cdp.once('open',r));
   let id=0;const pending=new Map();cdp.on('message',raw=>{const m=JSON.parse(raw);if(pending.has(m.id)){pending.get(m.id)(m);pending.delete(m.id);}});
   const send=(method,params={})=>new Promise(r=>{const n=++id;pending.set(n,r);cdp.send(JSON.stringify({id:n,method,params}));});
   const evaluate=async expression=>{const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.error||r.result.exceptionDetails)throw new Error(JSON.stringify(r));return r.result.result.value;};
@@ -90,8 +90,10 @@ wss.on('connection',(ws,req)=>ws.send(JSON.stringify(req.url.includes('/mux/mux'
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('${button}')).display`),'none');
     live=false;await until(()=>evaluate(`!document.querySelector('${button}').hidden`),'inactive session offers start');
     await evaluate(`document.querySelector('${button}').click()`);
+    await until(()=>evaluate('!!document.querySelector("dialog.ns-new[open]")'),'binary picker');
+    await evaluate(`(()=>{var d=document.querySelector('dialog.ns-new[open]');d.querySelector('[name=bin]').value='codex';d.querySelector('form').requestSubmit();})()`);
     await until(()=>posts.length===1,'resume request');
-    assert.deepEqual(posts[0],{agent:'codex',resume:'codex:fixture',startInactive:true});
+    assert.deepEqual(posts[0],{agent:'codex',bin:'codex',resume:'codex:fixture',startInactive:true});
     await until(()=>evaluate('getComputedStyle(document.querySelector(".muxv .input-area")).display !== "none"'),'live composer');
     assert.deepEqual((await evaluate('testErrors')).filter(e=>!e.startsWith('ResizeObserver loop')),[]);
     console.log('OK: '+(mobile?'mobile':'desktop')+' Codex footer, model, activity and mux start');

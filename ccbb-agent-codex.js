@@ -5,6 +5,39 @@ const fs = require('fs');
 const readline = require('readline');
 const { periodKey } = require('./ccbb-common');
 const path = require('path');
+const execFile = require('util').promisify(require('child_process').execFile);
+
+// lsof supplies descriptor access separately from its filename. Unknown access
+// also counts as an owner: an incomplete scan must never authorize a resume.
+function rolloutOwnersFromLsof(output) {
+  const owners = new Map();
+  let access = '';
+  if (!/^p\d+$/m.test(output)) throw new Error('No process information from lsof');
+  for (const line of output.split('\n')) {
+    if (line[0] === 'p' || line[0] === 'f') access = '';
+    else if (line[0] === 'a') access = line.slice(1);
+    else if (line[0] === 'n') {
+      const file = line.slice(1);
+      const match = path.basename(file).match(/^rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl(?: \(deleted\))?$/i);
+      if (match && access !== 'r') owners.set(match[1], file);
+    }
+  }
+  return owners;
+}
+
+async function nativeThreadInactive(id, platform = process.platform, run = execFile) {
+  if (platform === 'linux') return !nativeRollouts().has(id);
+  if (platform !== 'darwin') return false;
+  try {
+    // Check all of this user's writers, including renamed Codex binaries and
+    // editor-launched servers. A timeout, warning, or failed scan fails closed.
+    const { stdout, stderr } = await run('/usr/sbin/lsof',
+      ['-nP', '-a', '-u', String(process.getuid()), '-Ffan'],
+      { timeout: 5000, maxBuffer: 32 * 1024 * 1024 });
+    if (stderr.trim()) return false;
+    return !rolloutOwnersFromLsof(stdout).has(id);
+  } catch { return false; }
+}
 
 // Native clients own writable rollout descriptors even when CCBB is not attached.
 // A separate discovery app-server cannot report another process's loaded threads.
@@ -551,5 +584,5 @@ async function renameCodexThread(id, name, rpc = new CodexRpc()) {
   } finally { rpc.close(); }
 }
 
-module.exports = { subscription, codexTitle, CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts,
+module.exports = { subscription, codexTitle, CodexRpc, readCodexUsage, priceUsage, summarizeCodex, getCodexSessions, renameCodexThread, nativeActivity, nativeRollouts, nativeThreadInactive, rolloutOwnersFromLsof,
   normalizeItem, readHistory, cached, refresh, history, historyView, error: month => entry(month).error };

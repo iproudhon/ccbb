@@ -1616,7 +1616,7 @@ function makeViewBar(v, barMain, buttons){
   wireViewDrag(v, bar);
 
   // ⋮ opens the header block hanging from the bar, with the view's menu docked in it
-  // as a right-hand column (sessionMenuDock) — one panel, nothing floating over it.
+  // as a row on top (sessionMenuDock) — one panel, nothing floating over it.
   var pop = null;
   function menuIsOpen(){ return btns.classList.contains('open'); }
   function onDocDown(e){ if (!bar.contains(e.target)) closeMenu(); }

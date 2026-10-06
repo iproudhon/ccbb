@@ -55,12 +55,16 @@ test('shared socket control, ownership, arbitration, external input, and safe de
   assert.equal(mux.get('thread-1'),session);
   assert.equal(require('../ccbb-mux').pickSession(mux.list(),'thread-1').id,session.id);
   const again = await mux.create({agent:'codex',resume:session.id}); assert.equal(again,session);
-  if (process.platform === 'linux') {
+  {
+    const check = t.mock.method(require('../ccbb-agent-codex'), 'nativeThreadInactive', async () => false);
     threads.set('dormant', {id:'dormant',cwd:'/tmp',turns:[]});
     await assert.rejects(mux.create({agent:'codex',resume:'dormant'}), /ownership/);
+    await assert.rejects(mux.create({agent:'codex',resume:'dormant',startInactive:true}), /ownership/);
+    check.mock.mockImplementation(async () => true);
     const resumed = await mux.create({agent:'codex',resume:'dormant',startInactive:true});
     assert.equal(resumed.id,'codex:dormant');
     await resumed.stop(true);
+    check.mock.restore();
   }
   const native = await new CodexSocket(process.env.CCBB_CODEX_ENDPOINT).connect();
   await native.request('thread/resume',{threadId:session.nativeId});
@@ -412,6 +416,22 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs'), os = require('os'), path = require('path');
 const { nativeRollouts, nativeActivity } = require('../ccbb-agent-codex');
+test('macOS inactive-thread checks reject writers and incomplete scans', async () => {
+  const { nativeThreadInactive } = require('../ccbb-agent-codex');
+  const id = '01a08f8a-37fe-7492-a82c-f5480b18874c';
+  const file = '/tmp/a project/rollout-2026-09-11-' + id + '.jsonl';
+  const scan = stdout => async () => ({stdout, stderr:''});
+  for (const access of ['w', 'u', '']) {
+    assert.equal(await nativeThreadInactive(id, 'darwin', scan('p123\nf7\na'+access+'\nn'+file+'\n')), false);
+  }
+  assert.equal(await nativeThreadInactive(id, 'darwin', scan('p123\nf7\nar\nn'+file+'\n')), true);
+  assert.equal(await nativeThreadInactive(id, 'darwin', scan('p123\nf7\nar\nn/other\nf8\nn'+file+'\n')), false);
+  assert.equal(await nativeThreadInactive(id, 'darwin', scan('p123\nf7\naw\nn/other\n')), true);
+  assert.equal(await nativeThreadInactive(id, 'darwin', scan('')), false);
+  assert.equal(await nativeThreadInactive(id, 'darwin', async () => { throw new Error('timeout'); }), false);
+  assert.equal(await nativeThreadInactive(id, 'darwin', async () => ({stdout:'p123\n',stderr:'incomplete scan'})), false);
+  assert.equal(await nativeThreadInactive(id, 'win32', scan('p123\n')), false);
+});
 test('native Codex activity requires a writable owner and follows turn lifecycle', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccbb-native-'));
   t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));

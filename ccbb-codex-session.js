@@ -412,13 +412,13 @@ async function createCodexSession(mux, opt) {
   try {
     if (ref && !opt.fork && !(await loadedThreads(rpc)).has(ref)) {
       // The history page explicitly asks to start an inactive thread. Check local
-      // native owners again at click time; never apply a local /proc check remotely.
+      // native owners again at click time; never apply a local process check remotely.
       const local = rpc.endpoint.startsWith('unix://') || ['localhost', '127.0.0.1', '[::1]'].includes(new URL(rpc.endpoint).hostname);
-      const inactive = opt.startInactive === true && local && process.platform === 'linux' &&
-        !require('./ccbb-agent-codex').nativeRollouts().has(ref);
+      const inactive = opt.startInactive === true && local &&
+        await require('./ccbb-agent-codex').nativeThreadInactive(ref);
       if (!inactive) throw new Error('Codex thread ownership is unknown: attach a loaded thread or start a verified inactive local thread');
     }
-    if (!/\/0\.154\./.test(rpc.info.userAgent || '')) throw new Error('Codex socket control requires the tested 0.154.x CLI');
+    const untested = !/\/0\.154\./.test(rpc.info.userAgent || '');
     const prior = ref ? await readHistory(rpc, ref) : null;
     const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref } : { cwd: opt.cwd || process.cwd(), ...(opt.model ? { model: opt.model } : {}), ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
     if (!result.thread || !result.thread.id) throw new Error('Codex returned no thread identity');
@@ -437,6 +437,7 @@ async function createCodexSession(mux, opt) {
     rpc.removeListener('message', collect);
     for (const m of buffered) s.onRpc(m);
     // -n is a name for the thread itself, set in Codex, not one ccbb keeps beside it.
+    if (untested) s.emit('stderr', { text: 'Codex socket control is tested with 0.154.x; this server is ' + (rpc.info.userAgent || 'an unknown version') });
     if (opt.name) { try { await s.rename(String(opt.name).trim()); } catch (e) { s.emit('stderr', { text: 'Could not name the Codex thread: ' + e.message }); } }
     try { const data = await rpc.request('account/rateLimits/read', {}); s.state.rateLimits = data.rateLimits; } catch {}
     await s.refreshUsage();

@@ -196,6 +196,7 @@ const MOBILE_HTML = `<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{overscroll-behavior:none}
+html{height:100%;overflow:hidden}
 body{
   font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
   /* This colour does more work than it looks like. iOS Safari tints its own chrome — the
@@ -206,15 +207,23 @@ body{
      of as a page with a stripe above and below it. In standalone mode, where there is no
      Safari chrome, this same colour fills the safe-area padding, to the same effect. */
   font-size:15px;background:var(--bg-alt);color:var(--ink);
-  /* --app-h tracks visualViewport: on iOS the URL bar and the keyboard both change the
-     usable height without changing 100dvh, and a stack sized to the wrong number puts
-     the composer under the keyboard. Falls back to dvh before the first measurement. */
-  height:var(--app-h,100dvh);
-  display:flex;flex-direction:column;overflow:hidden;
-  padding-top:var(--safe-t);padding-bottom:var(--safe-b);
+  height:100%;overflow:hidden;
   -webkit-font-smoothing:antialiased;
 }
-#stack{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--bg)}
+/* Like the terminal, the session stack follows the visible viewport while the
+   document keeps its layout size. */
+#stack{position:fixed;top:var(--app-top,0px);left:0;right:0;
+  height:var(--app-h,100dvh);min-height:0;display:flex;flex-direction:column;
+  overflow:hidden;background:var(--bg);
+  padding-top:var(--safe-t);padding-bottom:var(--safe-b)}
+/* Keyboard up (body.kb, see syncViewport): the composer's bottom edge is the keyboard's
+   top edge. The footer under it and the home-indicator inset would sit behind the
+   keyboard on a full-height page; on one cut to the visual viewport they are dropped. */
+body.kb #stack{padding-bottom:0}
+body.kb .sfoot,body.kb .sv-foot{display:none}
+/* The full-screen editor and // output carry their own inset; the keyboard covers it too. */
+body.kb.comp-max .pbody.cmax .composer{padding-bottom:8px}
+body.kb.cmd-max .pbody.cmdmax .cmd-content{padding-bottom:10px}
 /* ── panels ──
    Vertical only, and an accordion: exactly one panel is expanded, every other is a
    header-height strip you tap to bring forward. On a phone a "split" is two useless
@@ -223,6 +232,9 @@ body{
 .panel.min{flex:0 0 auto}
 .panel.exp,.panel.max{flex:1 1 auto}
 .panel.min .pbody{display:none}
+/* A session's – □ ✕ live in its ⋮ row (sessionMenuDock mirrors them from here, so they
+   stay in the DOM); the bar keeps the dot, the title, ▶ and ⋮. */
+.phead.sess>.pbtns>.pbtn:not(.pdots){display:none}
 body.has-max .panel:not(.max){display:none}
 .panel.lifted{opacity:.5}
 .drag-ghost{position:fixed;z-index:200;pointer-events:none;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -264,9 +276,9 @@ body.has-max .panel:not(.max){display:none}
 /* ── a session's actions, folded away ──
    The same trade the desktop makes: four buttons in the bar and a detail block under it,
    all of it on screen for the sake of the moment you want one of them. On a phone that
-   block cost two of the lines the transcript wanted. ⋮ unfolds the buttons where they
-   were and the block below them; the next tap anywhere folds it back, so nothing stays
-   open behind you. */
+   block cost two of the lines the transcript wanted. ⋮ unfolds the block with the
+   session's buttons as a row on top of it (– □ ✕ included: a session's bar shows only
+   ▶ and ⋮); the next tap anywhere folds it back, so nothing stays open behind you. */
 .panel:not(.menu) .subhead{display:none}
 .pbtn.pdots{font-size:18px}
 .panel.menu .pbtn.pdots{color:var(--accent)}
@@ -496,7 +508,7 @@ body.has-max .panel:not(.max){display:none}
    — see compMaxOwner — so they never stack. The safe-area padding goes on .cmd-head
    rather than on the fixed box, so the strip behind the status bar is the header's
    colour instead of the content's white. */
-body.cmd-max .pbody.cmdmax .cmd-box{position:fixed;top:0;left:0;right:0;height:var(--app-h,100dvh);
+body.cmd-max .pbody.cmdmax .cmd-box{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-h,100dvh);
   z-index:150;border-top:none}
 body.cmd-max .pbody.cmdmax .cmd-head{padding-top:var(--safe-t);min-height:calc(40px + var(--safe-t))}
 body.cmd-max .pbody.cmdmax .cmd-content{padding-bottom:calc(10px + var(--safe-b))}
@@ -558,12 +570,9 @@ body.cmd-max .pbody.cmdmax .cmd-content{padding-bottom:calc(10px + var(--safe-b)
    only thing worth looking at while you write anyway.
    Sized from --app-h and never inset:0: the visual viewport shrinks under the keyboard
    while 100vh does not, so a bottom-anchored send button would sit behind the keys. Its
-   own safe-area padding, because a fixed box is not inside body's.
-   UNVERIFIED against a real on-screen keyboard — the simulator will not raise one
-   without a physical tap. If the box turns out to be mispositioned with the keyboard up,
-   the thing to look at is visualViewport.offsetTop: iOS anchors position:fixed to the
-   LAYOUT viewport, and the keyboard can slide the visual viewport down inside it. */
-body.comp-max .pbody.cmax .composer{position:fixed;top:0;left:0;right:0;height:var(--app-h,100dvh);
+   own safe-area padding, because it sits outside the stack's padding.
+   --app-top follows visualViewport.offsetTop when Safari pans on focus. */
+body.comp-max .pbody.cmax .composer{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-h,100dvh);
   z-index:150;border-top:none;
   padding-top:calc(8px + var(--safe-t));
   padding-bottom:calc(8px + var(--safe-b))}
@@ -602,6 +611,9 @@ body.comp-max .pbody.cmax .cbox::after{display:none}
 .tgeom{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--ink-faint);flex-shrink:0}
 .tbody{flex:1 1 auto;min-height:0;overflow:hidden}
 .tbody .xterm{padding:2px 0 2px 4px}
+/* The grid font shrinks to fit 80 columns; the focused input must not trigger iOS zoom.
+   xterm sets this size inline as it moves the textarea to the cursor. */
+#termwrap .xterm-helper-textarea{font-size:16px!important}
 .tnote{padding:16px;font-size:13px;color:var(--ink-soft);line-height:1.6}
 .tnote code{font-family:ui-monospace,Menlo,monospace;background:var(--code-bg);border-radius:4px;padding:0 4px}
 /* The key bar exists because an iOS keyboard has no Esc, Tab, Ctrl or arrows, and buries
@@ -849,22 +861,97 @@ function onForeground(fn){
 }
 
 // ── viewport ──────────────────────────────────────────────────────────────────
-// iOS reports a 100dvh that includes the space the keyboard is covering, so the stack is
-// sized from visualViewport instead. The scrollTo(0,0) undoes Safari's habit of scrolling
-// the whole document up to reveal a focused field, which would push the panel headers off.
-function syncViewport(){
-  var vv = window.visualViewport;
-  if (vv && vv.scale > 1.01) return;
-  var h = vv ? vv.height : window.innerHeight;
-  var doc = document.documentElement;
-  doc.style.setProperty('--app-h', Math.round(h)+'px');
-  // The terminal follows offsetTop itself; scrolling the document here would
-  // fight Safari's focus scrolling and move the keyboard-relative container.
-  if (!termState && window.scrollY !== 0) window.scrollTo(0, 0);
+// Follow both dimensions of the visible viewport. Safari can pan it while focusing
+// an editor; forcing document scroll back to zero fights that movement. Fixed surfaces
+// share its origin instead, keeping their bottom edge at the keyboard.
+// ttn serves ccbb in a same-origin iframe. Its own visualViewport stays at the
+// iframe's layout size when the keyboard opens; only the outer window sees it.
+// Read the highest accessible viewport, without changing the host page or frame.
+var viewportWindow = window, viewportFrames = [];
+try {
+  while (viewportWindow.parent !== viewportWindow && viewportWindow.frameElement) {
+    var viewportFrame = viewportWindow.frameElement;
+    var viewportParent = viewportWindow.parent;
+    void viewportParent.document.documentElement;
+    viewportFrames.push(viewportFrame);
+    viewportWindow = viewportParent;
+  }
+} catch(e) {} // Cross-origin hosts must resize their frame themselves.
+function mobileViewport(){
+  var vv = viewportWindow.visualViewport;
+  var top = vv ? vv.offsetTop : 0;
+  var bottom = top + (vv ? vv.height : viewportWindow.innerHeight);
+  // Translate the visible rectangle into each child viewport, clipping at its edges.
+  for (var i = viewportFrames.length - 1; i >= 0; i--) {
+    var frame = viewportFrames[i];
+    // Safari focus scrolling can report a root-fixed iframe at -scrollY even
+    // though its layout anchor is still top:0. Subtracting that rect from the
+    // visual offset counts the same pan twice (396 - -396 = 792 on iPhone).
+    // offsetTop preserves the layout anchor. Frames with a containing block or
+    // normal document flow still need their current viewport-relative rect.
+    var fixedToRoot = frame.ownerDocument.defaultView.getComputedStyle(frame).position === 'fixed' && !frame.offsetParent;
+    var origin = (fixedToRoot ? frame.offsetTop : frame.getBoundingClientRect().top) + frame.clientTop;
+    top = Math.max(0, Math.min(frame.clientHeight, top - origin));
+    bottom = Math.max(top, Math.min(frame.clientHeight, bottom - origin));
+  }
+  return { height: bottom - top, offsetTop: top, scale: vv ? vv.scale : 1 };
 }
+var vvMax = {};
+function keyboardUp(){
+  var vv = viewportWindow.visualViewport;
+  if (!vv) return false;
+  // Layout width is stable through focus zoom and fractional viewport rounding.
+  var w = viewportWindow.document.documentElement.clientWidth;
+  vvMax[w] = Math.max(vvMax[w] || 0, vv.height);
+  return vvMax[w] - vv.height > 150;
+}
+function syncViewport(){
+  var vv = mobileViewport();
+  if (vv.scale > 1.01) return;
+  var doc = document.documentElement;
+  doc.style.setProperty('--app-h', vv.height+'px');
+  doc.style.setProperty('--app-top', vv.offsetTop+'px');
+  // With the keyboard up the composer sits right on it: the home-indicator inset and
+  // the status footer under the composer belong to the screen's edge, and the keyboard
+  // is covering that edge (see body.kb).
+  document.body.classList.toggle('kb', keyboardUp());
+  if (termState && termState.fitViewport) termState.fitViewport();
+}
+// Recheck while focused and through keyboard dismissal, covering missed events
+// during keyboard animations. Terminal fitting skips unchanged geometry.
+var vvPoll = null, vvPollEnd = null;
+function vvPollStart(){
+  clearTimeout(vvPollEnd);
+  if (!vvPoll) vvPoll = setInterval(syncViewport, 150);
+  syncViewport();
+}
+function vvPollStop(){
+  clearTimeout(vvPollEnd);
+  vvPollEnd = setTimeout(function(){ clearInterval(vvPoll); vvPoll = null; syncViewport(); }, 800);
+}
+document.addEventListener('focusin', vvPollStart);
+document.addEventListener('focusout', vvPollStop);
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncViewport);
   window.visualViewport.addEventListener('scroll', syncViewport);
+}
+// Parent viewport events do not propagate into iframe documents.
+if (viewportWindow !== window) {
+  if (viewportWindow.visualViewport) {
+    viewportWindow.visualViewport.addEventListener('resize', syncViewport);
+    viewportWindow.visualViewport.addEventListener('scroll', syncViewport);
+  }
+  viewportWindow.addEventListener('resize', syncViewport);
+  viewportWindow.addEventListener('scroll', syncViewport, true);
+  window.addEventListener('pagehide', function(e){
+    if (e.persisted) return;
+    if (viewportWindow.visualViewport) {
+      viewportWindow.visualViewport.removeEventListener('resize', syncViewport);
+      viewportWindow.visualViewport.removeEventListener('scroll', syncViewport);
+    }
+    viewportWindow.removeEventListener('resize', syncViewport);
+    viewportWindow.removeEventListener('scroll', syncViewport, true);
+  });
 }
 window.addEventListener('resize', syncViewport);
 window.addEventListener('orientationchange', function(){ setTimeout(syncViewport, 250); });
@@ -978,9 +1065,9 @@ function removePanel(p){
   if (!panels.some(function(q){ return q.state !== 'min'; }))
     setState(panels.filter(function(q){ return q.kind === 'list'; })[0] || panels[0], 'exp');
 }
-// menu:true adds a ⋮ after the buttons, as the desktop's session bar has: the window
-// buttons stay in the bar, and what the session can do is in the menu ⋮ opens (see
-// panelMenu).
+// menu:true adds a ⋮ after the buttons, as the desktop's session bar has. A session
+// panel's bar (.phead.sess) then hides the buttons themselves: the ⋮ row mirrors them,
+// so they stay in the DOM (see panelMenu).
 function headButtons(specs, menu){
   var wrap = el('div','pbtns');
   var host = wrap;
@@ -999,11 +1086,11 @@ function headButtons(specs, menu){
   return wrap;
 }
 // A session panel's ⋮: it unfolds the subhead (dir and status) with the session menu
-// docked in it as a right-hand column; a tap anywhere else folds it. menuFn builds the
+// docked in it as a row on top; a tap anywhere else folds it. menuFn builds the
 // items' handlers when it opens, so they read the panel's state as it is then.
 function panelMenu(root, head, menuFn){
   var pop = null, sub = root.querySelector('.subhead');
-  nsWatchWidth(root, head, 360);
+  nsWatchWidth(root, head);
   function onOutside(e){ if (!head.contains(e.target) && !(pop && pop.contains(e.target))) fold(); }
   function fold(){
     if (!root.classList.contains('menu')) return;
@@ -1398,6 +1485,7 @@ function createListPanel(){
   p.onState = function(){
     var mx = head.querySelector('[data-k="max"]');
     mx.innerHTML = p.state==='max' ? ICON.restore : ICON.max;
+    mx.title = p.state==='max' ? 'Restore' : 'Maximize';
     mx.classList.toggle('on', p.state==='max');
   };
 
@@ -1494,7 +1582,7 @@ function createMuxPanel(sid, server, snapshot){
   var root = el('div','panel');
   p.el = root;
 
-  var head = el('div','phead',
+  var head = el('div','phead sess',
     '<span class="dot mux" data-r="dot" title="Driven over the mux protocol, not a tmux pane">'+activityGlyph(sid.indexOf('codex:') === 0 ? 'codex' : 'claude', !snapshot)+'</span>'+
     '<span class="srv'+(isLocal(server)?' local':'')+'">'+esc(SRV)+'</span>'+
     '<span class="ptitle" data-r="title">'+esc(shortSessionId(sid))+'</span>');
@@ -1601,6 +1689,7 @@ function createMuxPanel(sid, server, snapshot){
   p.onState = function(){
     var mx = head.querySelector('[data-k="max"]');
     mx.innerHTML = p.state === 'max' ? ICON.restore : ICON.max;
+    mx.title = p.state === 'max' ? 'Restore' : 'Maximize';
     mx.classList.toggle('on', p.state === 'max');
   };
   // Closing the panel is how you say you are done with the session — the same meaning the
@@ -1640,7 +1729,7 @@ function createSessionPanel(sid, server){
   var root = el('div','panel');
   p.el = root;
 
-  var head = el('div','phead',
+  var head = el('div','phead sess',
     '<span class="dot" data-r="dot">'+activityGlyph('claude')+'</span>'+
     '<span class="srv'+(isLocal(server)?' local':'')+'">'+esc(SRV)+'</span>'+
     '<span class="ptitle" data-r="title">Loading…</span>');
@@ -2483,8 +2572,9 @@ function createSessionPanel(sid, server){
     var b = e.target.closest('button');
     if (!b) return;
     // Send is the one button that means "I am done typing": it lets the keyboard go and
-    // the tools row with it, because the reply is what you want the screen for now.
-    if (b.dataset.c === 'send') { send(); composerEl.classList.remove('cfocus'); return; }
+    // the tools row with it, because the reply is what you want the screen for now. iOS
+    // does not move the focus to a tapped button, so the box is blurred by hand.
+    if (b.dataset.c === 'send') { send(); boxEl.blur(); composerEl.classList.remove('cfocus'); return; }
     if (b.dataset.c === 'cmax') setComposerMax(!composerMax);
     else if (b.dataset.c === 'prev') histWalk(-1);
     else if (b.dataset.c === 'next') histWalk(1);
@@ -2542,6 +2632,7 @@ function createSessionPanel(sid, server){
   p.onState = function(){
     var mx = head.querySelector('[data-k="max"]');
     mx.innerHTML = p.state === 'max' ? ICON.restore : ICON.max;
+    mx.title = p.state === 'max' ? 'Restore' : 'Maximize';
     mx.classList.toggle('on', p.state === 'max');
   };
   p.onShow = function(){ if (following) transcript.scrollTop = transcript.scrollHeight; };
@@ -2772,23 +2863,28 @@ function openTerminal(server, sessionId){
     ++fitRun; clearTimeout(fitStepTimer); clearTimeout(fitTimer);
     fitTimer = setTimeout(function(){ fitTermGrid(0); }, 80);
   }
+  var fitWidth = -1;
   function fitViewport(){
     if (t.destroyed) return;
-    var vv = window.visualViewport;
-    if (vv && vv.scale > 1.01) return;
-    wrap.style.top = (vv ? vv.offsetTop : 0) + 'px';
-    wrap.style.height = (vv ? vv.height : window.innerHeight) + 'px';
-    wrap.style.bottom = 'auto';
+    var vv = mobileViewport();
+    if (vv.scale > 1.01) return;
+    var top = vv.offsetTop + 'px', h = vv.height + 'px';
     // The home-indicator inset belongs at the screen edge, not between the
     // software keyboard and our keys. Some browsers retain it with keys up.
-    wrap.style.paddingBottom = vv && window.innerHeight - vv.height > 100 ? '0px' : '';
+    var pad = keyboardUp() ? '0px' : '';
+    // syncViewport also polls this while the keyboard may be moving; an unchanged
+    // geometry must not refit, which would resend the size to the pty every tick.
+    // Width is checked too: a side-by-side resize changes only the columns.
+    var w = wrap.clientWidth;
+    if (wrap.style.top === top && wrap.style.height === h && wrap.style.paddingBottom === pad && fitWidth === w) return;
+    fitWidth = w;
+    wrap.style.top = top;
+    wrap.style.height = h;
+    wrap.style.bottom = 'auto';
+    wrap.style.paddingBottom = pad;
     refit();
   }
-  window.addEventListener('resize', fitViewport);
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', fitViewport);
-    window.visualViewport.addEventListener('scroll', fitViewport);
-  }
+  t.fitViewport = fitViewport;
   fitViewport();
 
   head.addEventListener('click', function(e){
@@ -2987,11 +3083,6 @@ function openTerminal(server, sessionId){
     clearTimeout(reconnectTimer); clearTimeout(fitTimer); clearTimeout(fitStepTimer); clearTimeout(quietTimer); clearTimeout(focusTimer);
     fitWaiters = [];
     offWake();
-    window.removeEventListener('resize', fitViewport);
-    if (window.visualViewport) {
-      window.visualViewport.removeEventListener('resize', fitViewport);
-      window.visualViewport.removeEventListener('scroll', fitViewport);
-    }
     if (t.id && !t.dead) {
       if (t.ws && t.ws.readyState === 1) wsSendJ({ type:'close' });
       else fetch(API+'/api/term/'+t.id+'/close', { method:'POST' }).catch(function(){});

@@ -10,7 +10,7 @@ The goal is to give Codex the same CCBB experience as Claude Code: discover sess
 
 Run `node ccbb.js web -p 8610`, open `http://127.0.0.1:8610`, then choose **+ → Codex → Open**. The phone page at `/m` offers **+ Codex**. Lists show both agents; activity circles identify Codex and Claude mux sessions. Existing saved Codex sessions open as read-only history; managed sessions open the shared live renderer with a composer, streamed text/tools, approvals, questions, and usage. Unknown cost stays unknown; `~$` is a local API-price estimate, not a reported bill. The aggregate cost summary remains explicitly Claude-specific.
 
-The default server is persistent and local: `unix://<CCBB_HOME-or-CLAUDE_CONFIG_DIR>/mux/codex/app-server.sock`. Override it with `CCBB_CODEX_ENDPOINT` to use a known existing server. The socket directory is private. CCBB never kills a shared Codex app-server when a browser closes or CCBB stops. Codex currently requires the tested 0.154.x protocol. New threads inherit Codex login, model, sandbox, and approval configuration. Claude creation preserves main’s explicit `--bin` requirement; the web dialog asks for that binary. List pushes preserve main’s opt-in watch behavior.
+The default server is persistent and local: `unix://<CCBB_HOME-or-CLAUDE_CONFIG_DIR>/mux/codex/app-server.sock`. Override it with `CCBB_CODEX_ENDPOINT` to use a known existing server. The socket directory is private. CCBB never kills a shared Codex app-server when a browser closes or CCBB stops. Codex is tested against the 0.154.x protocol; other versions attach with a warning. New threads inherit Codex login, model, sandbox, and approval configuration. Claude creation preserves main’s explicit `--bin` requirement; the web dialog asks for that binary. List pushes preserve main’s opt-in watch behavior.
 
 CLI examples:
 
@@ -23,6 +23,8 @@ codex resume --remote unix:///absolute/path/to/app-server.sock <native-thread-id
 ```
 
 An in-place attach requires the thread to be loaded on the configured server. Unknown ownership is refused. A live activity icon does not imply shared control: VS Code private-stdio sessions are visible but cannot be attached through CCBB. Use the same persistent socket endpoint and native thread ID for shared native-TUI control. A fork returns a distinct thread and can copy saved history. A newly created Codex thread needs a persisted rollout before another native client can resume it. The probe waited for its first turn to finish; attaching before submitting anything returned “no rollout found” on 0.154.0.
+
+History **Start** can also resume an unloaded local thread after checking native owners. Linux uses writable `/proc` rollout descriptors; macOS uses `lsof` to check this user's open rollout files. On macOS, scan failures, warnings, and unknown descriptor access refuse the resume. Remote endpoints still require an already loaded thread.
 
 Browser **Open session** suggests loaded thread IDs when Codex is selected. Normal messages queue within CCBB while busy; `/steer <message>` targets the active turn explicitly. `/compact` and `/model <model-id>` use Codex protocol methods. A native client can race a queued submission at a turn boundary: `turn/start` may steer an already-active server turn. Inputs are never automatically resent after an uncertain disconnect.
 

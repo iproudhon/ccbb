@@ -2152,7 +2152,7 @@ function wire() {
   var expBtn = Q('.exp-btn');
   var histPrev = Q('.hist-btn[data-h="prev"]');
   var histNext = Q('.hist-btn[data-h="next"]');
-  function submit() {
+  function submit(tapped) {
     var text = input.value;
     if (!text.trim()) return;
     histAdd(text);
@@ -2164,9 +2164,13 @@ function wire() {
     else send({ op: 'submit', text: text });
     input.value = '';
     setMax(false);
-    input.focus();
+    // A tap on ↑ on a touch screen is "done typing": drop the focus so the on-screen
+    // keyboard goes and the reply gets the screen. Ctrl/Cmd+Enter means a real keyboard
+    // (an iPad's included), and a mouse click means a desk — the caret stays for both.
+    if (tapped && matchMedia('(hover: none)').matches) input.blur();
+    else input.focus();
   }
-  sendBtn.addEventListener('click', submit);
+  sendBtn.addEventListener('click', function () { submit(true); });
 
   // — history —
   // Seeded from the turns already in the transcript, so the first ▲ reaches what was

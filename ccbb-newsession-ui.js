@@ -79,12 +79,14 @@ function nsMenuButtons(m, items, done, iconOnly) {
   items.forEach(function(it){
     if (it.hidden) return;
     var b = document.createElement('button');
-    b.type = 'button'; b.className = 'ns-mi'; b.setAttribute('role', 'menuitem');
+    b.type = 'button'; b.className = 'ns-mi';
+    if (!iconOnly) b.setAttribute('role', 'menuitem');
     if (it.disabled) b.disabled = true;
     if (it.k) b.dataset.k = it.k;
     if (iconOnly) {
+      // The reason a disabled item is off goes in the label too: a phone shows no tooltip.
       b.title = it.title ? it.label + ' — ' + it.title : it.label;
-      b.setAttribute('aria-label', it.label);
+      b.setAttribute('aria-label', b.title);
       b.innerHTML = '<span class="ns-mic">' + it.icon + '</span>';
     } else {
       if (it.title) b.title = it.title;
@@ -94,35 +96,55 @@ function nsMenuButtons(m, items, done, iconOnly) {
     m.appendChild(b);
   });
 }
-// A session's menu as a strip of icon buttons docked in its info panel rather than a
-// popup over it: the two open together, so one floating over the other hid exactly what
-// ⋮ was opened to show. done() runs when an item is picked (the caller folds the panel).
-// It is always one row above the info, the same at any width. o.win: the bar's own
-// window buttons (▶ – □ ✕); the visible ones always end the row, right-aligned — a
-// narrow bar hides its own (ns-narrow). A mirrored button just clicks the real one, so nothing is copied.
+// A session's menu as a row of icon buttons docked on top of its info panel rather than
+// a popup over it: the two open together, so one floating over the other hid exactly
+// what ⋮ was opened to show. The same row at every width. done() runs when an item is
+// picked (the caller folds the panel). A toolbar, not a menu: it stays put and has no
+// arrow-key walk.
+// o.win: the bar's own window buttons (▶ – □ ✕), mirrored as one right-aligned group at
+// the end of the row — a narrow bar hides its own (ns-narrow). A mirror clicks the real
+// button, so nothing it does is copied, and follows it live (hidden, glyph, title):
+// ▶ comes and goes with the child while the row is open.
 function sessionMenuDock(o, done) {
   var m = document.createElement('div');
   m.className = 'ns-dock';
-  m.setAttribute('role', 'menu');
+  m.setAttribute('role', 'toolbar');
   nsMenuButtons(m, sessionMenuItems(o), done, true);
+  var g = document.createElement('span');
+  g.className = 'ns-wbs';
+  var obs = [];
   Array.prototype.forEach.call(o.win || [], function(real){
-    if (real.hidden) return;
     var b = document.createElement('button');
-    b.type = 'button'; b.className = 'ns-mi ns-wb'; b.innerHTML = '<span class="ns-mic">' + real.innerHTML + '</span>';
-    b.title = real.title;
-    b.setAttribute('aria-label', real.getAttribute('aria-label') || real.title);
-    b.addEventListener('click', function(e){ e.stopPropagation(); real.click(); });
-    m.appendChild(b);
+    b.type = 'button'; b.className = 'ns-mi ns-wb';
+    function sync() {
+      b.hidden = real.hidden;
+      b.innerHTML = '<span class="ns-mic">' + real.innerHTML + '</span>';
+      b.title = real.title;
+      b.setAttribute('aria-label', real.getAttribute('aria-label') || real.title);
+    }
+    sync();
+    // done() first: a real button that stops the click (▶) never reaches the bar's own
+    // fold, and a cancelled restart would leave the row open.
+    b.addEventListener('click', function(e){ e.stopPropagation(); done(); real.click(); });
+    g.appendChild(b);
+    if (typeof MutationObserver === 'function') {
+      var mo = new MutationObserver(function(){
+        if (!m.isConnected) return obs.forEach(function(x){ x.disconnect(); });
+        sync();
+      });
+      mo.observe(real, { attributes: true, attributeFilter: ['hidden', 'title', 'aria-label'], childList: true, characterData: true, subtree: true });
+      obs.push(mo);
+    }
   });
+  if (g.children.length) m.appendChild(g);
   return m;
 }
 // Narrow and stacked, by the bar's measured width: under 340px the bar hides its window
-// buttons (the ⋮ row carries them), under stackAt (480px) long info lines wrap.
+// buttons (the ⋮ row carries them), under 480px the desktop's long info lines wrap.
 // A ResizeObserver, not a container query — a folded column in horizontal layout is
 // sized BY its bar, and inline-size containment would collapse it to nothing.
-// stackAt: the phone passes its own (360), since every phone is under 480.
-function nsWatchWidth(target, measure, stackAt) {
-  stackAt = stackAt || 480;
+function nsWatchWidth(target, measure) {
+  var stackAt = 480;
   function apply(w) {
     if (!w) return;
     target.classList.toggle('ns-narrow', w < 340);
@@ -577,8 +599,10 @@ const CSS = `
 .ns-dock{flex:none;order:-1;display:flex;flex-wrap:wrap;gap:2px;padding:4px;border-bottom:1px solid var(--line);background:var(--bg)}
 .ns-dock>.ns-mi{justify-content:center;padding:0;width:38px;min-height:34px}
 .ns-dock .ns-mic{width:auto;font-size:13px}
-.ns-dock>.ns-mi:not(.ns-wb)+.ns-wb{margin-left:auto}
-.ns-dock>.ns-wb .ns-mic{font-family:inherit;font-weight:400;font-size:15px}
+.ns-wbs{margin-left:auto;display:flex;gap:2px}
+.ns-wbs>.ns-mi{justify-content:center;padding:0;width:38px;min-height:34px}
+.ns-wbs>.ns-mi[hidden]{display:none}
+.ns-wb .ns-mic{font-family:inherit;font-weight:400;font-size:15px}
 .vb-head.open.docked{display:flex;flex-direction:column}
 .vb-head.docked>:not(.ns-dock){min-width:0}
 .subhead.has-menu{display:grid;grid-template-columns:minmax(0,1fr);padding:0 0 7px}
