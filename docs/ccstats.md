@@ -51,6 +51,27 @@ context size before and after, trigger, duration, and whether it was inferred.
 
 Safe to hand to someone else; that is the point of the `skel`/`stats` split.
 
+## Collecting from others: ccstats-skel
+
+`ccstats-skel.js` is `skel` alone, shipped as a second bin of the ccbb package so anyone can
+run it straight from GitHub with nothing installed (needs node ≥18 and git):
+
+```bash
+npx -y -p github:iproudhon/ccbb ccstats-skel                 # → ./ccstats-skel.json.gz
+npx -y -p github:iproudhon/ccbb ccstats-skel -o me.json.gz -m opus
+curl -sL https://raw.githubusercontent.com/iproudhon/ccbb/main/ccstats-skel.js | node - -o me.json.gz
+```
+
+Same options as `skel` (`-o`, `-d`, `-m`, `-s`). Differences:
+
+- Output is gzipped when the name ends in `.gz`, which the default does. `stats` and
+  ccstats-golizer read gzipped and plain skeletons alike (sniffed by magic bytes).
+- Sanitized further: `sessionId` is replaced by the fingerprint; MCP tool names become
+  `t:mcp` and any non-identifier tool name `t:other`; on `*-local` responses the model and
+  provider both become `local`. Fingerprints are
+  computed first, so they still dedup against `skel` output and across collections.
+- No `codex app-server` fallback: Codex homes with no rollout files on disk are skipped.
+
 ## Cache-write attribution
 
 A cache write is either new context or a prefix being paid for twice. Each response's write is

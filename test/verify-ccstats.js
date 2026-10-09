@@ -227,6 +227,35 @@ check('skeletons carry no content', () => {
   }
 });
 
+// ── ccstats-skel ──────────────────────────────────────────────────────────────
+// The standalone collector: gzipped by default, same sessions and fingerprints as `skel`,
+// no session ids, MCP tool names or local model names, and readable by `stats` as-is.
+const SKEL_CLI = path.join(__dirname, '..', 'ccstats-skel.js');
+const gzFile = path.join(tmp, 'collected.json.gz');
+execFileSync(process.execPath, [SKEL_CLI, ...DIRS, '-o', gzFile], { encoding: 'utf8' });
+check('ccstats-skel writes sanitized gzip with the same fingerprints', () => {
+  const buf = fs.readFileSync(gzFile);
+  assert.ok(buf[0] === 0x1f && buf[1] === 0x8b, 'not gzipped');
+  const coll = JSON.parse(require('zlib').gunzipSync(buf).toString('utf8'));
+  assert.deepStrictEqual(coll.sessions.map(s => s.fingerprint).sort(),
+    skel.sessions.map(s => s.fingerprint).sort());
+  for (const s of coll.sessions) assert.strictEqual(s.sessionId, s.fingerprint);
+  const text = JSON.stringify(coll);
+  assert.ok(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/.test(text), 'session uuid leaked');
+  assert.ok(!text.includes('mcp__'), 'mcp tool name leaked');
+  assert.ok(/ccstats stats: \d+ sessions/.test(run(['stats', gzFile, '-o', path.join(tmp, 'gz.html')])));
+});
+const { sanitize } = require(SKEL_CLI);
+check('sanitize strips tool and local-model names', () => {
+  const s = sanitize({ fingerprint: 'f', sessionId: 'x',
+    messages: [{ type: 't:mcp__corp-wiki__search+t:Bash+x' }, { type: 't:my tool' }],
+    responses: [{ model: '/srv/models/Qwen3-32B', provider: 'mylab', source: 'codex-local' },
+      { model: 'claude-opus-5', provider: 'anthropic', source: 'claude-sub' }] });
+  assert.deepStrictEqual(s.messages.map(m => m.type), ['t:mcp+t:Bash+x', 't:other']);
+  assert.deepStrictEqual(s.models, ['local', 'claude-opus-5']);
+  assert.deepStrictEqual(s.providers, ['local', 'anthropic']);
+});
+
 // ── Report checks ─────────────────────────────────────────────────────────────
 // Run the emitted script under the DOM shim and inspect what it drew.
 function renderReport(args) {

@@ -37,7 +37,10 @@ const POOL_POINTS = 240;                             // default time buckets per
 
 // ── Inputs ────────────────────────────────────────────────────────────────────
 function readJson(f) {
-  try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) {
+  try {
+    const buf = fs.readFileSync(f);   // ccstats-skel writes gzip; sniff the magic, not the name
+    return JSON.parse((buf[0] === 0x1f && buf[1] === 0x8b ? zlib.gunzipSync(buf) : buf).toString('utf8'));
+  } catch (e) {
     console.error(`ccstats-golizer: cannot read ${f}: ${e.message}`); process.exit(1);
   }
 }

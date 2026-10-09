@@ -26,6 +26,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { spawn } = require('child_process');
 
 // ── Discovery and extraction ──────────────────────────────────────────────────
@@ -721,7 +722,10 @@ async function runStats(argv) {
   // skeletons are built straight from the discoverable sessions — same data `ccstats skel`
   // would have written, without the intermediate file.
   const inputs = files.length ? files.map(f => {
-    try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) {
+    try {
+      const buf = fs.readFileSync(f);   // ccstats-skel writes gzip; sniff the magic, not the name
+      return JSON.parse((buf[0] === 0x1f && buf[1] === 0x8b ? zlib.gunzipSync(buf) : buf).toString('utf8'));
+    } catch (e) {
       console.error(`ccstats stats: cannot read ${f}: ${e.message}`); process.exit(1);
     }
   }) : [await buildAllSkeletons(o.dirs)];

@@ -13,7 +13,8 @@
   ],
   "license": "MIT",
   "bin": {
-    "ccbb": "ccbb.js"
+    "ccbb": "ccbb.js",
+    "ccstats-skel": "ccstats-skel.js"
   },
   "main": "ccbb-common.js",
   "files": [
@@ -29,7 +30,8 @@
     "ccbb-mobile.js",
     "LICENSE",
     "ccbb-codex-session.js",
-    "ccbb-newsession-ui.js"
+    "ccbb-newsession-ui.js",
+    "ccstats-skel.js"
   ],
   "engines": {
     "node": ">=18"
