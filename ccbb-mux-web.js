@@ -435,7 +435,16 @@ function fmtTokShort(t) {
 // subset a Claude turn actually emits. Everything is escaped BEFORE any markup is
 // introduced, so no path here can inject HTML from model output.
 function md(src) {
+  // unjoinTables comes from ccbb's SHARED_JS, when the host included it.
+  if (typeof unjoinTables === 'function') src = unjoinTables(src);
   var lines = String(src == null ? '' : src).split('\\n');
+  var SEP = /^\\s*\\|?\\s*:?-+:?\\s*(\\|\\s*:?-+:?\\s*)*\\|?\\s*$/;
+  function cells(s) {
+    s = s.trim().replace(/\\\\\\|/g, '\\0');
+    if (s[0] === '|') s = s.slice(1);
+    if (s[s.length - 1] === '|') s = s.slice(0, -1);
+    return s.split('|').map(function (c) { return c.replace(/\\0/g, '|').trim(); });
+  }
   var out = [], i = 0;
   function inline(s) {
     s = esc(s);
@@ -467,6 +476,22 @@ function md(src) {
       out.push((ord ? '<ol>' : '<ul>') + items.join('') + (ord ? '</ol>' : '</ul>'));
       continue;
     }
+    if (l.indexOf('|') >= 0 && i + 1 < lines.length && SEP.test(lines[i + 1]) && lines[i + 1].indexOf('|') >= 0) {
+      var head = cells(l), al = cells(lines[i + 1]).map(function (c) {
+        var a = c[0] === ':', b = c[c.length - 1] === ':';
+        return a && b ? 'center' : b ? 'right' : a ? 'left' : '';
+      });
+      var tr = function (cs, tag) {
+        return '<tr>' + head.map(function (_, k) {
+          return '<' + tag + (al[k] ? ' style="text-align:' + al[k] + '"' : '') + '>' + inline(cs[k] || '') + '</' + tag + '>';
+        }).join('') + '</tr>';
+      };
+      var body = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].indexOf('|') >= 0) { body.push(tr(cells(lines[i]), 'td')); i++; }
+      out.push('<table><thead>' + tr(head, 'th') + '</thead><tbody>' + body.join('') + '</tbody></table>');
+      continue;
+    }
     if (/^\\s*>\\s?/.test(l)) {
       var q = [];
       while (i < lines.length && /^\\s*>\\s?/.test(lines[i])) { q.push(lines[i].replace(/^\\s*>\\s?/, '')); i++; }
@@ -476,7 +501,8 @@ function md(src) {
     if (!l.trim()) { i++; continue; }
     var para = [];
     while (i < lines.length && lines[i].trim() && lines[i].slice(0, 3) !== BT3 &&
-           !/^(#{1,6})\\s|^\\s*([-*+]|\\d+\\.)\\s|^\\s*>/.test(lines[i])) { para.push(lines[i]); i++; }
+           !/^(#{1,6})\\s|^\\s*([-*+]|\\d+\\.)\\s|^\\s*>/.test(lines[i]) &&
+           !(lines[i].indexOf('|') >= 0 && i + 1 < lines.length && SEP.test(lines[i + 1]) && lines[i + 1].indexOf('|') >= 0)) { para.push(lines[i]); i++; }
     out.push('<p>' + inline(para.join('\\n')) + '</p>');
   }
   return out.join('');

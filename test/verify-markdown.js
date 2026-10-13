@@ -36,3 +36,16 @@ test('the page hook makes marked draw it as a table', { skip: !fs.existsSync(ven
   assert.match(html, /<table>/);
   assert.equal((html.match(/<tr>/g) || []).length, 3);
 });
+
+test('the mux view draws it as a table too', () => {
+  const { APP_JS } = require('../ccbb-mux-web');
+  const src = APP_JS.slice(APP_JS.indexOf('function md('), APP_JS.indexOf('// ── Tool renderers'));
+  const ctx = { BT: '`', BT3: '```', esc: s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;') };
+  vm.createContext(ctx);
+  vm.runInContext(unjoinTables.toString() + '\n' + src, ctx);
+  const html = ctx.md(joined + '\nafter');
+  assert.match(html, /<table>/);
+  assert.equal((html.match(/<tr>/g) || []).length, 3);
+  assert.match(html, /<td>vLLM \| graphs<\/td>/);
+  assert.match(html, /<\/table><p>after<\/p>$/);
+});
