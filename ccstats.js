@@ -622,6 +622,7 @@ const NBINS = 96;
 const SBINS = 24;             // secondary charts (idle gap)
 const SESS_BINS = 48;         // per-session distributions (turn count, duration)
 const CBINS = 32;             // compactions
+const FINE = 4;               // line mode plots each bar's bin split this many ways
 const DEFAULT_POINTS = 2000;
 
 // ── Shared option parsing ─────────────────────────────────────────────────────
@@ -729,27 +730,29 @@ async function runStats(argv) {
       console.error(`ccstats stats: cannot read ${f}: ${e.message}`); process.exit(1);
     }
   }) : [await buildAllSkeletons(o.dirs)];
+  // Each input file is one user's. Names are anonymized by file order: anon-a, anon-b, …
+  const users = inputs.map((_, u) => anonName(u));
   const seen = new Set();
   let sessions = [];
-  for (const data of inputs) {
+  inputs.forEach((data, u) => {
     for (const s of (Array.isArray(data) ? data : (data.sessions || []))) {
       const key = s.fingerprint || s.sessionId;
       if (key && seen.has(key)) continue;
       if (key) seen.add(key);
-      sessions.push(s);
+      sessions.push({ ...s, user: u });
     }
-  }
+  });
   sessions = filterSessions(sessions, o);
   if (!sessions.length) { console.error('ccstats stats: no sessions matched the filter.'); process.exit(1); }
 
-  const model = buildModel(sessions);
+  const model = buildModel(sessions, users);
   if (!model.rows.length) { console.error('ccstats stats: no responses matched the filter.'); process.exit(1); }
   const meta = {
     log,
     sessions: model.sessionRows.length,
     responses: model.rows.length,
     withTiming: model.rows.filter(r => r.respMs != null).length,
-    sources: model.sources, models: model.families, groups: model.groups,
+    users: model.users, sources: model.sources, models: model.families, groups: model.groups,
     generatedAt: new Date().toISOString(),
   };
   // --confluence changes WHAT the output file holds (the macro-body extract), not how many
@@ -759,7 +762,7 @@ async function runStats(argv) {
   fs.writeFileSync(out, body);
   const kb = Math.round(Buffer.byteLength(body) / 1024);
   console.log(`ccstats stats: ${meta.sessions} sessions, ${meta.responses} responses, ` +
-    `${meta.groups.length} source×model groups → ${out} (${kb} KB` +
+    `${meta.users.length} user${meta.users.length === 1 ? '' : 's'}, ${meta.groups.length} groups → ${out} (${kb} KB` +
     `${conf ? ', Confluence HTML-macro body' : ''})`);
 }
 function statsHelp() {
@@ -771,7 +774,8 @@ Usage:
 Writes a self-contained HTML report: token histograms, response-time charts, cache-write
 attribution and per-session distributions. With no file arguments the skeletons are built
 from the discoverable sessions; given files (glob is fine, e.g. *.json) are read instead and
-deduped by fingerprint. Sources and models are selectable in the page as well as here.
+deduped by fingerprint. Each file counts as one user, shown anonymized (anon-a, anon-b, …)
+in file order. Users, sources and models are selectable in the page.
 
 Chart data is pre-aggregated at build time per source×model group, so page size grows with
 the number of groups, not the number of sessions (only the scatter carries per-response
@@ -787,17 +791,23 @@ ${COMMON_HELP}`);
 }
 
 // ── Build-time model ──────────────────────────────────────────────────────────
+function anonName(i) {
+  let n = '';
+  do { n = String.fromCharCode(97 + i % 26) + n; i = Math.floor(i / 26) - 1; } while (i >= 0);
+  return 'anon-' + n;
+}
 // Flatten sessions into response rows + session rows, each tagged with a group index.
-// A group is one (source, model family) pair: the finest cut the page's two checkbox rows
-// can select, and the unit every aggregate is kept in.
-function buildModel(sessions) {
+// A group is one (source, model family, user) triple: the finest cut the page's checkbox
+// rows can select, and the unit every aggregate is kept in.
+function buildModel(sessions, users) {
+  users = users || [anonName(0)];
   const sources = [], families = [], groups = [], groupIndex = new Map();
   const idx = (arr, v) => { let i = arr.indexOf(v); if (i < 0) { arr.push(v); i = arr.length - 1; } return i; };
-  const groupOf = (source, model) => {
-    const key = source + '\u0000' + model;
+  const groupOf = (source, model, user) => {
+    const key = source + '\u0000' + model + '\u0000' + user;
     if (groupIndex.has(key)) return groupIndex.get(key);
     const g = groups.length;
-    groups.push([idx(sources, source), idx(families, model)]);
+    groups.push([idx(sources, source), idx(families, model), user]);
     groupIndex.set(key, g);
     return g;
   };
@@ -805,7 +815,7 @@ function buildModel(sessions) {
   for (const s of sessions) {
     let sessionGroup = null;
     for (const r of (s.responses || [])) {
-      const g = groupOf(r.source || s.agent || 'unknown', familyOf(r.model));
+      const g = groupOf(r.source || s.agent || 'unknown', familyOf(r.model), s.user || 0);
       if (sessionGroup == null) sessionGroup = g;
       rows.push({
         promptTokens: r.promptTokens || 0,
@@ -839,7 +849,7 @@ function buildModel(sessions) {
       });
     }
   }
-  return { rows, sessionRows, compactRows, sources, families, groups };
+  return { rows, sessionRows, compactRows, users, sources, families, groups };
 }
 
 // ── Aggregation ───────────────────────────────────────────────────────────────
@@ -857,20 +867,24 @@ function niceStep(x) {
   const p = Math.pow(10, Math.floor(Math.log10(x))); const f = x / p;
   return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
 }
-// Edge arrays: n+1 numbers, ascending. linEdges snaps to a round step; logEdges is
-// log10-spaced and ignores zeros (they fall into the first bin).
+// Edge arrays: {edges, f}, ascending. The edges are FINE — every f-th one is a bar edge, so
+// the page draws lines from the fine bins and merges each f of them into one bar. linEdges
+// snaps bars to a round step (and splits it only where the split stays on whole numbers);
+// logEdges is log10-spaced and ignores zeros (they fall into the first bin).
 function linEdges(vals, N) {
   const max = Math.max(...vals, 1), step = niceStep(max / N) || 1;
   const n = Math.max(1, Math.ceil((max + 1e-9) / step));
-  return Array.from({ length: n + 1 }, (_, i) => Math.round(i * step));
+  const f = [FINE, 5, 2].find(k => k <= FINE && Number.isInteger(step / k)) || 1;
+  return { edges: Array.from({ length: n * f + 1 }, (_, i) => Math.round(i * step / f)), f };
 }
 function logEdges(vals, N, floor) {
   const pos = vals.filter(v => v > 0);
-  if (!pos.length) return [0, 1];
+  if (!pos.length) return { edges: [0, 1], f: 1 };
   const lo = Math.log10(Math.max(floor || 1, Math.min(...pos))), hi = Math.log10(Math.max(...pos));
-  const span = (hi - lo) || 1;
-  return Array.from({ length: N + 1 }, (_, i) => Math.round(Math.pow(10, lo + span * i / N)));
+  const span = (hi - lo) || 1, n = N * FINE;
+  return { edges: Array.from({ length: n + 1 }, (_, i) => Math.round(Math.pow(10, lo + span * i / n))), f: FINE };
 }
+const NO_EDGES = { edges: [0, 1], f: 1 };
 function binOf(edges, v) {
   if (!(v > edges[0])) return 0;
   let lo = 0, hi = edges.length - 1;
@@ -879,8 +893,10 @@ function binOf(edges, v) {
 }
 // Every cell is a count or a sum of non-negative numbers, so a negative value is free to mean
 // "this many zeros". Splitting the aggregates per (source, model) group leaves ~90% of cells
-// empty, and that is most of the payload; the page expands this once at startup.
-function rle(a) {
+// empty, and that is most of the payload; the page expands this once at startup. A row ships
+// as one base-36 string ("-" marks a zero run) — about a third smaller than a JSON array.
+function rle(a) { return rleNums(a).map(v => v.toString(36)).join(','); }
+function rleNums(a) {
   const out = [];
   let z = 0;
   for (const v of a) {
@@ -891,9 +907,18 @@ function rle(a) {
   return out;                       // a trailing run of zeros is implied by `len`
 }
 function packRows(rows) { return { len: rows.length ? rows[0].length : 0, g: rows.map(rle) }; }
-function packSection(s) { return { edges: s.edges, n: s.n, len: s.g[0] ? s.g[0].length : 0, g: s.g.map(rle) }; }
+// A section with `sum: [i, a, b]` has cell i == cell a + cell b by construction; column i is
+// left out of the payload and the page puts it back.
+function packSection(s) {
+  let g = s.g;
+  if (s.sum) g = g.map(r => r.filter((_, j) => j % s.n !== s.sum[0]));
+  const out = { edges: s.edges, f: s.f, n: s.n, len: g[0] ? g[0].length : 0, g: g.map(rle) };
+  if (s.sum) out.sum = s.sum;
+  return out;
+}
 // One aggregate section: edges + per-group flat cells. `cell` writes a row's contribution.
-function section(edges, nCell, nGroups, items, valueOf, cell) {
+function section(fe, nCell, nGroups, items, valueOf, cell) {
+  const edges = fe.edges;
   const nb = edges.length - 1;
   const g = Array.from({ length: nGroups }, () => new Array(nb * nCell).fill(0));
   for (const it of items) {
@@ -901,7 +926,7 @@ function section(edges, nCell, nGroups, items, valueOf, cell) {
     if (v == null) continue;
     cell(g[it.g], binOf(edges, v) * nCell, it);
   }
-  return { edges, n: nCell, g };
+  return { edges, f: fe.f, n: nCell, g };
 }
 // prompt-binned cell: [n, cacheRead, cacheWrite, decode, respSum, respCount, cwGrowth, cwExpiry]
 function promptCell(a, o, r) {
@@ -909,26 +934,28 @@ function promptCell(a, o, r) {
   if (r.respMs != null) { a[o + 4] += r.respMs; a[o + 5]++; }
   a[o + 6] += r.cwGrowth; a[o + 7] += r.cwExpiry;
 }
-function buildView(rows, sessionRows, compactRows, nGroups, cap) {
+function buildView(rows, sessionRows, compactRows, nGroups, cap, cwSplit) {
   const prompts = rows.map(totalPrompt);
   const gaps = rows.filter(r => r.gapMs != null).map(r => r.gapMs);
   const lin = section(linEdges(prompts, NBINS), 8, nGroups, rows, totalPrompt, promptCell);
   const log = section(logEdges(prompts, NBINS), 8, nGroups, rows, totalPrompt, promptCell);
+  if (cwSplit) lin.sum = log.sum = [2, 6, 7];
   // gap cell: [n, cacheWrite, cwGrowth, cwExpiry, respSum, respCount]
-  const gap = section(gaps.length ? logEdges(gaps, SBINS, 1000) : [0, 1], 6, nGroups, rows,
+  const gap = section(gaps.length ? logEdges(gaps, SBINS, 1000) : NO_EDGES, 6, nGroups, rows,
     r => r.gapMs, (a, o, r) => {
       a[o]++; a[o + 1] += r.cacheWrite; a[o + 2] += r.cwGrowth; a[o + 3] += r.cwExpiry;
       if (r.respMs != null) { a[o + 4] += r.respMs; a[o + 5]++; }
     });
+  if (cwSplit) gap.sum = [1, 2, 3];
   // Session distributions, in both scalings so the page's log toggle can switch bins.
   const tv = sessionRows.map(s => s.turns), count1 = (a, o) => { a[o]++; };
   const turns = section(linEdges(tv, SESS_BINS), 1, nGroups, sessionRows, s => s.turns, count1);
-  const turnsLog = section(tv.length ? logEdges(tv, SESS_BINS, 1) : [0, 1], 1, nGroups,
+  const turnsLog = section(tv.length ? logEdges(tv, SESS_BINS, 1) : NO_EDGES, 1, nGroups,
     sessionRows, s => s.turns, count1);
   const durs = sessionRows.filter(s => s.durMs != null).map(s => s.durMs);
-  const dur = section(durs.length ? linEdges(durs, SESS_BINS) : [0, 1], 1, nGroups, sessionRows,
+  const dur = section(durs.length ? linEdges(durs, SESS_BINS) : NO_EDGES, 1, nGroups, sessionRows,
     s => s.durMs, count1);
-  const durLog = section(durs.length ? logEdges(durs, SESS_BINS, 1000) : [0, 1], 1, nGroups,
+  const durLog = section(durs.length ? logEdges(durs, SESS_BINS, 1000) : NO_EDGES, 1, nGroups,
     sessionRows, s => s.durMs, count1);
 
   // Compactions, binned by the context size that triggered them.
@@ -939,9 +966,9 @@ function buildView(rows, sessionRows, compactRows, nGroups, cap) {
     if (c.durMs != null) { a[o + 3] += c.durMs; a[o + 4]++; }
     a[o + 5] += c.inferred; a[o + 6] += c.auto;
   };
-  const comp = section(pres.length ? linEdges(pres, CBINS) : [0, 1], 7, nGroups, compactRows,
+  const comp = section(pres.length ? linEdges(pres, CBINS) : NO_EDGES, 7, nGroups, compactRows,
     c => c.pre, compCell);
-  const compLog = section(pres.length ? logEdges(pres, CBINS, 1000) : [0, 1], 7, nGroups,
+  const compLog = section(pres.length ? logEdges(pres, CBINS, 1000) : NO_EDGES, 7, nGroups,
     compactRows, c => c.pre, compCell);
 
   // Hour-of-day response-time means, per group.
@@ -987,24 +1014,45 @@ function buildView(rows, sessionRows, compactRows, nGroups, cap) {
     for (let i = 0; i < cap; i++) pts.push(all[Math.floor(i * stride)]);
   }
   const R = Math.round;
-  const out = {
-    hour: { sum: packRows(hsum.map(a => a.map(R))), cnt: packRows(hcnt) },
-    tot: packRows(tot.map(a => a.map(R))),
+  return {
+    hour: { sum: hsum.map(a => a.map(R)), cnt: hcnt },
+    tot: tot.map(a => a.map(R)),
     pts, ptsTotal: all.length,
+    lin, log, gap, turns, turnsLog, dur, durLog, comp, compLog,
   };
-  for (const [k, s] of Object.entries({ lin, log, gap, turns, turnsLog, dur, durLog, comp, compLog }))
-    out[k] = packSection(s);
+}
+const SECTIONS = ['lin', 'log', 'gap', 'turns', 'turnsLog', 'dur', 'durLog', 'comp', 'compLog'];
+function packView(v) {
+  const out = { hour: { sum: packRows(v.hour.sum), cnt: packRows(v.hour.cnt) },
+    tot: packRows(v.tot), pts: v.pts, ptsTotal: v.ptsTotal };
+  for (const k of SECTIONS) out[k] = packSection(v[k]);
   return out;
 }
+const minusRows = (a, b) => a.map((r, i) => r.map((x, j) => x - b[i][j]));
 function buildViews(model, cap) {
   const n = model.groups.length;
   const keepRows = model.rows, dropRows = model.rows.filter(r => !isOutlier(r));
-  const keep = buildView(keepRows, model.sessionRows, model.compactRows, n, cap);
-  const drop = buildView(dropRows, model.sessionRows, model.compactRows, n, cap);
+  // Cache write is always growth + re-write for skeletons that carry the split; then the
+  // cache-write column need not ship.
+  const cwSplit = keepRows.every(r => r.cacheWrite === r.cwGrowth + r.cwExpiry);
+  const keepRaw = buildView(keepRows, model.sessionRows, model.compactRows, n, cap, cwSplit);
+  const dropRaw = buildView(dropRows, model.sessionRows, model.compactRows, n, cap, cwSplit);
+  const keep = packView(keepRaw), drop = packView(dropRaw);
+  // Scatter points as one base-36 string: "x,y,g[,1];…" (the trailing 1 flags an outlier).
+  keep.pts = { s: keepRaw.pts.map(p => p.map(v => v.toString(36)).join(',')).join(';') };
   // Only the response-derived sections differ between the two outlier states; sessions and
   // compactions come out byte-identical, so ship them once and let the page alias them.
-  for (const k of Object.keys(drop))
-    if (JSON.stringify(drop[k]) === JSON.stringify(keep[k])) drop[k] = '@' + k;
+  // The rest differ only by the few outlier rows: where the bins line up, ship just those
+  // (keep − drop, all integer counts and sums, so the page's subtraction is exact).
+  for (const k of Object.keys(drop)) {
+    if (JSON.stringify(drop[k]) === JSON.stringify(keep[k])) { drop[k] = '@' + k; continue; }
+    const a = keepRaw[k], b = dropRaw[k];
+    if (k === 'tot') drop.tot = { minus: 1, ...packRows(minusRows(a, b)) };
+    else if (k === 'hour') drop.hour = { minus: 1,
+      sum: packRows(minusRows(a.sum, b.sum)), cnt: packRows(minusRows(a.cnt, b.cnt)) };
+    else if (SECTIONS.includes(k) && JSON.stringify(a.edges) === JSON.stringify(b.edges))
+      drop[k] = { minus: 1, ...packSection({ ...b, g: minusRows(a.g, b.g) }) };
+  }
   // The scatter sample is shipped once, flagged; the page derives the trimmed one from it.
   drop.pts = '@pts';
   return { keep, drop };
@@ -1043,8 +1091,12 @@ h1{font-size:20px;font-weight:600;margin:0 0 4px;color:__primary__}
   min-width:58px}
 .ctrl .n{color:__muted__;font-variant-numeric:tabular-nums}
 .ctrl a{color:__series__;cursor:pointer;text-decoration:none;font-size:12px}
-.card{background:__surface__;border:1px solid __border__;border-radius:12px;
+.card{position:relative;background:__surface__;border:1px solid __border__;border-radius:12px;
   padding:16px 16px 8px;margin:0 0 20px;overflow-x:auto}
+.mode{position:absolute;top:14px;right:16px;display:flex;border:1px solid __border__;
+  border-radius:6px;overflow:hidden;font-size:11px}
+.mode a{padding:2px 8px;cursor:pointer;color:__muted__;user-select:none}
+.mode a.on{background:__series__;color:__surface__}
 .card h2{font-size:15px;font-weight:600;margin:0 0 2px;color:__primary__}
 .card .desc{color:__muted__;font-size:12px;margin:0 0 8px}
 svg{display:block;max-width:100%;height:auto}
@@ -1084,6 +1136,7 @@ const MARKUP = `
   <div class="ctrl" id="scaleCtrl">
     <label><input type="checkbox" id="outToggle" checked> remove outliers (0-size &amp; 0-response, or response &gt; 10&nbsp;min)</label>
   </div>
+  <div class="ctrl" id="userCtrl"><span class="lbl">user</span></div>
   <div class="ctrl" id="srcCtrl"><span class="lbl">source</span></div>
   <div class="ctrl" id="modCtrl"><span class="lbl">model</span></div>
   <div class="card"><h2>Sessions by turn count</h2><p class="desc">how many sessions had how many billable responses</p><div id="sess-turns"></div></div>
@@ -1121,10 +1174,10 @@ var VIEWS = DATA.views, meta = DATA.meta;
 // The payload ships zero-run compressed (a negative number is a run of that many zeros, a
 // trailing run is implied by len), and the outlier views alias any section that came out
 // identical. Expand both once here so nothing downstream has to know.
-function unrle(a, len){
-  var out = new Array(len), i = 0;
+function unrle(row, len){
+  var out = new Array(len), i = 0, a = row ? row.split(',') : [];
   for(var k=0; k<a.length; k++){
-    var v = a[k];
+    var v = parseInt(a[k], 36);
     if(v < 0){ for(var j=0; j<-v; j++) out[i++] = 0; } else out[i++] = v;
   }
   while(i < len) out[i++] = 0;
@@ -1132,8 +1185,23 @@ function unrle(a, len){
 }
 function unpack(p){
   var g = [];
-  for(var i=0; i<p.g.length; i++) g.push(unrle(p.g[i], p.len));
+  for(var i=0; i<p.g.length; i++) g.push(p.sum ? unsum(unrle(p.g[i], p.len), p.n, p.sum) : unrle(p.g[i], p.len));
   return g;
+}
+// Put back the column packSection left out: cell sum[0] = cell sum[1] + cell sum[2].
+function unsum(r, n, sum){
+  var out = [], m = n - 1;
+  for(var o=0; o<r.length; o+=m){
+    var c = r.slice(o, o+m);
+    c.splice(sum[0], 0, 0);
+    c[sum[0]] = c[sum[1]] + c[sum[2]];
+    out.push.apply(out, c);
+  }
+  return out;
+}
+// A section marked minus holds only the outlier rows' share: the view is base − it.
+function minus(a, b){
+  return a.map(function(r, i){ return r.map(function(x, j){ return x - b[i][j]; }); });
 }
 function expand(v, base){
   Object.keys(v).forEach(function(k){
@@ -1143,11 +1211,18 @@ function expand(v, base){
       return;
     }
     if(typeof s === 'string' && s.charAt(0) === '@'){ v[k] = base[s.slice(1)]; return; }
-    if(k === 'hour'){ v.hour = {sum: unpack(s.sum), cnt: unpack(s.cnt)}; return; }
-    if(k === 'tot'){ v.tot = unpack(s); return; }
-    if(s && s.edges){ s.g = unpack(s); delete s.len; }
+    var m = s && s.minus;
+    if(k === 'hour'){
+      v.hour = {sum: unpack(s.sum), cnt: unpack(s.cnt)};
+      if(m) v.hour = {sum: minus(base.hour.sum, v.hour.sum), cnt: minus(base.hour.cnt, v.hour.cnt)};
+      return;
+    }
+    if(k === 'tot'){ v.tot = m ? minus(base.tot, unpack(s)) : unpack(s); return; }
+    if(s && s.edges){ s.g = m ? minus(base[k].g, unpack(s)) : unpack(s); delete s.len; delete s.minus; delete s.sum; }
   });
 }
+VIEWS.keep.pts = VIEWS.keep.pts.s ? VIEWS.keep.pts.s.split(';').map(function(p){
+  return p.split(',').map(function(v){ return parseInt(v, 36); }); }) : [];
 expand(VIEWS.keep, null); expand(VIEWS.drop, VIEWS.keep);
 
 var host = document.getElementById(${JSON.stringify(HOST_ID)});
@@ -1215,10 +1290,12 @@ var DEFAULT_SOURCES = ['claude-sub', 'claude-bedrock'];
 var srcOn = meta.sources.map(function(s){ return DEFAULT_SOURCES.indexOf(s) >= 0; });
 if(!srcOn.some(function(v){ return v; })) srcOn = meta.sources.map(function(){ return true; });
 var modOn = meta.models.map(function(){ return true; });
+var userOn = meta.users.map(function(){ return true; });
 function refreshSel(){
   SEL = [];
   for(var g=0; g<meta.groups.length; g++){
-    if(srcOn[meta.groups[g][0]] && modOn[meta.groups[g][1]]) SEL.push(g);
+    var gr = meta.groups[g];
+    if(srcOn[gr[0]] && modOn[gr[1]] && userOn[gr[2]]) SEL.push(g);
   }
 }
 // Sum one section's per-group cells over SEL, decoded into per-bin objects.
@@ -1233,6 +1310,19 @@ function sumSection(sec){
       for(var k2=0; k2<n; k2++) c[k2] += arr[b*n + k2];
     }
     out.push({lo: sec.edges[b], hi: sec.edges[b+1], c: c});
+  }
+  out.f = sec.f || 1;
+  return out;
+}
+// Merge each f fine bins into one bar. Every cell is a count or a sum, so this is exact.
+function coarsen(bins){
+  var f = bins.f || 1;
+  if(f === 1) return bins;
+  var out = [];
+  for(var i=0; i<bins.length; i+=f){
+    var part = bins.slice(i, i+f), c = part[0].c.slice();
+    for(var j=1; j<part.length; j++) for(var k=0; k<c.length; k++) c[k] += part[j].c[k];
+    out.push({lo: part[0].lo, hi: part[part.length-1].hi, c: c});
   }
   return out;
 }
@@ -1326,11 +1416,40 @@ function blankSvg(hostEl){
   hostEl.innerHTML = ''; hostEl.appendChild(svg); return svg;
 }
 
-// Generic binned bar chart. opts: height(bin) -> bar height in data units,
-// segs(bin) -> [[color, value], …] stacked shares (optional; one solid bar otherwise),
-// fmtY, fmtX, tip(bin), xlabel, mean (value for the dashed reference line), meanLabel.
+// Per-chart line/bars switch, keyed by chart id. Line is the default.
+var MODE = {};
+function modeToggle(id, hostEl){
+  var card = hostEl.parentNode;
+  if(!card || card.querySelector('.mode')) return;
+  var box = document.createElement('div');
+  box.className = 'mode';
+  ['line', 'bars'].forEach(function(m){
+    var a = document.createElement('a');
+    a.textContent = m; a.setAttribute('data-m', m);
+    a.addEventListener('click', function(){ MODE[id] = m; render(); });
+    box.appendChild(a);
+  });
+  card.appendChild(box);
+}
+function paintMode(hostEl, mode){
+  var box = hostEl.parentNode && hostEl.parentNode.querySelector('.mode');
+  if(!box) return;
+  [].forEach.call(box.children, function(a){
+    a.className = a.getAttribute('data-m') === mode ? 'on' : ''; });
+}
+// Generic binned chart, drawn as bars or as lines through the bin centres.
+// opts: height(bin) -> bar height in data units,
+// segs(bin) -> [[color, value], …] stacked shares (optional; one solid bar otherwise; in line
+// mode each share becomes its own line, with the total drawn over them),
+// fmtY, fmtX, tip(bin), xlabel, mean (value for the dashed reference line), meanLabel,
+// zeros (an empty bin is a real 0 — counts — rather than "no data" — averages).
+// bins come in fine (see coarsen); line mode plots them as they are, bars merge them.
 function drawBins(id, bins, isLog, opts){
   var hostEl = $(id); if(!hostEl) return;
+  modeToggle(id, hostEl);
+  var line = (MODE[id] || 'line') === 'line';
+  paintMode(hostEl, line ? 'line' : 'bars');
+  if(!line) bins = coarsen(bins);
   var svg = blankSvg(hostEl);
   if(!bins.length) return;
   var fmtY = opts.fmtY || fmt, fmtX = opts.fmtX || fmt;
@@ -1342,9 +1461,15 @@ function drawBins(id, bins, isLog, opts){
   svg.appendChild(axisLine());
   var bw = IW / bins.length;
   var step = Math.ceil(bins.length/8);
+  if(line) drawLines(svg, bins, bw, maxH, opts);
   bins.forEach(function(b, i){
     var h = IH * opts.height(b) / maxH, x = M.l + i*bw, w = Math.max(1, bw-2);
-    if(h > 0){
+    if(line){
+      var hitL = el('rect',{x:x, y:M.t, width:bw, height:IH, fill:'transparent'});
+      hitL.addEventListener('mousemove', function(e){ showTip(opts.tip(b), e); });
+      hitL.addEventListener('mouseleave', hideTip);
+      svg.appendChild(hitL);
+    } else if(h > 0){
       var segs = opts.segs ? opts.segs(b) : [[PAL.series, 1]];
       var tot = 0;
       segs.forEach(function(s){ tot += s[1]; });
@@ -1365,6 +1490,36 @@ function drawBins(id, bins, isLog, opts){
   if(opts.marks) opts.marks(svg, bins, bw, maxH);
   svg.appendChild(axisLabel(M.l+IW/2, H-4, opts.xlabel + (isLog ? ' (log bins)' : '')));
   return svg;
+}
+
+// Line mode for drawBins: one path per stacked share (value = bar height × share) plus the
+// total, through each bin's centre. Bins with no data are stepped over, unless opts.zeros.
+function drawLines(svg, bins, bw, maxH, opts){
+  var segsOf = function(b){
+    var segs = opts.segs ? opts.segs(b) : [[PAL.series, 1]], tot = 0;
+    segs.forEach(function(s){ tot += s[1]; });
+    return {segs: segs, tot: tot};
+  };
+  var first = segsOf(bins[0]).segs, nSeg = first.length;
+  var series = [];
+  if(nSeg > 1) for(var k=0; k<nSeg; k++) series.push({color: first[k][0], v: function(k){
+    return function(b){ var s = segsOf(b); return s.tot > 0 ? opts.height(b) * s.segs[k][1] / s.tot : 0; };
+  }(k), w: 1.75});
+  series.push({color: nSeg > 1 ? PAL.primary : first[0][0], v: opts.height, w: 2,
+    dots: bins.length <= 60});
+  series.forEach(function(sr){
+    var d = '', started = false;
+    bins.forEach(function(b, i){
+      var v = sr.v(b);
+      if(b.hi <= b.lo) return;          // rounded-away log bin: nothing can land in it
+      if(!opts.zeros && !(opts.height(b) > 0)) return;
+      var cx = M.l + (i + 0.5)*bw, cy = M.t + IH - IH * v / maxH;
+      d += (started?' L':'M') + cx.toFixed(1) + ' ' + cy.toFixed(1); started = true;
+      if(sr.dots) svg.appendChild(el('circle',{cx:cx, cy:cy, r:2.5, fill:sr.color}));
+    });
+    if(d) svg.appendChild(el('path',{d:d, fill:'none', stroke:sr.color, 'stroke-width':sr.w,
+      'stroke-linejoin':'round'}));
+  });
 }
 
 function drawScatter(log){
@@ -1469,6 +1624,7 @@ function render(){
     segs: function(b){ return [[PAL.series, 1]]; },
     fmtY: function(v){ return String(Math.round(v)); },
     fmtX: function(v){ return String(Math.round(v)); },
+    zeros: true,
     xlabel: 'billable responses per session',
     mean: null,
     tip: function(b){ return '<b>'+Math.round(b.lo)+'</b>–<b>'+Math.round(b.hi)+'</b> turns<br><b>'+
@@ -1479,6 +1635,7 @@ function render(){
     height: function(b){ return b.c[0]; },
     segs: function(b){ return [[PAL.s3, 1]]; },
     fmtY: function(v){ return String(Math.round(v)); }, fmtX: fmtDur,
+    zeros: true,
     xlabel: 'session duration',
     tip: function(b){ return '<b>'+fmtDur(b.lo)+'</b>–<b>'+fmtDur(b.hi)+'</b><br><b>'+
       b.c[0]+'</b> sessions'; }
@@ -1491,6 +1648,7 @@ function render(){
     height: function(b){ return b.c[0]; },
     segs: function(b){ return [[PAL.s2, 1]]; },
     fmtY: function(v){ return String(Math.round(v)); },
+    zeros: true,
     xlabel: compX,
     tip: function(b){
       var n = b.c[0] || 1;
@@ -1524,6 +1682,7 @@ function render(){
     height: function(b){ return b.c[0]; },
     segs: function(b){ return [[PAL.s1, b.c[1]], [PAL.s2, b.c[2]], [PAL.s3, b.c[3]]]; },
     fmtY: function(v){ return String(Math.round(v)); },
+    zeros: true,
     xlabel: promptX,
     tip: function(b){
       var tot = b.c[1]+b.c[2]+b.c[3] || 1;
@@ -1673,13 +1832,14 @@ function logCheckbox(labelText){
 // Response counts per facet entry, for the labels.
 function facetCounts(which){
   var out = [];
-  var names = which === 0 ? meta.sources : meta.models;
+  var names = [meta.sources, meta.models, meta.users][which];
   for(var i=0; i<names.length; i++) out.push(0);
   for(var g=0; g<meta.groups.length; g++) out[meta.groups[g][which]] += VIEWS.keep.tot[g][0];
   return out;
 }
 $('scaleCtrl').appendChild(logCheckbox('log scaling (all histogram x bins & response-time axis)'));
-var srcCounts = facetCounts(0);
+var srcCounts = facetCounts(0), userCounts = facetCounts(2);
+facet($('userCtrl'), meta.users, userOn, userCounts);
 facet($('srcCtrl'), meta.sources, srcOn, srcCounts);
 facet($('modCtrl'), meta.models, modOn, facetCounts(1));
 
@@ -1706,6 +1866,11 @@ barPaint();
 
 barBody.appendChild(floatRow('scale'));
 barBody.appendChild(logCheckbox('log x'));
+barBody.appendChild(floatRow('user'));
+var barUser = document.createElement('div');
+barUser.className = 'rows';
+barBody.appendChild(barUser);
+facet(barUser, meta.users, userOn, userCounts);
 barBody.appendChild(floatRow('source'));
 var barSrc = document.createElement('div');
 barSrc.className = 'rows';
@@ -1713,6 +1878,7 @@ barBody.appendChild(barSrc);
 facet(barSrc, meta.sources, srcOn, srcCounts);
 
 $('sub').textContent = 'generated ' + meta.generatedAt.replace('T',' ').slice(0,16) +
+  ' · ' + meta.users.length + ' user' + (meta.users.length===1?'':'s') +
   ' · ' + meta.sources.length + ' source' + (meta.sources.length===1?'':'s') +
   ' · ' + meta.models.length + ' model' + (meta.models.length===1?'':'s');
 $('foot').textContent = 'Sources and models are auto-detected per response. Cache-write ' +
@@ -1774,4 +1940,4 @@ if (require.main === module) {
   main().catch(e => { console.error(`ccstats: ${e.message}`); process.exitCode = 1; });
 }
 
-module.exports = { runSkel, runStats, buildModel, buildViews };
+module.exports = { runSkel, runStats, buildModel, buildView, buildViews, isOutlier };

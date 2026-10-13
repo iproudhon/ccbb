@@ -252,6 +252,14 @@ function webManifest(self) {
 // ccbb's behaviour for them — hoisted rather than copied, for the same reason APP_CSS was.
 const SHARED_JS = `
 ${require('./ccbb-common').codexWindows.toString()}
+${require('./ccbb-common').unjoinTables.toString()}
+// The mobile page may fall back to a CDN marked that lands after this runs; dynamic
+// scripts still hold the load event, so a retry there catches it.
+(function hookMarked() {
+  if (typeof window === 'undefined') return;
+  function use() { if (!window.marked || !marked.use) return false; marked.use({ hooks: { preprocess: unjoinTables } }); return true; }
+  if (!use()) window.addEventListener('load', use);
+})();
 ${require('./ccbb-newsession-ui').JS}
 
 // ── shared helpers ────────────────────────────────────────────────────────────

@@ -97,14 +97,16 @@ response time), prompt-size → decode and cache-write bars, the growth/re-write
 → cache write, compactions by the context size that triggered them and by the result size they
 left, a prompt+output → response-time scatter with a binned trend line, and mean response time
 by hour. Light/dark via `prefers-color-scheme`, hover tooltips, an outlier toggle,
-source/model checkboxes, and a log-scaling switch that re-bins every histogram (both scalings
-are shipped, so it costs no rebuild). Log scaling and the source filter appear twice — in the
+user/source/model checkboxes, a per-chart line/bars switch on every histogram (line by
+default), and a log-scaling switch that re-bins every histogram (both scalings
+are shipped, so it costs no rebuild). Each input file counts as one user, shown anonymized as
+`anon-a`, `anon-b`, … in argument order. Log scaling and the user and source filters appear twice — in the
 control rows at the top and in a collapsible panel pinned to the top-right corner — and the two
 copies stay in sync whichever one is clicked. The page opens with outliers removed and with only
 `claude-sub` + `claude-bedrock` selected (everything, if neither is present), so a mixed report
 starts on one comparable slice rather than stacking four billing models together.
 
-Chart data is pre-aggregated at build time per source×model group over shared bin edges, so
+Chart data is pre-aggregated at build time per user×source×model group over shared bin edges, so
 page size grows with the number of groups rather than sessions, and the checkboxes re-sum in
 the page without shipping rows. Only the scatter carries per-response points (`--points`,
 default 2000; `0` keeps every response).

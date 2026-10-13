@@ -274,20 +274,38 @@ function renderReport(args) {
 }
 // The payload is zero-run compressed and the drop view aliases sections identical to keep's;
 // mirror the page's decode so the checks below can assert on plain per-group arrays.
-function unrle(a, len) {
+function unrle(row, len) {
   const out = [];
-  for (const v of a) { if (v < 0) { for (let j = 0; j < -v; j++) out.push(0); } else out.push(v); }
+  for (const v of (row ? row.split(',').map(t => parseInt(t, 36)) : [])) { if (v < 0) { for (let j = 0; j < -v; j++) out.push(0); } else out.push(v); }
   while (out.length < len) out.push(0);
   return out;
 }
+const minus = (a, b) => a.map((r, i) => r.map((x, j) => x - b[i][j]));
 function expand(v, base) {
   const o = {};
   for (const [k, s] of Object.entries(v)) {
+    const m = s && s.minus;
     if (k === 'pts' && typeof s === 'string') o.pts = base.pts.filter(p => !p[3]);
+    else if (k === 'pts') o.pts = s.s ? s.s.split(';').map(p => p.split(',').map(t => parseInt(t, 36))) : [];
     else if (typeof s === 'string' && s[0] === '@') o[k] = base[s.slice(1)];
-    else if (k === 'hour') o.hour = { sum: s.sum.g.map(r => unrle(r, s.sum.len)), cnt: s.cnt.g.map(r => unrle(r, s.cnt.len)) };
-    else if (k === 'tot') o.tot = s.g.map(r => unrle(r, s.len));
-    else if (s && s.edges) o[k] = { edges: s.edges, n: s.n, g: s.g.map(r => unrle(r, s.len)) };
+    else if (k === 'hour') {
+      const h = { sum: s.sum.g.map(r => unrle(r, s.sum.len)), cnt: s.cnt.g.map(r => unrle(r, s.cnt.len)) };
+      o.hour = m ? { sum: minus(base.hour.sum, h.sum), cnt: minus(base.hour.cnt, h.cnt) } : h;
+    }
+    else if (k === 'tot') { const t = s.g.map(r => unrle(r, s.len)); o.tot = m ? minus(base.tot, t) : t; }
+    else if (s && s.edges) {
+      let g = s.g.map(r => unrle(r, s.len));
+      if (s.sum) g = g.map(r => {
+        const out = [];
+        for (let o = 0; o < r.length; o += s.n - 1) {
+          const c = r.slice(o, o + s.n - 1);
+          c.splice(s.sum[0], 0, c[s.sum[1] - 1] + c[s.sum[2] - 1]);
+          out.push(...c);
+        }
+        return out;
+      });
+      o[k] = { edges: s.edges, f: s.f, n: s.n, g: m ? minus(base[k].g, g) : g };
+    }
     else o[k] = s;
   }
   return o;
@@ -295,7 +313,7 @@ function expand(v, base) {
 let rep;
 check('report renders without throwing', () => {
   rep = renderReport([skelFile]);
-  assert.ok(/source×model groups/.test(rep.log), rep.log.trim());
+  assert.ok(/1 user, \d+ groups/.test(rep.log), rep.log.trim());
 });
 check('every chart drew an svg', () => {
   if (!rep) throw new Error('report did not render');
@@ -365,7 +383,8 @@ check('session charts come before the response charts', () => {
 check('defaults: outliers removed, only the two billable-Claude sources on', () => {
   assert.strictEqual(rep.ids.get('outToggle').checked, true, 'outliers not removed by default');
   const panel = floatPanel();
-  const boxes = panel.querySelectorAll('input').slice(1);   // [0] is the log toggle
+  // [0] is the log toggle, then one per user
+  const boxes = panel.querySelectorAll('input').slice(1 + rep.data.meta.users.length);
   const on = rep.data.meta.sources.filter((s, i) => boxes[i].checked);
   assert.deepStrictEqual(on.slice().sort(), ['claude-bedrock', 'claude-sub']);
 });
@@ -397,8 +416,9 @@ check('log and source controls exist in both the page and a floating panel', () 
   assert.ok(/\.float\{position:fixed;top:[^;]*;right:/.test(rep.html), 'not pinned top-right');
   const panel = floatPanel();
   const boxes = panel.querySelectorAll('input');
-  // 1 log toggle + one per source
-  assert.strictEqual(boxes.length, 1 + rep.data.meta.sources.length, `float has ${boxes.length}`);
+  // 1 log toggle + one per user + one per source
+  assert.strictEqual(boxes.length, 1 + rep.data.meta.users.length + rep.data.meta.sources.length,
+    `float has ${boxes.length}`);
   // the outlier toggle is static markup; only the log copy is appended by script
   assert.strictEqual(rep.ids.get('scaleCtrl').querySelectorAll('input').length, 1,
     'no in-page log toggle');
@@ -421,7 +441,7 @@ check('the two copies stay in sync and both re-draw', () => {
   assert.strictEqual(floatLog.checked, false, 'the floating toggle did not follow');
 
   // Same for a source: unchecking it in the floating panel must move the page's copy.
-  const floatSrc = panel.querySelectorAll('input')[1];
+  const floatSrc = panel.querySelectorAll('input')[1 + rep.data.meta.users.length];
   const pageSrc = rep.ids.get('srcCtrl').querySelectorAll('input')[0];
   const before = rep.ids.get('tiles').innerHTML;
   floatSrc.checked = false;
@@ -452,8 +472,11 @@ check('--confluence writes only the macro body', () => {
 check('the payload is compressed and the drop view shares what it can', () => {
   // zero runs really are encoded (a negative cell), not just dense arrays that happen to fit
   const lin = rep.raw.views.keep.lin;
-  assert.ok(lin.len > 0 && lin.g.some(r => r.some(v => v < 0)), 'no zero runs in lin');
-  assert.ok(lin.g.some(r => r.length < lin.len), 'rle did not shrink any group');
+  const rows = lin.g.map(r => r ? r.split(',') : []);
+  assert.ok(lin.len > 0 && rows.some(r => r.some(t => t[0] === '-')), 'no zero runs in lin');
+  assert.ok(rows.some(r => r.length < lin.len), 'rle did not shrink any group');
+  // cache write is derived from growth + re-write, not shipped
+  assert.deepStrictEqual(lin.sum, [2, 6, 7], 'cache-write column shipped');
   // sessions/compactions are identical between views, so they must ship once
   const shared = ['turns', 'turnsLog', 'dur', 'durLog', 'comp', 'compLog', 'pts'];
   for (const k of shared) assert.strictEqual(typeof rep.raw.views.drop[k], 'string', `${k} duplicated`);
@@ -461,6 +484,41 @@ check('the payload is compressed and the drop view shares what it can', () => {
   assert.deepStrictEqual(rep.data.views.drop.turns, rep.data.views.keep.turns);
   assert.ok(rep.data.views.drop.pts.length <= rep.data.views.keep.pts.length);
   assert.ok(rep.data.views.drop.pts.every(p => !p[3]), 'trimmed sample kept an outlier');
+});
+// Decode a report's payload and compare it cell for cell with a fresh build of both views.
+function roundTrip(r, file) {
+  const { buildModel, buildView, isOutlier } = require(CLI);
+  const sessions = JSON.parse(fs.readFileSync(file, 'utf8')).sessions;
+  const m = buildModel(sessions.map(s => ({ ...s, user: 0 })));
+  const n = m.groups.length;
+  const want = {
+    keep: buildView(m.rows, m.sessionRows, m.compactRows, n, 2000),
+    drop: buildView(m.rows.filter(x => !isOutlier(x)), m.sessionRows, m.compactRows, n, 2000),
+  };
+  for (const v of ['keep', 'drop']) {
+    const got = r.data.views[v], w = want[v];
+    for (const k of ['lin', 'log', 'gap', 'turns', 'turnsLog', 'dur', 'durLog', 'comp', 'compLog']) {
+      assert.deepStrictEqual(got[k].edges, w[k].edges, `${v}.${k} edges`);
+      assert.deepStrictEqual(got[k].g, w[k].g, `${v}.${k} cells`);
+    }
+    assert.deepStrictEqual(got.tot, w.tot.map(a => a.map(Math.round)), `${v}.tot`);
+    assert.deepStrictEqual(got.hour, { sum: w.hour.sum.map(a => a.map(Math.round)), cnt: w.hour.cnt }, `${v}.hour`);
+    assert.deepStrictEqual(got.pts, w.pts, `${v}.pts`);
+  }
+}
+check('the decoded payload is exactly the build-time aggregates', () => roundTrip(rep, skelFile));
+check('outliers that leave the bins alone ship as a delta, still exact', () => {
+  // A 0-size, 0-time response is an outlier that moves no bin edge, so the drop view's
+  // prompt sections ship as keep − outliers.
+  const skel = JSON.parse(fs.readFileSync(skelFile, 'utf8'));
+  const s0 = skel.sessions.find(s => s.responses.length);
+  s0.responses.push({ ...s0.responses[0], promptTokens: 0, output: 0, cacheRead: 0,
+    cacheWrite: 0, cwGrowth: 0, cwExpiry: 0, respMs: 0, gapMs: null });
+  const f = path.join(tmp, 'skel-outlier.json');
+  fs.writeFileSync(f, JSON.stringify(skel));
+  const r = renderReport([f]);
+  assert.strictEqual(r.raw.views.drop.lin.minus, 1, 'drop.lin shipped in full');
+  roundTrip(r, f);
 });
 check('report is self-contained', () => {
   assert.ok(!/src\s*=\s*["']http/i.test(rep.html), 'external script/src reference');

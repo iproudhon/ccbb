@@ -1975,9 +1975,35 @@ function codexWindows(limits) {
   return windows;
 }
 
+// A GFM table the model wrote with every row on one line — "| a | b | |---|---| | 1 | 2 |",
+// rows joined by "| |" — which marked shows as a paragraph of pipes. The separator row
+// gives the column count, so the line splits back into rows only when it divides evenly;
+// anything else, and anything inside a fence, is left as written. Runs in the page too
+// (marked's preprocess hook, via SHARED_JS), so it stays self-contained.
+function unjoinTables(src) {
+  const dash = /^\s*:?-+:?\s*$/;
+  let fence = null;
+  return String(src == null ? '' : src).split('\n').map(line => {
+    const t = line.trim();
+    const f = /^(`{3,}|~{3,})/.exec(t);
+    if (f) { if (!fence) fence = t[0]; else if (t[0] === fence) fence = null; return line; }
+    if (fence || t[0] !== '|' || t[t.length - 1] !== '|' || !/\|\s*\|\s*:?-+/.test(t)) return line;
+    const cells = t.replace(/\\\|/g, '\0').slice(1, -1).split('|');
+    const n = cells.findIndex(c => dash.test(c)) - 1;
+    if (n < 1 || cells[n].trim()) return line;
+    const rows = [];
+    for (let i = 0; i < cells.length; i += n + 1) {
+      if (i + n > cells.length || (i + n < cells.length && cells[i + n].trim())) return line;
+      rows.push(cells.slice(i, i + n));
+    }
+    if (rows.length < 2 || !rows[1].every(c => dash.test(c))) return line;
+    return rows.map(r => '|' + r.join('|') + '|').join('\n').replace(/\0/g, '\\|');
+  }).join('\n');
+}
+
 module.exports = {
   muxTitle, sessionRow,
-  codexWindows,
+  codexWindows, unjoinTables,
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
   serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable,
