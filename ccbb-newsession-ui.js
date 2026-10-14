@@ -405,7 +405,11 @@ function openExplorer(o) {
       server: o.server, base: o.base, start: o.start || nsStore(dirKey) || '~', onNewHere: o.onNewHere,
       onDir: function(p){ nsStore(dirKey, p); if (w) w.querySelector('.flw-title').textContent = o.server + ': ' + p; },
       onPop: function(r){
-        floatWin(o.server + ': ' + r.path, function(h){ nsFileView(h, r); });
+        floatWin(o.server + ': ' + r.path, function(h){ nsFileView(h, r); }, null, null, { reload: function(h){
+          nsGet(o.base + '/api/fs/cat?path=' + encodeURIComponent(r.path)).then(function(nr){
+            var y = h.scrollTop; h.innerHTML = ''; nsFileView(h, nr); h.scrollTop = y;
+          }).catch(function(e){ h.innerHTML = '<div class="ns-xmsg bad"></div>'; h.firstChild.textContent = e.message; });
+        } });
       },
     });
   }, null, function(){ delete NS_EXP_WINS[o.server]; }, { persist: 'ccbb.flw.exp.' + o.server });
@@ -489,6 +493,7 @@ function explorerBody(root, o) {
       '<button type="button" class="ns-ib" data-r="up" title="Parent directory" aria-label="Parent directory">&#8593;</button>' +
       '<input data-r="path" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Path">' +
       '<button type="button" class="ns-ib" data-r="hid" title="Show hidden files" aria-label="Show hidden files">.*</button>' +
+      '<button type="button" class="ns-ib" data-r="reload" title="Reload" aria-label="Reload">&#8635;</button>' +
       (o.onPop ? '<button type="button" class="ns-ib" data-r="pop" title="Detach to a floating window" aria-label="Detach to a floating window" hidden>&#10697;</button>' : '') +
       (o.close ? '<button type="button" class="ns-ib" data-r="x" title="Close" aria-label="Close">&#10005;</button>' : '') +
     '</div>' +
@@ -508,12 +513,15 @@ function explorerBody(root, o) {
     viewing = null; if (popBtn) popBtn.hidden = true;
     pathEl.value = cur.path; upBtn.disabled = !cur.parent; actBtn.disabled = false;
   }
-  function ls(p){
-    var my = ++seq;
-    bodyEl.innerHTML = '<div class="ns-xmsg">Loading…</div>';
+  // keep: a reload, which leaves the old content up until the new arrives and comes
+  // back to the same scroll position.
+  function ls(p, keep){
+    var my = ++seq, y = bodyEl.scrollTop;
+    if (!keep) bodyEl.innerHTML = '<div class="ns-xmsg">Loading…</div>';
     nsGet(o.base + '/api/fs/ls?path=' + encodeURIComponent(p)).then(function(r){
       if (my !== seq) return;
       cur = r; listMode(); render();
+      if (keep) bodyEl.scrollTop = y;
       if (o.onDir) o.onDir(r.path);
     }).catch(function(e){
       if (my !== seq) return;
@@ -536,16 +544,16 @@ function explorerBody(root, o) {
     bodyEl.scrollTop = 0;
   }
   function join(dir, name){ return dir.replace(/\/+$/, '') + '/' + name; }
-  function cat(p){
-    var my = ++seq;
-    bodyEl.innerHTML = '<div class="ns-xmsg">Loading…</div>';
+  function cat(p, keep){
+    var my = ++seq, y = bodyEl.scrollTop;
+    if (!keep) bodyEl.innerHTML = '<div class="ns-xmsg">Loading…</div>';
     nsGet(o.base + '/api/fs/cat?path=' + encodeURIComponent(p)).then(function(r){
       if (my !== seq) return;
       viewing = r; pathEl.value = r.path; upBtn.disabled = false; actBtn.disabled = true;
       if (popBtn) popBtn.hidden = false;
       bodyEl.innerHTML = '';
       nsFileView(bodyEl, r);
-      bodyEl.scrollTop = 0;
+      bodyEl.scrollTop = keep ? y : 0;
     }).catch(function(e){
       if (my !== seq) return;
       bodyEl.innerHTML = '<div class="ns-xmsg bad"></div>'; bodyEl.firstChild.textContent = e.message;
@@ -557,6 +565,10 @@ function explorerBody(root, o) {
     if (row.classList.contains('dir')) ls(p); else cat(p);
   });
   // Up from a file goes back to the listing it was opened from.
+  q('reload').addEventListener('click', function(){
+    if (viewing) cat(viewing.path, true);
+    else if (cur) ls(cur.path, true);
+  });
   upBtn.addEventListener('click', function(){
     if (viewing && cur) { listMode(); render(); }
     else if (cur && cur.parent) ls(cur.parent);

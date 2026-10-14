@@ -1751,6 +1751,7 @@ function createSessionPanel(sid, server){
     '</div>'+
     '<div class="cmd-box" data-r="cmd">'+
       '<div class="cmd-head"><span class="cmd-title" data-r="cmdtitle"></span>'+
+        '<button class="pbtn" data-c="cmdreload" title="Run again">'+ICON.refresh+'</button>'+
         '<button class="pbtn" data-c="cmdmax" title="Maximize output">'+ICON.max+'</button>'+
         '<button class="pbtn" data-c="close">'+ICON.close+'</button></div>'+
       '<div class="cmd-content" data-r="cmdbody"></div>'+
@@ -2464,11 +2465,18 @@ function createSessionPanel(sid, server){
     var name = sp === -1 ? cbody : cbody.slice(0, sp);
     var args = sp === -1 ? '' : cbody.slice(sp+1);
     if (!name) return;
+    execCmd({ name:name, args:args, cwd:cmdCwd });
+  }
+  // The last call is kept so ↻ runs the same command in the directory it first ran in.
+  var lastCall = null;
+  function execCmd(call, keep){
+    lastCall = call;
+    var y = cmdBody.scrollTop;
     api('/api/session/'+sid+'/command', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ name:name, args:args, cwd:cmdCwd }) })
+      body: JSON.stringify(call) })
       .then(function(r){ return r.json(); })
-      .then(showCmd)
-      .catch(function(e){ showCmd({ error:String(e) }); });
+      .catch(function(e){ return { error:String(e) }; })
+      .then(function(d){ showCmd(d); if (keep) cmdBody.scrollTop = y; });
   }
   // Full screen, sharing compMaxOwner with the maximized editor: whichever is opened
   // second folds the first, so document.body never wears two overlays at once.
@@ -2516,6 +2524,7 @@ function createSessionPanel(sid, server){
   cmdBox.addEventListener('click', function(e){
     if (e.target.closest('[data-c="close"]')) hideCmd();
     else if (e.target.closest('[data-c="cmdmax"]')) setCmdMax(!cmdMax);
+    else if (e.target.closest('[data-c="cmdreload"]') && lastCall) execCmd(lastCall, true);
   });
 
   // — prompt history —

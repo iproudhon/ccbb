@@ -73,7 +73,10 @@ let cdp, browser, web;
     await send('Emulation.setDeviceMetricsOverride', { width: mobile ? 390 : 1280, height: 844, deviceScaleFactor: 1, mobile });
     await send('Page.navigate', { url: 'http://127.0.0.1:' + port + (mobile ? '/m' : '/') });
     await until(() => evaluate('typeof openSession === "function"'), 'page');
-    await evaluate('openSession(' + JSON.stringify(SID) + ', null, false, "fixture")');
+    // An inactive session opens in the mux renderer on the desktop now; this is about the
+    // transcript view, so the desktop builds that one directly.
+    await evaluate(mobile ? 'openSession(' + JSON.stringify(SID) + ', null, false, "fixture")'
+      : 'placeView(createSessionView({ sessionId: ' + JSON.stringify(SID) + ', server: null, title: "fixture", projectPath: "/tmp", live: false }))');
     const prefix = mobile ? 'mobile' : 'desktop';
     const soFar = mobile ? all : fromFile;
     await expect(prefix + ': history keeps each block at its own line', soFar);

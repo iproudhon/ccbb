@@ -591,6 +591,7 @@ function floatWin(title, fill, host, onClose, opts) {
   // maximize to the viewport, and the one you are in toggles back to normal.
   w.innerHTML = '<div class="flw-head"><span class="flw-title"></span>'+
       '<div class="flw-btns">'+
+        (opts && opts.reload ? '<button class="flw-btn" data-c="reload" title="Reload">&#8635;</button>' : '')+
         '<button class="flw-btn" data-c="min" title="Minimize">&#8211;</button>'+
         '<button class="flw-btn" data-c="max" title="Maximize">&#9633;</button>'+
         '<button class="flw-btn" data-c="close" title="Close">&#10005;</button>'+
@@ -610,6 +611,9 @@ function floatWin(title, fill, host, onClose, opts) {
   w.querySelector('.flw-btns').addEventListener('click', function (e) {
     var b = e.target.closest('.flw-btn');
     if (!b) return;
+    // Reload refills the body in place: whoever opened the window knows where its
+    // content came from, so it is the one that fetches it again.
+    if (b.dataset.c === 'reload') { opts.reload(w.querySelector('.flw-body')); return; }
     if (b.dataset.c === 'min') { w.classList.toggle('min'); w.classList.remove('max'); }
     else if (b.dataset.c === 'max') { w.classList.toggle('max'); w.classList.remove('min'); }
     else { if (w.parentNode) w.parentNode.removeChild(w); if (onClose) onClose(); return; }
@@ -1758,13 +1762,28 @@ function wireViewDrag(v, bar){
     document.addEventListener('pointercancel', up, true);
   });
 }
-function openSession(sid, server, mux, title){
+// A new view goes at the end — or, given the view it supersedes (a resume, a stale row's
+// fallback), into that one's slot, keeping its maximize and fold.
+function placeView(nv, old){
+  var idx = old ? views.indexOf(old) : -1;
+  if (idx < 0) { views.push(nv); viewsEl.appendChild(nv.el); }
+  else {
+    nv.maxed = old.maxed; nv.folded = old.folded;
+    if (old.destroy) old.destroy();
+    viewsEl.replaceChild(nv.el, old.el);
+    views[idx] = nv;
+  }
+  relayout();
+  setTimeout(function(){ nv.barEl.scrollIntoView({block:'nearest'}); }, 0);
+}
+function openSession(sid, server, mux, title, replace){
   try { sid = decodeURIComponent(sid); } catch(e) {}
   // A session is identified by (server, id): the same id could exist on two machines,
   // and two views of "the same" id on different servers are two different sessions.
   var srv = isLocal(server) ? null : server;
   for (var i=0;i<views.length;i++) {
-    if (views[i].kind === 'session' && views[i].sessionId === sid && (views[i].server||null) === srv) {
+    if (views[i] !== replace && views[i].kind === 'session' && views[i].sessionId === sid && (views[i].server||null) === srv) {
+      if (replace) closeView(replace);
       if (!views[i].maxed) toggleMax(views[i]);
       return;
     }
@@ -1776,28 +1795,29 @@ function openSession(sid, server, mux, title){
     fetch(hurl+'?win=5,25').then(function(r){return r.json();}).then(function(snap){
       if (snap.error) throw new Error(snap.error);
       snap.historyUrl = hurl;   // where the view pages its middle and elided results from
-      var cv = createMuxSessionView({sessionId:sid, server:srv, title:snap.state.title, snapshot:snap});
-      views.push(cv); viewsEl.appendChild(cv.el); relayout();
+      placeView(createMuxSessionView({sessionId:sid, server:srv, title:snap.state.title, snapshot:snap}), replace);
     }).catch(function(e){toast('Codex history: '+e.message);});
     return;
   }
   if (mux) {
-    var mv = createMuxSessionView({ sessionId: sid, server: srv, title: title || '' });
-    views.push(mv);
-    viewsEl.appendChild(mv.el);
-    relayout();
-    setTimeout(function(){ mv.barEl.scrollIntoView({block:'nearest'}); }, 0);
+    placeView(createMuxSessionView({ sessionId: sid, server: srv, title: title || '' }), replace);
     return;
   }
   fetch(apiBase(srv)+'/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
     var info = { sessionId: sid, server: srv, title: (d&&d.title)||'', projectPath: (d&&d.projectPath)||'',
                  live: !!(d&&d.live), liveStatus: (d&&d.liveStatus)||null, liveStatusAt: (d&&d.liveStatusAt)||null,
                  stats: (d&&d.stats)||null };
-    var v = createSessionView(info);
-    views.push(v);
-    viewsEl.appendChild(v.el);
-    relayout();
-    setTimeout(function(){ v.barEl.scrollIntoView({block:'nearest'}); }, 0);
+    // Nobody is running it, so there is no pane to show: the transcript opens in the mux
+    // renderer, read-only, with ▶ to resume it there. Any failure keeps the old view.
+    if (info.live) return placeView(createSessionView(info), replace);
+    var hurl = apiBase(srv)+'/api/claude/history/'+encodeURIComponent(sid);
+    return fetch(hurl+'?win=5,25').then(function(r){ return r.json(); }).then(function(snap){
+      if (!snap || snap.error || !snap.state) throw new Error((snap && snap.error) || 'no history');
+      snap.historyUrl = hurl;
+      Object.assign(snap.state, { live: false, liveStatus: info.liveStatus });
+      placeView(createMuxSessionView({ sessionId: sid, server: srv, agent: 'claude', title: info.title || snap.state.title,
+        projectPath: info.projectPath || snap.state.cwd, snapshot: snap }), replace);
+    }).catch(function(){ placeView(createSessionView(info), replace); });
   }).catch(function(e){ toast('Failed to open session: '+e); });
 }
 
@@ -2763,6 +2783,9 @@ function createMuxSessionView(INFO){
   // is the mux's own WebSocket path — and a peer's mux rides the peer proxy the same way.
   v.client = window.createMuxView(host, {
     onExit: function(){ closeView(v); },
+    // The row said live and the mux has no such session — it ended since the list was
+    // drawn. What is left of it is its history, opened in this view's place.
+    onMissing: function(){ openSession(INFO.sessionId, INFO.server, false, INFO.title || '', v); },
     base: API + '/mux',
     snapshot: INFO.snapshot || null,
     session: INFO.sessionId,
@@ -2789,16 +2812,21 @@ function createMuxSessionView(INFO){
   v.onResume = async function(){
     if (RO || !INFO.snapshot) return;
     // Used only when the app-server has to be launched, but chosen like any other start.
-    var bin = await pickBinary({ server: SRV, base: API, agent: 'codex', title: INFO.title || '' });
+    var codex = INFO.sessionId.indexOf('codex:') === 0;
+    var bin = await pickBinary({ server: SRV, base: API, agent: codex ? 'codex' : 'claude', title: INFO.title || '' });
     if (!bin) return;
     var btn = el.querySelector('.vb-resume');
     if (btn) btn.disabled = true;
     try {
       var r = await fetch(API+'/mux/api/sessions', {method:'POST', headers:{'content-type':'application/json'},
-        body:JSON.stringify({agent:'codex', bin:bin, resume:INFO.sessionId, startInactive:true})});
+        body:JSON.stringify(codex ? {agent:'codex', bin:bin, resume:INFO.sessionId, startInactive:true}
+          : {resume:INFO.sessionId, cwd:INFO.projectPath || INFO.snapshot.state.cwd || undefined,
+             label:INFO.title || undefined, bin:bin})});
       var d = await r.json();
-      if (!r.ok) throw new Error(d.error || 'Could not start mux session');
-      closeView(v); openSession(d.session.id, INFO.server, true, d.session.title);
+      // 409 running-in-mux: what ▶ would make already exists, so open that instead.
+      if (!r.ok && !(r.status === 409 && d && d.reason === 'running-in-mux')) throw new Error(d.error || 'Could not start mux session');
+      var sess = d.session || {};
+      openSession(sess.id || INFO.sessionId, INFO.server, true, sess.title || sess.label || INFO.title || '', v);
     } catch(e) { if(btn)btn.disabled=false; toast(e.message); }
   };
   wireSessionTerm(v, el, body, INFO, SRV, {});
@@ -2886,6 +2914,7 @@ function createSessionView(INFO){
     '<div class="cmd-box">'+
       '<div class="cmd-head"><span class="cmd-title"></span>'+
         '<div class="cmd-btns">'+
+          '<button class="cmd-btn" data-c="reload" title="Run again">&#8635;</button>'+
           '<button class="cmd-btn" data-c="pop" title="Detach to a floating window">&#10697;</button>'+
           '<button class="cmd-btn" data-c="min" title="Minimize">&#8211;</button>'+
           '<button class="cmd-btn" data-c="max" title="Maximize">&#9633;</button>'+
@@ -3765,18 +3794,23 @@ function createSessionView(INFO){
     var name = sp === -1 ? cbody : cbody.slice(0, sp);
     var args = sp === -1 ? '' : cbody.slice(sp + 1);
     if (!name) return;
-    qfetch('/api/session/'+INFO.sessionId+'/command', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ name: name, args: args, cwd: cmdCwd })
-    }).then(function(r){ return r.json(); }).then(function(d){ showCmd(d); }).catch(function(e){ showCmd({ error:String(e) }); });
+    var call = { name: name, args: args, cwd: cmdCwd };
+    fetchCmd(call).then(function(d){ showCmd(d, call); });
+  }
+  // The call is kept with what it produced, so ↻ runs the same command in the same
+  // directory — not wherever a later //cd has since moved this view to.
+  function fetchCmd(call){
+    return qfetch('/api/session/'+INFO.sessionId+'/command', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(call)
+    }).then(function(r){ return r.json(); }).catch(function(e){ return { error:String(e) }; });
   }
   // renderCmdOutput (SHARED_JS) draws; this places. The same output has two homes now:
   // the docked panel, and a floating window that outlives the next command run here.
-  var lastCmd = null;
-  function showCmd(d) {
+  var lastCmd = null, lastCall = null;
+  function showCmd(d, call) {
     if (d && d.cwd) cmdCwd = d.cwd;
     if (d && d.kind === 'clear') { hideCmd(); return; }
-    lastCmd = d;
+    lastCmd = d; lastCall = call || null;
     cmdBox.classList.toggle('html', !!(d && !d.error && d.kind === 'html'));
     cmdTitle.textContent = (d && d.error) ? 'error' : ((d && d.title) || '');
     var fresh = renderCmdOutput(d);
@@ -3791,9 +3825,11 @@ function createSessionView(INFO){
   // Titled with where it came from — a floating window has no view around it to say.
   function popCmd() {
     if (!lastCmd) return;
-    var d = lastCmd;
+    var d = lastCmd, call = lastCall;
     var title = SRV + ' ' + (INFO.title || shortSessionId(INFO.sessionId)) + ': ' + cmdTitle.textContent;
-    floatWin(title, function (host) { host.appendChild(renderCmdOutput(d)); });
+    floatWin(title, function (host) { host.appendChild(renderCmdOutput(d)); }, null, null, call && { reload: function (host) {
+      fetchCmd(call).then(function (nd) { var y = host.scrollTop; host.innerHTML = ''; host.appendChild(renderCmdOutput(nd)); host.scrollTop = y; });
+    } });
     hideCmd();
   }
   function hideCmd() { cmdBox.classList.remove('show','min','max','html'); syncCmdBtns(); }
@@ -3807,6 +3843,14 @@ function createSessionView(INFO){
     var b = e.target.closest('.cmd-btn');
     if (!b) return;
     if (b.dataset.c === 'pop') popCmd();
+    else if (b.dataset.c === 'reload') {
+      if (!lastCall) return;
+      // The same place in a refreshed output, not the top of it: re-running is how you
+      // watch something change.
+      var call = lastCall, y = cmdContent.scrollTop, max = cmdBox.classList.contains('max'), min = cmdBox.classList.contains('min');
+      fetchCmd(call).then(function(d){ showCmd(d, call); cmdBox.classList.toggle('max', max); cmdBox.classList.toggle('min', min); syncCmdBtns(); cmdContent.scrollTop = y; });
+      return;
+    }
     else if (b.dataset.c === 'min') { cmdBox.classList.toggle('min'); cmdBox.classList.remove('max'); }
     else if (b.dataset.c === 'max') { cmdBox.classList.toggle('max'); cmdBox.classList.remove('min'); }
     else hideCmd();
@@ -3967,9 +4011,8 @@ function createSessionView(INFO){
           return;
         }
         var sess = r.d && r.d.session;
-        closeView(v);
         openSession((sess && sess.id) || INFO.sessionId, INFO.server, true,
-          (sess && sess.label) || INFO.title || '');
+          (sess && sess.label) || INFO.title || '', v);
       })
       .catch(function(e){ if (btn) btn.disabled = false; toast('Resume failed: '+e); });
   };
@@ -6470,6 +6513,10 @@ function runWeb(args) {
     }
     if (method === 'GET' && (m = pathname.match(/^\/api\/codex\/history\/([^/]+)$/))) {
       return require('./ccbb-agent-codex').historyView(decodeURIComponent(m[1]), query).then(d => send(res, 200, d), e => send(res, 500, {error:e.message}));
+    }
+    if (method === 'GET' && (m = pathname.match(/^\/api\/claude\/history\/([^/]+)$/))) {
+      try { return send(res, 200, require('./ccbb-mux').claudeHistory(decodeURIComponent(m[1]), query)); }
+      catch (e) { return send(res, 404, { error: e.message }); }
     }
     if (method === 'GET' && pathname === '/api/sessions') {
       const mk = query.get('month');

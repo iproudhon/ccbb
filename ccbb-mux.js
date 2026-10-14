@@ -336,6 +336,8 @@ class Session {
     this.turnLive = false;
     this._statusLine = null;          // last status line emitted, for the deduper below
 
+    // A history view: the transcript read through the same normalizer, no child and no log.
+    if (opt.historyOnly) { this.seedHistory(opt.resume); return; }
     ensureDir(MUX_DIR);
     if (opt.agent !== 'codex') this.rawLog = fs.createWriteStream(path.join(MUX_DIR, this.id + '.ndjson'), { flags: 'a' });
     // BEFORE spawn, deliberately: resuming in place the child appends to this very
@@ -408,6 +410,8 @@ class Session {
           String(j.content || '').indexOf('<task-notification>') >= 0) { keep.push(j); continue; }
       if (j.type !== 'user' && j.type !== 'assistant') continue;
       if (j.isSidechain) continue;              // a subagent's own thread, not this one's
+      if (j.cwd) this._diskCwd = j.cwd;
+      if (j.type === 'assistant' && j.message && j.message.model && j.message.model[0] !== '<') this._diskModel = j.message.model;
       // A compact summary is a user message whose content is the ENTIRE prior
       // conversation. Rendered as a turn it is a wall of text nobody wrote; the
       // turns it summarizes are still in this same file, above it.
@@ -1795,6 +1799,40 @@ async function muxSessionsQuiet(timeoutMs = 600) {
   } catch { return []; }
 }
 
-module.exports = { runNew, runStop, agentOfBin, muxSessionsQuiet, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
+// What GET /api/claude/history/<id> answers — the codex history view's shapes, for a
+// Claude transcript nobody is running: the whole snapshot, or with `win` its head and
+// tail, `before` a page of the middle, `tool` one elided result. A view pages and opens
+// results as it is read, so the parsed transcript is held briefly; a new view reads afresh.
+const claudeHistories = new Map();   // id → { at, session }
+function claudeHistory(id, q) {
+  const win = common.parseWindow(q.get('win'));
+  let h = claudeHistories.get(id);
+  if (win || !h || Date.now() - h.at > 10 * 60 * 1000) {
+    if (!common.findSessionJsonl(id)) throw new Error('no such session');
+    const s = new Session({ notifyChange() {} }, { resume: id, historyOnly: true });
+    try { s.state.stats = common.getSessionStats(id, {}); } catch (e) {}
+    const st = s.state.stats;
+    if (st) Object.assign(s.state, { title: st.title || s.state.title, label: st.title || s.state.label,
+      startedAt: st.startedAt || s.state.startedAt, lastActivity: st.lastActivity || s.state.lastActivity, cost: st.cost || 0, tokens: st.totalTokens || 0, turns: st.turns || 0,
+      contextTokens: st.context ? st.context.tokens : 0, contextPeak: st.contextMax ? st.contextMax.tokens : 0 });
+    if (s._diskCwd) {
+      s.state.cwd = s.cwd = s._diskCwd;
+      if (!(st && st.title)) s.state.title = s.state.label = path.basename(s._diskCwd);
+    }
+    if (s._diskModel) s.state.model = s._diskModel;
+    s.state.status = 'history';
+    s.state.agent = 'claude';
+    h = { at: Date.now(), session: s };
+    claudeHistories.delete(id);
+    claudeHistories.set(id, h);
+    if (claudeHistories.size > 4) claudeHistories.delete(claudeHistories.keys().next().value);
+  }
+  const s = h.session;
+  if (q.has('tool')) return { op: 'tool_result', ...s.toolResult(q.get('tool')) };
+  if (q.has('before')) return { op: 'history', ...common.sliceMessages(s.messages, q.get('after') || null, q.get('before'), Number(q.get('limit')) || 25) };
+  return { ...s.snapshot(win), epoch: 'history' };
+}
+
+module.exports = { runNew, claudeHistory, runStop, agentOfBin, muxSessionsQuiet, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
   TURN_VERBS, SPIN_VERBS, SPIN_FRAMES,
   muxAddress, MUX_DIR };

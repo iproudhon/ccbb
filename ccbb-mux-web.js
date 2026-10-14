@@ -385,6 +385,7 @@ var HAS_BAR = opts.bar !== false;
 var ON_CHROME = typeof opts.onChrome === 'function' ? opts.onChrome : null;
 // /exit closes the view the way its X does, so the host that owns the X does it.
 var ON_EXIT = typeof opts.onExit === 'function' ? opts.onExit : null;
+var ON_MISSING = typeof opts.onMissing === 'function' ? opts.onMissing : null;
 // The host's header block wants the whole stats object, not the handful of numbers the
 // status line prints. Separate from onChrome because it changes on a different clock.
 var ON_STATS = typeof opts.onStats === 'function' ? opts.onStats : null;
@@ -1380,7 +1381,8 @@ function cmdNode(c) {
   var out = c.out || { kind: c.html ? 'html' : 'console', content: c.text || '' };
   if (c.state !== 'running') {
     var btns = el('span', 'tool-btns');
-    btns.innerHTML = '<button class="flw-btn" data-c="min" title="Minimize">&#8211;</button>'+
+    btns.innerHTML = (c.rerun ? '<button class="flw-btn" data-c="reload" title="Run again">&#8635;</button>' : '')+
+      '<button class="flw-btn" data-c="min" title="Minimize">&#8211;</button>'+
       '<button class="flw-btn" data-c="max" title="Maximize">&#9633;</button>'+
       '<button class="flw-btn" data-c="pop" title="Detach to a floating window">&#10697;</button>';
     btns.addEventListener('click', function (e) {
@@ -1389,7 +1391,11 @@ function cmdNode(c) {
       e.stopPropagation();
       if (b.dataset.c === 'pop') {
         floatWin((MACHINE ? MACHINE + ' ' : '') + sessionName(S.info) + ': ' + label,
-          function (host) { host.appendChild(renderCmdOutput(out)); }, root);
+          function (host) { host.appendChild(renderCmdOutput(out)); }, root, null, c.rerun && { reload: function (host) {
+            c.rerun(function (o) { var y = host.scrollTop; host.innerHTML = ''; host.appendChild(renderCmdOutput(o)); host.scrollTop = y; });
+          } });
+      } else if (b.dataset.c === 'reload') {
+        c.rerun();
       } else if (b.dataset.c === 'max') {
         var on = !d.classList.contains('max');
         d.classList.toggle('max', on);
@@ -1483,6 +1489,7 @@ function msgNode(m) {
       // that will never come.
       noOutput: !!c.noOutput,
       out: c.out || null,
+      rerun: c.call ? function (then) { execLocal(m, then); } : null,
       text: c.text || '' }));
     return wrap;
   }
@@ -2063,7 +2070,12 @@ function connect() {
       S.seq = m.from || S.seq; retryFetches(); return paintChrome();
     }
     if (m.op === 'presence') { S.clients = m.clients || []; return paintChrome(); }
-    if (m.op === 'ack') { if (m.error) note(m.error); return; }
+    if (m.op === 'ack') {
+      // The eager attach refused before any snapshot: the session is gone, not lagging.
+      if (m.error === 'no such session' && !S.epoch && ON_MISSING) { dead = true; try { ws.close(); } catch (err) {} return ON_MISSING(); }
+      if (m.error) note(m.error);
+      return;
+    }
     if (m.op === 'event') return apply(m);
     if (m.op === 'history') return onHistory(m);
     if (m.op === 'tool_result') return onToolResult(m);
@@ -2120,18 +2132,29 @@ function runLocal(raw) {
   if (sk.length) after = 'api:' + S.stream[sk[sk.length - 1]].apiId;
   for (var i = S.msgs.length - 1; i >= 0 && !after; i--) if (S.msgs[i].role !== 'notice') after = S.msgs[i].id;
   var entry = { id: 'local-' + (++CMD_SEQ), _rev: ++REV, after: after, at: new Date().toISOString(),
-    command: { kind: 'running', name: name, args: args, local: true, stream: 'stdout', text: '' } };
+    command: { kind: 'running', name: name, args: args, local: true, stream: 'stdout', text: '',
+      // Kept for ↻: the same command, in the directory it first ran in.
+      call: { name: name, args: args, cwd: CMD_CWD || (S.info && S.info.cwd) || '' } } };
   // The pseudo-message the transcript renders. It is its own shape rather than a
   // faked child message: nothing downstream should mistake this for something the
   // session said.
   S.cmds.push(entry);
   S.open['cmd:' + entry.id] = true;              // you just asked for it; show it
   paintAll();
+  execLocal(entry);
+}
+// Runs (or re-runs) a // card's command and settles the card with what came back.
+// The callback gets the output as renderCmdOutput takes it, for a detached window to redraw.
+function execLocal(entry, then) {
   var h = { 'content-type': 'application/json' };
   if (TOKEN) h['x-ccbb-token'] = TOKEN;
+  function done() {
+    entry._rev = ++REV;
+    paintAll();
+    if (then) then(entry.command.out || { kind: 'console', content: entry.command.text || '' });
+  }
   fetch(ccbbBase() + '/api/session/' + encodeURIComponent(SESSION) + '/command',
-    { method: 'POST', headers: h, credentials: 'same-origin',
-      body: JSON.stringify({ name: name, args: args, cwd: CMD_CWD || (S.info && S.info.cwd) || '' }) })
+    { method: 'POST', headers: h, credentials: 'same-origin', body: JSON.stringify(entry.command.call) })
     .then(function (r) { return r.json(); })
     .then(function (d) {
       if (d && d.cwd) CMD_CWD = d.cwd;
@@ -2141,12 +2164,11 @@ function runLocal(raw) {
       // The whole typed result rides along: kind and lang decide how the card draws it.
       entry.command.out = d && !d.error ? { kind: d.kind, lang: d.lang, content: d.content || '' } : null;
       entry.command.text = d && d.error ? d.error : (d && d.content) || '';
-      entry._rev = ++REV;
-      paintAll();
+      done();
     })
     .catch(function (e) {
       entry.command.kind = 'out'; entry.command.stream = 'stderr';
-      entry.command.text = String(e); entry._rev = ++REV; paintAll();
+      entry.command.text = String(e); done();
     });
 }
 
