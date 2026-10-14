@@ -256,6 +256,48 @@ check('sanitize strips tool and local-model names', () => {
   assert.deepStrictEqual(s.providers, ['local', 'anthropic']);
 });
 
+// ── Session shape and cost ────────────────────────────────────────────────────
+check('session shape: triggers, tool pairing, runs and wall clock', () => {
+  const { sessionShape } = require(CLI);
+  const T = 1e12, iso = t => new Date(T + t).toISOString();
+  const s = {
+    messages: [
+      { type: 'u', tokens: 10, ts: T },
+      { type: 'x+t:Bash+t:Read', tokens: 40, ts: T + 1000 },
+      { type: 'r', tokens: 300, ts: T + 3000 },
+      { type: 'r', tokens: 500, ts: T + 4000 },
+      { type: 'x', tokens: 20, ts: T + 6000 },
+      { type: 'u', tokens: 15, ts: T + 60000 },
+      { type: 'x', tokens: 5, ts: T + 61000 },
+    ],
+    responses: [
+      { ts: iso(1000) }, { ts: iso(6000) }, { ts: iso(61000) }, { ts: iso(2000), main: false },
+    ],
+  };
+  const sh = sessionShape(s);
+  assert.deepStrictEqual(sh.trig, [[0, null], [1, 'Read'], [0, null], [2, null]]);
+  assert.deepStrictEqual(sh.tools.map(t => [t.name, t.callTok, t.resTok, t.execMs]),
+    [['Bash', 20, 300, 2000], ['Read', 20, 500, 3000]]);
+  assert.deepStrictEqual(sh.runs, [{ n: 2, durMs: 6000 }, { n: 1, durMs: 1000 }]);
+  // model: 0→1s, 4→6s, 60→61s = 4s; tools: 1→3s, 3→4s = 3s; user: 6→60s = 54s
+  assert.deepStrictEqual(sh.wall, [4000, 3000, 54000]);
+  assert.deepStrictEqual(sh.inputs, [[0, 10], [1, 300], [1, 500], [0, 15]]);
+});
+check('cost: list prices, Bedrock +10%, write multiplier by source', () => {
+  const { buildModel } = require(CLI);
+  const r = { model: 'claude-opus-5', input: 100, cacheRead: 1000, cacheWrite: 300, output: 50,
+    cwGrowth: 200, cwExpiry: 100, promptTokens: 1400 };
+  const m = buildModel([
+    { responses: [{ ...r, source: 'claude-sub' }], messages: [] },
+    { responses: [{ ...r, source: 'claude-bedrock' }], messages: [] },
+    { responses: [{ ...r, source: 'codex', model: 'gpt-5.6' }], messages: [] },
+  ]);
+  // opus-5: $5 in, $25 out, $0.50 read → µ$ per token. sub writes at 2×, Bedrock at 1.25×.
+  assert.deepStrictEqual(m.rows[0].cost, [500, 500, 2000, 1000, 1250]);
+  assert.deepStrictEqual(m.rows[1].cost, [550, 550, 1375, 688, 1375]);
+  assert.strictEqual(m.rows[2].cost, null, 'codex should be unpriced');
+});
+
 // ── Report checks ─────────────────────────────────────────────────────────────
 // Run the emitted script under the DOM shim and inspect what it drew.
 function renderReport(args) {
@@ -318,9 +360,11 @@ check('report renders without throwing', () => {
 check('every chart drew an svg', () => {
   if (!rep) throw new Error('report did not render');
   for (const id of ['stack-count', 'stack-resp', 'avg-decode', 'avg-cw', 'cw-split', 'gap-cw',
-    'scatter', 'hour', 'sess-turns', 'sess-dur', 'comp-count', 'comp-post']) {
+    'scatter', 'hour', 'sess-turns', 'sess-dur', 'comp-count', 'comp-post',
+    'cost-day', 'cost-model', 'cost-prompt', 'cost-gap', 'tool-runs', 'inp-size', 'tool-mix', 'wall', 'trig']) {
     const el = rep.ids.get(id);
     assert.ok(el, `${id} host missing`);
+    if (id === 'tool-mix' && !rep.data.meta.tools.length) continue;   // the fixture calls no tools
     assert.ok(el.children.some(c => c.tagName === 'svg' && c.children.length > 2),
       `${id} drew nothing`);
   }
@@ -328,8 +372,46 @@ check('every chart drew an svg', () => {
 check('tiles and legends are filled in', () => {
   assert.ok(/sessions/.test(rep.ids.get('tiles').innerHTML), 'tiles empty');
   assert.ok(/cache re-write/.test(rep.ids.get('tiles').innerHTML), 'no cache re-write tile');
-  assert.ok(/Prompt Size/.test(rep.ids.get('stack-count-legend').innerHTML), 'legend empty');
-  assert.ok(/re-write/.test(rep.ids.get('cw-split-legend').innerHTML), 'split legend empty');
+  const items = id => rep.ids.get(id).children.map(c => c.innerHTML);
+  assert.ok(/Prompt Size/.test(items('stack-count-legend')[0]), 'legend empty or total not first');
+  assert.ok(items('cw-split-legend').some(h => /re-write/.test(h)), 'split legend empty');
+});
+check('legend entries switch their series off and on', () => {
+  // line mode (stack-resp opens on lines): one path per visible series
+  const lines = () => rep.ids.get('stack-resp').children[0].children.filter(c => c.tagName === 'path').length;
+  const before = lines();
+  const entry = rep.ids.get('stack-resp-legend').children[1];   // cache read
+  entry.listeners.click[0]();
+  const hidden = rep.ids.get('stack-resp-legend').children[1];
+  assert.ok(/off/.test(hidden.className), 'entry not marked off');
+  assert.strictEqual(lines(), before - 1, 'series still drawn');
+  hidden.listeners.click[0]();
+  assert.strictEqual(lines(), before);
+  // bars mode (stack-count opens on bars): the hidden part's segments go
+  const blue = () => rep.ids.get('stack-count').children[0].children
+    .filter(c => c.tagName === 'rect' && c.attrs.fill === '#2a78d6').length;
+  const segs = blue();
+  assert.ok(segs > 0, 'no cache-read segments');
+  rep.ids.get('stack-count-legend').children[1].listeners.click[0]();   // Cache Read
+  assert.strictEqual(blue(), 0, 'cache-read segments still drawn');
+  rep.ids.get('stack-count-legend').children[1].listeners.click[0]();
+  assert.strictEqual(blue(), segs);
+});
+check('composition charts open on bars', () => {
+  for (const id of ['stack-count', 'cw-split', 'gap-cw', 'cost-gap'])
+    assert.ok(!rep.ids.get(id).children[0].children.some(c => c.tagName === 'path'), `${id} opened on lines`);
+});
+check('standalone ships per-row data and line charts bin it per pixel', () => {
+  assert.ok(rep.raw.raw && rep.raw.raw.r.split(';').length === rep.data.meta.responses, 'raw rows missing');
+  const svg = rep.ids.get('avg-decode').children[0];
+  const hits = svg.children.filter(c => c.tagName === 'rect').length;
+  assert.ok(hits > 400, `only ${hits} line bins`);
+});
+check('idle-gap bars split exactly at the 5 min and 1 h TTLs', () => {
+  const gap = rep.data.views.keep.gap;
+  const bars = gap.edges.filter((_, i) => i % gap.f === 0);
+  for (const t of [300000, 3600000])
+    if (t > gap.edges[0] && t < gap.edges[gap.edges.length - 1]) assert.ok(bars.includes(t), `no bar edge at ${t}`);
 });
 check('filters offer every discovered source and model', () => {
   const srcBoxes = rep.ids.get('srcCtrl').children.filter(c => c.tagName === 'label');
@@ -343,20 +425,26 @@ check('filters offer every discovered source and model', () => {
 });
 check('per-group aggregates sum to the build-time totals', () => {
   const v = rep.data.views.keep;
-  const tot = v.tot.reduce((a, t) => a.map((x, i) => x + t[i]), new Array(16).fill(0));
+  const tot = v.tot.reduce((a, t) => a.map((x, i) => x + t[i]), new Array(23).fill(0));
   assert.strictEqual(tot[0], rep.data.meta.responses, 'response count');
   assert.strictEqual(tot[8], rep.data.meta.sessions, 'session count');
   // the same numbers must be reachable from the binned sections
   for (const key of ['lin', 'log']) {
     const sec = v[key];
     let n = 0, cw = 0, cwg = 0, cwe = 0;
-    for (const g of sec.g) for (let i = 0; i < g.length; i += 8) { n += g[i]; cw += g[i + 2]; cwg += g[i + 6]; cwe += g[i + 7]; }
+    let cost = 0;
+    for (const g of sec.g) for (let i = 0; i < g.length; i += 14) {
+      n += g[i]; cw += g[i + 2]; cwg += g[i + 6]; cwe += g[i + 7];
+      for (let k = 9; k < 14; k++) cost += g[i + k];
+    }
+    assert.strictEqual(cost, tot.slice(17, 22).reduce((a, b) => a + b, 0), `${key} bins lost cost`);
     assert.strictEqual(n, tot[0], `${key} bins lost responses`);
     assert.strictEqual(cw, tot[2], `${key} bins lost cache writes`);
     assert.strictEqual(cwg + cwe, tot[6] + tot[7], `${key} bins lost the cache-write split`);
   }
   for (const key of ['turns', 'turnsLog', 'dur', 'durLog']) {
-    const sessions = v[key].g.reduce((a, g) => a + g.reduce((x, y) => x + y, 0), 0);
+    const n = v[key].n;
+    const sessions = v[key].g.reduce((a, g) => a + g.reduce((x, y, j) => x + (j % n ? 0 : y), 0), 0);
     assert.strictEqual(sessions, tot[8], `${key} histogram lost sessions`);
   }
   assert.strictEqual(tot[12], 2, 'compaction count');
@@ -468,6 +556,7 @@ check('--confluence writes only the macro body', () => {
   assert.ok(body.startsWith('<div id="ccstats-host">'), body.slice(0, 40));
   assert.ok(body.endsWith('</script>'));
   assert.ok(!/<!doctype/i.test(body), 'standalone shell leaked into the macro body');
+  assert.ok(!/"raw":/.test(body), 'per-row data leaked into the macro body');
 });
 check('the payload is compressed and the drop view shares what it can', () => {
   // zero runs really are encoded (a negative cell), not just dense arrays that happen to fit
@@ -487,17 +576,16 @@ check('the payload is compressed and the drop view shares what it can', () => {
 });
 // Decode a report's payload and compare it cell for cell with a fresh build of both views.
 function roundTrip(r, file) {
-  const { buildModel, buildView, isOutlier } = require(CLI);
+  const { buildModel, buildView, isOutlier, SECTIONS } = require(CLI);
   const sessions = JSON.parse(fs.readFileSync(file, 'utf8')).sessions;
   const m = buildModel(sessions.map(s => ({ ...s, user: 0 })));
-  const n = m.groups.length;
   const want = {
-    keep: buildView(m.rows, m.sessionRows, m.compactRows, n, 2000),
-    drop: buildView(m.rows.filter(x => !isOutlier(x)), m.sessionRows, m.compactRows, n, 2000),
+    keep: buildView(m, m.rows, 2000),
+    drop: buildView(m, m.rows.filter(x => !isOutlier(x)), 2000),
   };
   for (const v of ['keep', 'drop']) {
     const got = r.data.views[v], w = want[v];
-    for (const k of ['lin', 'log', 'gap', 'turns', 'turnsLog', 'dur', 'durLog', 'comp', 'compLog']) {
+    for (const k of SECTIONS) {
       assert.deepStrictEqual(got[k].edges, w[k].edges, `${v}.${k} edges`);
       assert.deepStrictEqual(got[k].g, w[k].g, `${v}.${k} cells`);
     }
@@ -533,6 +621,27 @@ if (process.argv.includes('--real')) {
   });
 }
 
-fs.rmSync(tmp, { recursive: true, force: true });
-console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
-process.exit(failures ? 1 : 0);
+// The Confluence body ships its payload gzipped and starts after inflating it — async, so it
+// runs last. Node has the same atob / Blob / Response / DecompressionStream the page uses.
+(async () => {
+  const name = 'the gzipped Confluence body inflates and draws every chart';
+  try {
+    const out = path.join(tmp, 'conf-run.html');
+    run(['stats', skelFile, '--confluence=' + out]);
+    const body = fs.readFileSync(out, 'utf8');
+    assert.ok(/var DATA = "[A-Za-z0-9+/=]+";/.test(body), 'payload not a gzip string');
+    const a = body.indexOf('<script>') + '<script>'.length, b = body.indexOf('</script>', a);
+    const { ctx, ids } = install();
+    Object.assign(ctx, { atob, Blob, Response, DecompressionStream, Uint8Array, JSON });
+    vm.runInContext(body.slice(a, b), vm.createContext(ctx), { filename: 'conf.js' });
+    for (let i = 0; i < 100 && !ids.get('tiles')?.innerHTML; i++) await new Promise(r => setTimeout(r, 20));
+    assert.ok(/sessions/.test(ids.get('tiles').innerHTML), 'never rendered');
+    for (const id of ['stack-count', 'cost-day', 'gap-cw', 'trig'])
+      assert.ok(ids.get(id).children.some(c => c.tagName === 'svg' && c.children.length > 2), `${id} drew nothing`);
+    console.log(`ok   ${name}`);
+  } catch (e) { failures++; console.log(`FAIL ${name}\n     ${e.message}`); }
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
+  process.exit(failures ? 1 : 0);
+})();

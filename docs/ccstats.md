@@ -92,13 +92,15 @@ consecutive requests. Inferred rows are flagged and the report says how many the
 ## The report
 
 Self-contained HTML, inline SVG, opens offline. Session-level charts first — sessions by turn
-count and by duration — then the response-level ones: prompt-size histograms (count and
+count and by duration, side by side — then the response-level ones: prompt-size histograms (count and
 response time), prompt-size → decode and cache-write bars, the growth/re-write split, idle gap
-→ cache write, compactions by the context size that triggered them and by the result size they
+→ cache write (dashed markers at the 5-minute Bedrock and 1-hour subscription cache TTLs; its
+bars are cut at both, so no bar straddles one), compactions by the context size that triggered them and by the result size they
 left, a prompt+output → response-time scatter with a binned trend line, and mean response time
 by hour. Light/dark via `prefers-color-scheme`, hover tooltips, an outlier toggle,
 user/source/model checkboxes, a per-chart line/bars switch on every histogram (line by
-default), and a log-scaling switch that re-bins every histogram (both scalings
+default; prompt size distribution, growth vs re-write and both idle-gap charts open on bars), clickable legend entries that hide or show each series (the y-axis rescales to what
+is left), and a log-scaling switch that re-bins every histogram (both scalings
 are shipped, so it costs no rebuild). Each input file counts as one user, shown anonymized as
 `anon-a`, `anon-b`, … in argument order. Log scaling and the user and source filters appear twice — in the
 control rows at the top and in a collapsible panel pinned to the top-right corner — and the two
@@ -109,7 +111,40 @@ starts on one comparable slice rather than stacking four billing models together
 Chart data is pre-aggregated at build time per user×source×model group over shared bin edges, so
 page size grows with the number of groups rather than sessions, and the checkboxes re-sum in
 the page without shipping rows. Only the scatter carries per-response points (`--points`,
-default 2000; `0` keeps every response).
+default 2000; `0` keeps every response). The standalone page additionally ships every row
+(response, session, compaction, prompt/tool-result message, prompt run — a few MB for ~65k responses), and its line charts re-bin those
+in the page at one bin per plot pixel; bars and the Confluence body use the pre-aggregated bins.
+
+## Cost
+
+Every priced response is costed in five parts — uncached input, cache read, cache write that is
+growth, cache write that is re-write, decode — and the report shows them as tiles, cost per
+UTC day, cost by model (with a tokens switch for the same split by volume), prompt size → cost
+and idle gap → cost (with the TTL markers). Each part is switchable from the legend.
+
+Prices are Anthropic list prices per model family, built in. Bedrock is billed at list +10%
+(regional endpoint). Cache writes cost input × 2 on `claude-sub` (Claude Code writes with the
+1-hour TTL on a subscription) and × 1.25 on Bedrock (5 minutes); cache-read rates are per model
+(0.1× input on most, 0.05× on Opus 5.5, 0.025× on Fable 5.1). A subscription is flat-rate, so
+its cost is shown as **API-equivalent**. Codex and local models are unpriced and counted in a
+note. Override any of it with `--prices file.json`:
+
+```json
+{"bedrockMarkup": 1.1, "models": {"claude-opus-5": {"input": 5, "output": 25, "cacheRead": 0.5}}}
+```
+
+## Tools vs user input
+
+Derived at report time from the skeleton's message rows (main transcripts only), so older
+skeletons work as they are. Each request's trigger is the last user prompt or tool result
+before it; tool results pair with earlier calls first-in-first-out, which names the tool.
+Subagent requests, and requests with nothing before them, are *other*. Charts: requests per
+user prompt (how far the agent runs on tool results alone), user prompt vs tool result sizes,
+tool mix (calls, tokens moved, call→result time), where session time goes (each gap between
+messages counted as model, tool or user/idle time by what ended it, as shares by session
+length), and user- vs tool-triggered requests (count, cache write split, response time, cost).
+Prompt and tool-result sizes are mostly the ~4 chars/token estimate. Run length, message size
+and the time split always bin log — they are too heavy-tailed for linear bins.
 
 ## Confluence
 
@@ -124,8 +159,12 @@ chart color is a concrete hex, never `var()` inside an SVG attribute. The toolti
 second shadow root on `<body>` so `position:fixed` stays viewport-anchored inside
 Confluence's transformed containers.
 
-Confluence rejects oversized macro bodies, which is why the data is pre-aggregated. Lower
-`--points` if a paste is rejected. Size is printed after each run.
+Confluence rejects oversized macro bodies, so the macro body is cut down three ways: the data
+is pre-aggregated, line charts run through the bar bins rather than the finer ones the page
+uses, and the payload ships as a base64 gzip string the page inflates (`DecompressionStream`)
+before drawing. The scatter defaults to 1000 points here. On the reference set (318 sessions,
+65k responses, 4 users) that is ~150 KB. Lower `--points` if a paste is still rejected. Size
+is printed after each run.
 
 `reportBlock()` is the single source for both the standalone page and the macro body, so the
 two can't drift.

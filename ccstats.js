@@ -622,8 +622,10 @@ const NBINS = 96;
 const SBINS = 24;             // secondary charts (idle gap)
 const SESS_BINS = 48;         // per-session distributions (turn count, duration)
 const CBINS = 32;             // compactions
+const GAP_CUTS = [300000, 3600000];   // cache TTLs: 5 min (Bedrock), 1 h (subscription)
 const FINE = 4;               // line mode plots each bar's bin split this many ways
 const DEFAULT_POINTS = 2000;
+const CONF_POINTS = 1000;     // --confluence default: the macro body has a size limit
 
 // ── Shared option parsing ─────────────────────────────────────────────────────
 // --dir / --model / --source are repeatable and also accept comma-separated lists.
@@ -700,7 +702,7 @@ function filterSessions(sessions, o) {
 // ── ccstats stats ─────────────────────────────────────────────────────────────
 async function runStats(argv) {
   const o = { dirs: [], models: [], sources: [] };
-  let out = 'ccstats.html', log = false, conf = false, points = DEFAULT_POINTS;
+  let out = 'ccstats.html', log = false, conf = false, points = null, prices = null;
   const files = [];
   const i = { v: 0 };
   for (; i.v < argv.length; i.v++) {
@@ -714,9 +716,14 @@ async function runStats(argv) {
     else if (a.startsWith('--confluence=')) { conf = true; out = a.slice(13); }
     else if (a === '--points') points = Number(argv[++i.v]);
     else if (a.startsWith('--points=')) points = Number(a.slice(9));
+    else if (a === '--prices' || a.startsWith('--prices=')) {
+      const f = a === '--prices' ? argv[++i.v] : a.slice(9);
+      try { prices = loadPrices(f); } catch (e) { console.error(`ccstats stats: cannot read prices ${f}: ${e.message}`); process.exit(1); }
+    }
     else if (a.startsWith('-')) { console.error(`ccstats stats: unknown option '${a}'`); process.exit(1); }
     else files.push(a);
   }
+  if (points == null) points = conf ? CONF_POINTS : DEFAULT_POINTS;
   if (!isFinite(points) || points < 0) { console.error('ccstats stats: --points must be a non-negative number'); process.exit(1); }
 
   // Load + dedup sessions by fingerprint (first file wins). With no file arguments the
@@ -745,7 +752,7 @@ async function runStats(argv) {
   sessions = filterSessions(sessions, o);
   if (!sessions.length) { console.error('ccstats stats: no sessions matched the filter.'); process.exit(1); }
 
-  const model = buildModel(sessions, users);
+  const model = buildModel(sessions, users, prices);
   if (!model.rows.length) { console.error('ccstats stats: no responses matched the filter.'); process.exit(1); }
   const meta = {
     log,
@@ -753,11 +760,14 @@ async function runStats(argv) {
     responses: model.rows.length,
     withTiming: model.rows.filter(r => r.respMs != null).length,
     users: model.users, sources: model.sources, models: model.families, groups: model.groups,
+    tools: model.tools,
     generatedAt: new Date().toISOString(),
   };
   // --confluence changes WHAT the output file holds (the macro-body extract), not how many
   // files are written: one run, one file, always the one named by -o.
-  const block = reportBlock(buildViews(model, points), meta);
+  // Confluence: lines on the bar bins and a gzipped payload, to fit the macro's size limit.
+  const block = conf ? reportBlock(buildViews(model, points, 1), meta, null, true)
+    : reportBlock(buildViews(model, points), meta, packRaw(model));
   const body = conf ? block + '\n' : renderHtml(block);
   fs.writeFileSync(out, body);
   const kb = Math.round(Buffer.byteLength(body) / 1024);
@@ -783,10 +793,17 @@ points).
 
   -o, --out <file>       output path (default ccstats.html)
   --log                  start with log-scaled axes/bins (default off; toggleable in the page)
-  --points <n>           scatter-plot sample cap (default ${DEFAULT_POINTS}, 0 = every response).
+  --points <n>           scatter-plot sample cap (default ${DEFAULT_POINTS}, ${CONF_POINTS} with --confluence;
+                         0 = every response).
                          The dominant term in page size — lower it if the page is too big.
+  --prices <file>        price overrides, JSON: {"bedrockMarkup": 1.1, "models": {"<family>":
+                         {"input": $, "output": $, "cacheRead": $}}} in $/MTok. Built in: Anthropic
+                         list prices; Bedrock +10%; cache writes 2× on claude-sub (1 h TTL), 1.25×
+                         on Bedrock (5 min). Subscription cost is API-equivalent.
   --confluence[=file]    write the Confluence HTML-macro body (host <div> + <script> only)
                          instead of a standalone page. With =file, that is the output path.
+                         Smaller than the page: line charts run through the bar bins and the
+                         data ships gzipped (decoded in the browser).
 ${COMMON_HELP}`);
 }
 
@@ -796,10 +813,98 @@ function anonName(i) {
   do { n = String.fromCharCode(97 + i % 26) + n; i = Math.floor(i / 26) - 1; } while (i >= 0);
   return 'anon-' + n;
 }
+// ── Pricing ───────────────────────────────────────────────────────────────────
+// Anthropic list prices, $ per million tokens: [input, output, cache read], by model family.
+// Cache writes are input × the source's write multiplier: Claude Code on a subscription writes
+// with the 1-hour TTL (2×), Bedrock with the default 5 minutes (1.25×). Bedrock is billed on
+// the regional endpoint, list + 10%. Subscription usage is flat-rate, so its cost is the
+// API-equivalent; Codex and local models are left unpriced. `--prices` overrides any of it.
+const PRICES = {
+  'claude-fable-5-1': [10, 50, 0.25], 'claude-mythos-5-1': [10, 50, 0.25],
+  'claude-fable-5': [10, 50, 1], 'claude-mythos-5': [10, 50, 1],
+  'claude-opus-5-5': [4, 20, 0.2], 'claude-opus-5': [5, 25, 0.5],
+  'claude-opus-4-8': [5, 25, 0.5], 'claude-opus-4-7': [5, 25, 0.5],
+  'claude-opus-4-6': [5, 25, 0.5], 'claude-opus-4-5': [5, 25, 0.5],
+  'claude-sonnet-5-5': [2, 10, 0.2], 'claude-sonnet-5': [2, 10, 0.2],
+  'claude-sonnet-4-6': [3, 15, 0.3], 'claude-sonnet-4-5': [3, 15, 0.3],
+  'claude-haiku-4-5': [1, 5, 0.1],
+};
+const WRITE_MULT = { 'claude-sub': 2, 'claude-bedrock': 1.25 };
+const BEDROCK_MARKUP = 1.1;
+// Per-token rates in $/MTok — equivalently µ$ per token — or null when unpriced.
+function priceOf(family, source, prices) {
+  const p = (prices && prices.models[family]) || PRICES[family];
+  const wm = WRITE_MULT[source];
+  if (!p || !wm) return null;
+  const k = source === 'claude-bedrock' ? (prices ? prices.bedrockMarkup : BEDROCK_MARKUP) : 1;
+  return { input: p[0] * k, output: p[1] * k, read: p[2] * k, write: p[0] * wm * k };
+}
+// --prices file: {"bedrockMarkup": 1.1, "models": {"<family>": {"input": 5, "output": 25,
+// "cacheRead": 0.5}}} — any part may be left out.
+function loadPrices(file) {
+  const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const models = {};
+  for (const [k, v] of Object.entries(j.models || {})) {
+    const base = PRICES[k] || [0, 0, 0];
+    models[k] = [v.input ?? base[0], v.output ?? base[1], v.cacheRead ?? base[2]];
+  }
+  return { models, bedrockMarkup: j.bedrockMarkup ?? BEDROCK_MARKUP };
+}
+
+// ── Session shape ─────────────────────────────────────────────────────────────
+// What the message rows say about a session, beyond its token counts:
+//  - each request's trigger: the last user prompt (0) or tool result (1) before it, with the
+//    tool whose result it was (tool results pair with earlier calls first-in-first-out);
+//    subagent requests and ones with nothing before them are "other" (2)
+//  - each tool call: name, call size, result size, call→result time
+//  - user prompt and tool result sizes
+//  - wall clock, split by what each gap between messages ended in: model time (an assistant
+//    message), tool time (a tool result) or user time (a prompt)
+//  - runs: a user prompt and the tool-driven requests that followed it before the next one
+const TRIG_USER = 0, TRIG_TOOL = 1, TRIG_OTHER = 2;
+function sessionShape(s) {
+  const msgs = (s.messages || []).map((m, i) => ({ m, i })).filter(x => x.m.ts != null)
+    .sort((a, b) => a.m.ts - b.m.ts || a.i - b.i).map(x => x.m);
+  const pending = [], tools = [], inputs = [], marks = [], wall = [0, 0, 0];
+  for (let k = 0; k < msgs.length; k++) {
+    const m = msgs[k];
+    if (k) wall[m.type === 'u' ? 2 : m.type === 'r' ? 1 : 0] += Math.max(0, m.ts - msgs[k - 1].ts);
+    if (m.type === 'u') { inputs.push([0, m.tokens]); marks.push([m.ts, TRIG_USER, null]); continue; }
+    if (m.type === 'r') {
+      const call = pending.shift();
+      if (call) { call.resTok = m.tokens; call.execMs = Math.max(0, m.ts - call.ts); }
+      inputs.push([1, m.tokens]); marks.push([m.ts, TRIG_TOOL, call ? call.name : null]);
+      continue;
+    }
+    const calls = m.type.split('+').filter(t => t.startsWith('t:'));
+    for (const t of calls) {
+      const ev = { name: t.slice(2) || '?', ts: m.ts, callTok: Math.round(m.tokens / calls.length),
+        resTok: 0, execMs: null };
+      pending.push(ev); tools.push(ev);
+    }
+  }
+  const order = s.responses.map((r, i) => ({ i, t: r.ts ? Date.parse(r.ts) : NaN, main: r.main !== false }))
+    .sort((a, b) => (a.t || 0) - (b.t || 0));
+  const trig = new Array(s.responses.length).fill(null).map(() => [TRIG_OTHER, null]);
+  const runs = [];
+  let j = -1, run = null;
+  for (const o of order) {
+    if (!o.main || isNaN(o.t)) continue;
+    while (j + 1 < marks.length && marks[j + 1][0] <= o.t) j++;
+    if (j < 0) continue;
+    const [ts, kind, tool] = marks[j];
+    trig[o.i] = [kind, tool];
+    if (kind === TRIG_USER && (!run || run.start !== ts)) runs.push(run = { start: ts, n: 0, end: ts });
+    if (run) { run.n++; run.end = o.t; }
+  }
+  return { trig, tools, inputs, wall, runs: runs.map(r => ({ n: r.n, durMs: r.end - r.start })) };
+}
+
 // Flatten sessions into response rows + session rows, each tagged with a group index.
-// A group is one (source, model family, user) triple: the finest cut the page's checkbox
-// rows can select, and the unit every aggregate is kept in.
-function buildModel(sessions, users) {
+// Groups are (source, model family, user) triples; the page sums any subset of them.
+// Also the rows the tools/cost charts need: tool calls, user/tool inputs and prompt runs.
+const MAX_TOOLS = 20;
+function buildModel(sessions, users, prices) {
   users = users || [anonName(0)];
   const sources = [], families = [], groups = [], groupIndex = new Map();
   const idx = (arr, v) => { let i = arr.indexOf(v); if (i < 0) { arr.push(v); i = arr.length - 1; } return i; };
@@ -811,14 +916,18 @@ function buildModel(sessions, users) {
     groupIndex.set(key, g);
     return g;
   };
-  const rows = [], sessionRows = [], compactRows = [];
+  const rows = [], sessionRows = [], compactRows = [], toolRows = [], inputRows = [], runRows = [];
+  const toolCount = new Map();
   for (const s of sessions) {
     let sessionGroup = null;
-    for (const r of (s.responses || [])) {
-      const g = groupOf(r.source || s.agent || 'unknown', familyOf(r.model), s.user || 0);
+    const shape = sessionShape(s);
+    (s.responses || []).forEach((r, i) => {
+      const source = r.source || s.agent || 'unknown', fam = familyOf(r.model);
+      const g = groupOf(source, fam, s.user || 0);
       if (sessionGroup == null) sessionGroup = g;
-      rows.push({
+      const row = {
         promptTokens: r.promptTokens || 0,
+        input: r.input || 0,
         output: r.output || 0,
         cacheRead: r.cacheRead || 0,
         cacheWrite: r.cacheWrite || 0,
@@ -827,13 +936,23 @@ function buildModel(sessions, users) {
         gapMs: (typeof r.gapMs === 'number') ? r.gapMs : null,
         respMs: (typeof r.respMs === 'number') ? r.respMs : null,
         hour: (typeof r.hour === 'number') ? r.hour : null,
+        day: r.ts ? Math.floor(Date.parse(r.ts) / 86400000) : null,
+        trig: shape.trig[i][0], trigTool: shape.trig[i][1],
+        cost: null,
         g,
-      });
-    }
+      };
+      // Cost parts in µ$: uncached input, cache read, write (growth), write (re-write), decode.
+      const p = priceOf(fam, source, prices);
+      if (p) row.cost = [row.input * p.input, row.cacheRead * p.read, row.cwGrowth * p.write,
+        (row.cacheWrite - row.cwGrowth) * p.write, row.output * p.output].map(Math.round);
+      if (row.day != null && isNaN(row.day)) row.day = null;
+      rows.push(row);
+    });
     if (sessionGroup == null) continue;
     sessionRows.push({
       turns: s.turns || (s.responses || []).length,
       durMs: (typeof s.durationMs === 'number') ? s.durationMs : null,
+      wall: shape.wall,
       g: sessionGroup,
     });
     // A compaction belongs to its session, so it follows the session's group through the
@@ -848,8 +967,21 @@ function buildModel(sessions, users) {
         g: sessionGroup,
       });
     }
+    for (const t of shape.tools) {
+      toolCount.set(t.name, (toolCount.get(t.name) || 0) + 1);
+      toolRows.push({ ...t, g: sessionGroup });
+    }
+    for (const [kind, tokens] of shape.inputs) inputRows.push({ kind, tokens, g: sessionGroup });
+    for (const r of shape.runs) runRows.push({ ...r, g: sessionGroup });
   }
-  return { rows, sessionRows, compactRows, users, sources, families, groups };
+  // The most-called tools by name, the rest as "other" — MCP names are per-server and many.
+  let tools = [...toolCount.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+  if (tools.length > MAX_TOOLS) tools = tools.slice(0, MAX_TOOLS - 1).concat(['other']);
+  const toolIdx = n => { const i = tools.indexOf(n); return i < 0 ? tools.length - 1 : i; };
+  for (const t of toolRows) t.tool = toolIdx(t.name);
+  for (const r of rows) r.trigTool = r.trigTool == null ? null : toolIdx(r.trigTool);
+  return { rows, sessionRows, compactRows, toolRows, inputRows, runRows,
+    users, sources, families, groups, tools };
 }
 
 // ── Aggregation ───────────────────────────────────────────────────────────────
@@ -871,18 +1003,33 @@ function niceStep(x) {
 // the page draws lines from the fine bins and merges each f of them into one bar. linEdges
 // snaps bars to a round step (and splits it only where the split stays on whole numbers);
 // logEdges is log10-spaced and ignores zeros (they fall into the first bin).
-function linEdges(vals, N) {
+function linEdges(vals, N, fine = FINE) {
   const max = Math.max(...vals, 1), step = niceStep(max / N) || 1;
   const n = Math.max(1, Math.ceil((max + 1e-9) / step));
-  const f = [FINE, 5, 2].find(k => k <= FINE && Number.isInteger(step / k)) || 1;
+  const f = [fine, 5, 2].find(k => k <= fine && Number.isInteger(step / k)) || 1;
   return { edges: Array.from({ length: n * f + 1 }, (_, i) => Math.round(i * step / f)), f };
 }
-function logEdges(vals, N, floor) {
+function logEdges(vals, N, floor, fine = FINE) {
   const pos = vals.filter(v => v > 0);
   if (!pos.length) return { edges: [0, 1], f: 1 };
   const lo = Math.log10(Math.max(floor || 1, Math.min(...pos))), hi = Math.log10(Math.max(...pos));
-  const span = (hi - lo) || 1, n = N * FINE;
-  return { edges: Array.from({ length: n + 1 }, (_, i) => Math.round(Math.pow(10, lo + span * i / n))), f: FINE };
+  const span = (hi - lo) || 1, n = N * fine;
+  return { edges: Array.from({ length: n + 1 }, (_, i) => Math.round(Math.pow(10, lo + span * i / n))), f: fine };
+}
+// logEdges, but with bar boundaries landing exactly on `cuts` (each cut inside the range gets
+// a bar edge; bars are shared out between the segments by their log span).
+function cutLogEdges(vals, N, floor, cuts, fine = FINE) {
+  const pos = vals.filter(v => v > 0);
+  if (!pos.length) return { edges: [0, 1], f: 1 };
+  const lo = Math.log10(Math.max(floor || 1, Math.min(...pos))), hi = Math.log10(Math.max(...pos));
+  if (!(hi > lo)) return logEdges(vals, N, floor, fine);
+  const pts = [lo, ...cuts.map(Math.log10).filter(c => c > lo && c < hi), hi], edges = [];
+  for (let s = 0; s < pts.length - 1; s++) {
+    const a = pts[s], span = pts[s + 1] - a;
+    const n = Math.max(1, Math.round(N * span / (hi - lo))) * fine;
+    for (let i = s ? 1 : 0; i <= n; i++) edges.push(Math.round(Math.pow(10, a + span * i / n)));
+  }
+  return { edges, f: fine };
 }
 const NO_EDGES = { edges: [0, 1], f: 1 };
 function binOf(edges, v) {
@@ -928,35 +1075,78 @@ function section(fe, nCell, nGroups, items, valueOf, cell) {
   }
   return { edges, f: fe.f, n: nCell, g };
 }
-// prompt-binned cell: [n, cacheRead, cacheWrite, decode, respSum, respCount, cwGrowth, cwExpiry]
+// Cost parts of a row, µ$: [input, cache read, write growth, write re-write, decode].
+const NO_COST = [0, 0, 0, 0, 0];
+const costOf = r => r.cost || NO_COST;
+// prompt-binned cell: [n, cacheRead, cacheWrite, decode, respSum, respCount, cwGrowth, cwExpiry,
+//  input, ...cost parts (5)]
 function promptCell(a, o, r) {
   a[o]++; a[o + 1] += r.cacheRead; a[o + 2] += r.cacheWrite; a[o + 3] += r.output;
   if (r.respMs != null) { a[o + 4] += r.respMs; a[o + 5]++; }
-  a[o + 6] += r.cwGrowth; a[o + 7] += r.cwExpiry;
+  a[o + 6] += r.cwGrowth; a[o + 7] += r.cwExpiry; a[o + 8] += r.input;
+  const c = costOf(r);
+  for (let k = 0; k < 5; k++) a[o + 9 + k] += c[k];
 }
-function buildView(rows, sessionRows, compactRows, nGroups, cap, cwSplit) {
+// Fixed integer edges 0..n, so a category index bins as itself.
+const catEdges = n => ({ edges: Array.from({ length: Math.max(1, n) + 1 }, (_, i) => i), f: 1 });
+// fine: line-mode bins per bar (see linEdges). The Confluence body ships 1 — lines then run
+// through the bar bins — to stay under the macro's size limit.
+function buildView(m, rows, cap, cwSplit, fine = FINE) {
+  const nGroups = m.groups.length, sessionRows = m.sessionRows, compactRows = m.compactRows;
   const prompts = rows.map(totalPrompt);
   const gaps = rows.filter(r => r.gapMs != null).map(r => r.gapMs);
-  const lin = section(linEdges(prompts, NBINS), 8, nGroups, rows, totalPrompt, promptCell);
-  const log = section(logEdges(prompts, NBINS), 8, nGroups, rows, totalPrompt, promptCell);
+  const lin = section(linEdges(prompts, NBINS, fine), 14, nGroups, rows, totalPrompt, promptCell);
+  const log = section(logEdges(prompts, NBINS, undefined, fine), 14, nGroups, rows, totalPrompt, promptCell);
   if (cwSplit) lin.sum = log.sum = [2, 6, 7];
-  // gap cell: [n, cacheWrite, cwGrowth, cwExpiry, respSum, respCount]
-  const gap = section(gaps.length ? logEdges(gaps, SBINS, 1000) : NO_EDGES, 6, nGroups, rows,
+  // gap cell: [n, cacheWrite, cwGrowth, cwExpiry, respSum, respCount, ...cost parts (5)]
+  const gap = section(gaps.length ? cutLogEdges(gaps, SBINS, 1000, GAP_CUTS, fine) : NO_EDGES, 11, nGroups, rows,
     r => r.gapMs, (a, o, r) => {
       a[o]++; a[o + 1] += r.cacheWrite; a[o + 2] += r.cwGrowth; a[o + 3] += r.cwExpiry;
       if (r.respMs != null) { a[o + 4] += r.respMs; a[o + 5]++; }
+      const c = costOf(r);
+      for (let k = 0; k < 5; k++) a[o + 6 + k] += c[k];
     });
   if (cwSplit) gap.sum = [1, 2, 3];
   // Session distributions, in both scalings so the page's log toggle can switch bins.
   const tv = sessionRows.map(s => s.turns), count1 = (a, o) => { a[o]++; };
-  const turns = section(linEdges(tv, SESS_BINS), 1, nGroups, sessionRows, s => s.turns, count1);
-  const turnsLog = section(tv.length ? logEdges(tv, SESS_BINS, 1) : NO_EDGES, 1, nGroups,
+  const turns = section(linEdges(tv, SESS_BINS, fine), 1, nGroups, sessionRows, s => s.turns, count1);
+  const turnsLog = section(tv.length ? logEdges(tv, SESS_BINS, 1, fine) : NO_EDGES, 1, nGroups,
     sessionRows, s => s.turns, count1);
+  // dur cell: [n, modelMs, toolMs, userMs] — the session's wall clock, split (sessionShape).
   const durs = sessionRows.filter(s => s.durMs != null).map(s => s.durMs);
-  const dur = section(durs.length ? linEdges(durs, SESS_BINS) : NO_EDGES, 1, nGroups, sessionRows,
-    s => s.durMs, count1);
-  const durLog = section(durs.length ? logEdges(durs, SESS_BINS, 1000) : NO_EDGES, 1, nGroups,
-    sessionRows, s => s.durMs, count1);
+  const durCell = (a, o, s) => { a[o]++; a[o + 1] += s.wall[0]; a[o + 2] += s.wall[1]; a[o + 3] += s.wall[2]; };
+  const dur = section(durs.length ? linEdges(durs, SESS_BINS, fine) : NO_EDGES, 4, nGroups, sessionRows,
+    s => s.durMs, durCell);
+  const durLog = section(durs.length ? logEdges(durs, SESS_BINS, 1000, fine) : NO_EDGES, 4, nGroups,
+    sessionRows, s => s.durMs, durCell);
+
+  // Tools vs user input (log bins only — see the page's drawTools). runs cell: [n, durSum]; inp cell: [nUser, userTok, nTool, toolTok];
+  // tool cell (per tool): [calls, callTok, resultTok, execSum, execN];
+  // trig cell (user / tool / other): [n, cwGrowth, cwExpiry, respSum, respN, costSum, costN].
+  const rn = m.runRows.map(r => r.n), runCell = (a, o, r) => { a[o]++; a[o + 1] += r.durMs; };
+  const runsLog = section(rn.length ? logEdges(rn, SESS_BINS, 1, fine) : NO_EDGES, 2, nGroups, m.runRows, r => r.n, runCell);
+  const iv = m.inputRows.map(r => r.tokens);
+  const inpCell = (a, o, r) => { a[o + 2 * r.kind]++; a[o + 2 * r.kind + 1] += r.tokens; };
+  const inpLog = section(iv.length ? logEdges(iv, SESS_BINS, undefined, fine) : NO_EDGES, 4, nGroups, m.inputRows, r => r.tokens, inpCell);
+  const tool = section(catEdges(m.tools.length), 5, nGroups, m.toolRows, t => t.tool, (a, o, t) => {
+    a[o]++; a[o + 1] += t.callTok; a[o + 2] += t.resTok;
+    if (t.execMs != null) { a[o + 3] += t.execMs; a[o + 4]++; }
+  });
+  const trig = section(catEdges(3), 7, nGroups, rows, r => r.trig, (a, o, r) => {
+    a[o]++; a[o + 1] += r.cwGrowth; a[o + 2] += r.cwExpiry;
+    if (r.respMs != null) { a[o + 3] += r.respMs; a[o + 4]++; }
+    if (r.cost) { a[o + 5] += r.cost.reduce((x, y) => x + y, 0); a[o + 6]++; }
+  });
+  // Cost per UTC day. cell: [n, ...cost parts (5)]
+  const days = rows.filter(r => r.day != null).map(r => r.day);
+  const dayEdges = days.length ? (() => {
+    const lo = Math.min(...days), hi = Math.max(...days);
+    return { edges: Array.from({ length: hi - lo + 2 }, (_, i) => lo + i), f: 1 };
+  })() : NO_EDGES;
+  const day = section(dayEdges, 6, nGroups, rows, r => r.day, (a, o, r) => {
+    a[o]++; const c = costOf(r);
+    for (let k = 0; k < 5; k++) a[o + 1 + k] += c[k];
+  });
 
   // Compactions, binned by the context size that triggered them.
   // cell: [n, preSum, postSum, durSum, durN, inferred, auto]
@@ -966,9 +1156,9 @@ function buildView(rows, sessionRows, compactRows, nGroups, cap, cwSplit) {
     if (c.durMs != null) { a[o + 3] += c.durMs; a[o + 4]++; }
     a[o + 5] += c.inferred; a[o + 6] += c.auto;
   };
-  const comp = section(pres.length ? linEdges(pres, CBINS) : NO_EDGES, 7, nGroups, compactRows,
+  const comp = section(pres.length ? linEdges(pres, CBINS, fine) : NO_EDGES, 7, nGroups, compactRows,
     c => c.pre, compCell);
-  const compLog = section(pres.length ? logEdges(pres, CBINS, 1000) : NO_EDGES, 7, nGroups,
+  const compLog = section(pres.length ? logEdges(pres, CBINS, 1000, fine) : NO_EDGES, 7, nGroups,
     compactRows, c => c.pre, compCell);
 
   // Hour-of-day response-time means, per group.
@@ -979,13 +1169,16 @@ function buildView(rows, sessionRows, compactRows, nGroups, cap, cwSplit) {
   // Per-group totals — true per-response means come from these, independent of any binning,
   // so the reference lines don't move when the log toggle changes the bins.
   // [n, cr, cw, dec, respSum, respN, cwGrowth, cwExpiry, sessions, turns, durSum, durN,
-  //  compactions, cPreSum, cPostSum, cInferred]
-  const tot = Array.from({ length: nGroups }, () => new Array(16).fill(0));
+  //  compactions, cPreSum, cPostSum, cInferred, input, ...cost parts (5), unpriced]
+  const tot = Array.from({ length: nGroups }, () => new Array(23).fill(0));
   for (const r of rows) {
     const t = tot[r.g];
     t[0]++; t[1] += r.cacheRead; t[2] += r.cacheWrite; t[3] += r.output;
     if (r.respMs != null) { t[4] += r.respMs; t[5]++; }
-    t[6] += r.cwGrowth; t[7] += r.cwExpiry;
+    t[6] += r.cwGrowth; t[7] += r.cwExpiry; t[16] += r.input;
+    const c = costOf(r);
+    for (let k = 0; k < 5; k++) t[17 + k] += c[k];
+    if (!r.cost && r.promptTokens + r.output > 0) t[22]++;
   }
   for (const s of sessionRows) {
     const t = tot[s.g];
@@ -1019,9 +1212,11 @@ function buildView(rows, sessionRows, compactRows, nGroups, cap, cwSplit) {
     tot: tot.map(a => a.map(R)),
     pts, ptsTotal: all.length,
     lin, log, gap, turns, turnsLog, dur, durLog, comp, compLog,
+    runsLog, inpLog, tool, trig, day,
   };
 }
-const SECTIONS = ['lin', 'log', 'gap', 'turns', 'turnsLog', 'dur', 'durLog', 'comp', 'compLog'];
+const SECTIONS = ['lin', 'log', 'gap', 'turns', 'turnsLog', 'dur', 'durLog', 'comp', 'compLog',
+  'runsLog', 'inpLog', 'tool', 'trig', 'day'];
 function packView(v) {
   const out = { hour: { sum: packRows(v.hour.sum), cnt: packRows(v.hour.cnt) },
     tot: packRows(v.tot), pts: v.pts, ptsTotal: v.ptsTotal };
@@ -1029,14 +1224,13 @@ function packView(v) {
   return out;
 }
 const minusRows = (a, b) => a.map((r, i) => r.map((x, j) => x - b[i][j]));
-function buildViews(model, cap) {
-  const n = model.groups.length;
+function buildViews(model, cap, fine) {
   const keepRows = model.rows, dropRows = model.rows.filter(r => !isOutlier(r));
   // Cache write is always growth + re-write for skeletons that carry the split; then the
   // cache-write column need not ship.
   const cwSplit = keepRows.every(r => r.cacheWrite === r.cwGrowth + r.cwExpiry);
-  const keepRaw = buildView(keepRows, model.sessionRows, model.compactRows, n, cap, cwSplit);
-  const dropRaw = buildView(dropRows, model.sessionRows, model.compactRows, n, cap, cwSplit);
+  const keepRaw = buildView(model, keepRows, cap, cwSplit, fine);
+  const dropRaw = buildView(model, dropRows, cap, cwSplit, fine);
   const keep = packView(keepRaw), drop = packView(dropRaw);
   // Scatter points as one base-36 string: "x,y,g[,1];…" (the trailing 1 flags an outlier).
   keep.pts = { s: keepRaw.pts.map(p => p.map(v => v.toString(36)).join(',')).join(';') };
@@ -1056,6 +1250,26 @@ function buildViews(model, cap) {
   // The scatter sample is shipped once, flagged; the page derives the trimmed one from it.
   drop.pts = '@pts';
   return { keep, drop };
+}
+
+// Every row, for the standalone page only: its line charts re-bin these at one bin per pixel.
+// Confluence gets the pre-binned views alone (macro bodies have a size limit). One base-36
+// string per kind, rows split by ';', an empty field is null, a trailing 1 flags an outlier.
+//   r: [g, cacheRead, cacheWrite, decode, respMs, cwGrowth, cwExpiry, gapMs, outlier, input,
+//       ...cost parts (5)]
+//   s: [g, turns, durMs, modelMs, toolMs, userMs]      c: [g, pre, post, durMs, inferred, auto]
+//   i: [g, kind (0 user, 1 tool), tokens]              u: [g, requests, durMs]
+function packRaw(model) {
+  const enc = a => a.map(v => v == null ? '' : Math.round(v).toString(36)).join(',');
+  const join = (rows, f) => rows.map(x => enc(f(x))).join(';');
+  return {
+    r: join(model.rows, x => [x.g, x.cacheRead, x.cacheWrite, x.output, x.respMs, x.cwGrowth,
+      x.cwExpiry, x.gapMs, isOutlier(x) ? 1 : 0, x.input, ...costOf(x)]),
+    s: join(model.sessionRows, x => [x.g, x.turns, x.durMs, ...x.wall]),
+    c: join(model.compactRows, x => [x.g, x.pre, x.post, x.durMs, x.inferred, x.auto]),
+    i: join(model.inputRows, x => [x.g, x.kind, x.tokens]),
+    u: join(model.runRows, x => [x.g, x.n, x.durMs]),
+  };
 }
 
 // ── HTML rendering ────────────────────────────────────────────────────────────
@@ -1103,6 +1317,11 @@ svg{display:block;max-width:100%;height:auto}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 8px;color:__secondary__;font-size:12px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.legend .pick{cursor:pointer;user-select:none}
+.legend .off{opacity:.45;text-decoration:line-through}
+.sect{font-size:17px;font-weight:600;margin:36px 0 4px;color:__primary__}
+.sect-sub{color:__muted__;font-size:12px;margin:0 0 14px}
+.row2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:0 20px}
 .sw0{background:__primary__}.sw1{background:__s1__}.sw2{background:__s2__}.sw3{background:__s3__}
 .foot{color:__muted__;font-size:12px;margin-top:8px}
 .float{position:fixed;top:14px;right:14px;z-index:2147483646;display:flex;
@@ -1139,34 +1358,73 @@ const MARKUP = `
   <div class="ctrl" id="userCtrl"><span class="lbl">user</span></div>
   <div class="ctrl" id="srcCtrl"><span class="lbl">source</span></div>
   <div class="ctrl" id="modCtrl"><span class="lbl">model</span></div>
-  <div class="card"><h2>Sessions by turn count</h2><p class="desc">how many sessions had how many billable responses</p><div id="sess-turns"></div></div>
-  <div class="card"><h2>Sessions by duration</h2><p class="desc">wall-clock first-to-last activity per session</p><div id="sess-dur"></div></div>
+  <div class="row2">
+  <div class="card"><h2>Sessions by turn count</h2><p class="desc">billable responses per session</p><div id="sess-turns"></div></div>
+  <div class="card"><h2>Sessions by duration</h2><p class="desc">first-to-last activity per session</p><div id="sess-dur"></div></div>
+  </div>
   <div class="card"><h2>Prompt Size Distribution</h2><p class="desc">responses binned by total prompt (cache-read + cache-write + decode); vertical dashed lines mark the average prompt composition, cumulative on the token axis (cache read, +cache write, +decode = avg total) — values in the legend</p>
     <div class="legend" id="stack-count-legend"></div><div id="stack-count"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Response Time</h2><p class="desc">avg response time binned by total prompt; each bar stacked by token-type share of that bin</p>
-    <div class="legend"><span><i class="sw1"></i>cache read</span><span><i class="sw2"></i>cache write</span><span><i class="sw3"></i>decode</span></div><div id="stack-resp"></div></div>
+    <div class="legend" id="stack-resp-legend"></div><div id="stack-resp"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Decode</h2><p class="desc">avg decode (output) tokens per response, binned by total prompt</p><div id="avg-decode"></div></div>
   <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Cache Write</h2><p class="desc">avg cache-write tokens per response, binned by total prompt</p><div id="avg-cw"></div></div>
   <div class="card"><h2>Cache Write: growth vs re-write</h2><p class="desc">avg cache-write tokens per response split by cause — <b>growth</b> is the part that fits what the prompt gained since the previous request, <b>re-write</b> is prefix that was already cached and had to be written again (TTL expiry or eviction)</p>
     <div class="legend" id="cw-split-legend"></div><div id="cw-split"></div></div>
-  <div class="card"><h2>Idle gap&nbsp;→&nbsp;Cache Write</h2><p class="desc">avg cache-write tokens per response against the gap since the previous request in the same session; the re-write share climbing past the cache TTL is what expiry looks like</p>
-    <div class="legend"><span><i class="sw1"></i>growth</span><span><i class="sw2"></i>re-write</span></div><div id="gap-cw"></div></div>
+  <div class="card"><h2>Idle gap&nbsp;→&nbsp;Cache Write</h2><p class="desc">avg cache-write tokens per response against the gap since the previous request in the same session; dashed lines mark the cache TTLs (5&nbsp;min Bedrock, 1&nbsp;h subscription) — the re-write share climbing past one is what expiry looks like</p>
+    <div class="legend" id="gap-cw-legend"></div><div id="gap-cw"></div></div>
   <div class="card"><h2>Compaction&nbsp;→&nbsp;context size at trigger</h2><p class="desc">how many compactions were issued at which context size<span id="comp-note"></span></p><div id="comp-count"></div></div>
   <div class="card"><h2>Compaction&nbsp;→&nbsp;result size</h2><p class="desc">avg context size left after compacting, against the size it was issued at; the dashed line is the average result, the blue segment the share that survived</p>
     <div class="legend" id="comp-post-legend"></div><div id="comp-post"></div></div>
-  <div class="card"><h2>Prompt&nbsp;+&nbsp;output size&nbsp;→&nbsp;response time</h2><p class="desc">each dot is one response (responses with timing); orange line = mean response time per x-slot (12 slots)<span id="pts-note"></span></p><div id="scatter"></div></div>
+  <div class="card"><h2>Prompt&nbsp;+&nbsp;output size&nbsp;→&nbsp;response time</h2><p class="desc">each dot is one response (responses with timing); orange line = mean response time per x-slot (12 slots)<span id="pts-note"></span></p>
+    <div class="legend" id="scatter-legend"></div><div id="scatter"></div></div>
   <div class="card"><h2>Time of day&nbsp;→&nbsp;avg response time</h2><p class="desc">mean response time by local hour</p><div id="hour"></div></div>
+
+  <h2 class="sect">Cost</h2>
+  <p class="sect-sub" id="cost-note"></p>
+  <div class="tiles" id="cost-tiles"></div>
+  <div class="card"><h2>Cost per day</h2><p class="desc">spend per UTC day, stacked by what it paid for</p>
+    <div class="legend" id="cost-day-legend"></div><div id="cost-day"></div></div>
+  <div class="card"><h2>Cost by model</h2><p class="desc">where the spend goes, split into uncached input, cache read, cache write (growth and re-write) and decode; switch to tokens to see the same split by volume</p>
+    <div class="legend" id="cost-model-legend"></div><div id="cost-model"></div></div>
+  <div class="card"><h2>Prompt Size&nbsp;→&nbsp;Cost</h2><p class="desc">avg cost per response, binned by total prompt</p>
+    <div class="legend" id="cost-prompt-legend"></div><div id="cost-prompt"></div></div>
+  <div class="card"><h2>Idle gap&nbsp;→&nbsp;Cost</h2><p class="desc">avg cost per response against the gap since the previous request; what letting the cache expire costs</p>
+    <div class="legend" id="cost-gap-legend"></div><div id="cost-gap"></div></div>
+
+  <h2 class="sect">Tools vs user input</h2>
+  <p class="sect-sub">from the message rows of main transcripts; prompt and tool-result sizes are mostly the ~4&nbsp;chars/token estimate</p>
+  <div class="card"><h2>User- vs tool-triggered requests</h2><p class="desc">requests that answer a user prompt against those that answer a tool result (other: subagents, and requests with nothing before them)</p>
+    <div class="legend" id="trig-legend"></div><div id="trig"></div></div>
+  <div class="card"><h2>Requests per user prompt</h2><p class="desc">model requests from one user prompt until the next — how far the agent runs on tool results alone<span id="runs-note"></span></p><div id="tool-runs"></div></div>
+  <div class="card"><h2>User prompts vs tool results&nbsp;→&nbsp;size</h2><p class="desc">how many messages of each size the model was fed</p>
+    <div class="legend" id="inp-size-legend"></div><div id="inp-size"></div></div>
+  <div class="card"><h2>Tool mix</h2><p class="desc">per tool: calls, tokens moved (result and call), and avg time from call to result</p>
+    <div class="legend" id="tool-mix-legend"></div><div id="tool-mix"></div></div>
+  <div class="card"><h2>Where session time goes</h2><p class="desc">share of each session's wall clock by session length, split by what each gap between messages ended in — the model answering, a tool returning, or the user's next prompt (which includes idle time)</p>
+    <div class="legend" id="wall-legend"></div><div id="wall"></div></div>
   <p class="foot" id="foot"></p>
 `;
 
 // The paste-ready block: host <div> + one <script>. This is BOTH the body of the standalone
 // page and, verbatim, the body of the Confluence HTML macro.
-function reportBlock(views, meta) {
-  const payload = JSON.stringify({ views, meta }).replace(/</g, '\\u003c');
+function reportBlock(views, meta, raw, gz) {
+  let payload = JSON.stringify(raw ? { views, meta, raw } : { views, meta });
+  // gz: the JSON ships as a base64 gzip string and the page inflates it before starting.
+  payload = gz ? JSON.stringify(zlib.gzipSync(payload, { level: 9 }).toString('base64'))
+    : payload.replace(/</g, '\\u003c');
   return `<div id="${HOST_ID}"></div>
 <script>
 (function(){
 var DATA = ${payload};
+// A string payload is gzip + base64 (the Confluence body); inflate it, then start.
+function inflate(b64){
+  var bin = atob(b64), u = new Uint8Array(bin.length);
+  for(var i=0; i<bin.length; i++) u[i] = bin.charCodeAt(i);
+  return new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+}
+if(typeof DATA === 'string') inflate(DATA).then(function(t){ start(JSON.parse(t)); });
+else start(DATA);
+function start(DATA){
 var CSS_T = ${JSON.stringify(CSS_TEMPLATE)};
 var MARKUP = ${JSON.stringify(MARKUP)};
 var VIEWS = DATA.views, meta = DATA.meta;
@@ -1224,6 +1482,11 @@ function expand(v, base){
 VIEWS.keep.pts = VIEWS.keep.pts.s ? VIEWS.keep.pts.s.split(';').map(function(p){
   return p.split(',').map(function(v){ return parseInt(v, 36); }); }) : [];
 expand(VIEWS.keep, null); expand(VIEWS.drop, VIEWS.keep);
+// Per-row data (standalone page only — see packRaw): line charts re-bin it per pixel.
+function rows36(s){ return s ? s.split(';').map(function(p){ return p.split(',').map(function(v){
+  return v === '' ? null : parseInt(v, 36); }); }) : []; }
+var RAW = DATA.raw ? {r: rows36(DATA.raw.r), s: rows36(DATA.raw.s), c: rows36(DATA.raw.c),
+  i: rows36(DATA.raw.i), u: rows36(DATA.raw.u)} : null;
 
 var host = document.getElementById(${JSON.stringify(HOST_ID)});
 if(!host) return;
@@ -1234,10 +1497,10 @@ root.innerHTML = '';
 // Concrete hex per theme — never var() inside SVG attributes (Confluence would not resolve it).
 var LIGHT = {plane:'#f9f9f7', surface:'#fcfcfb', primary:'#0b0b0b', secondary:'#52514e',
   muted:'#898781', grid:'#e1e0d9', axis:'#c3c2b7', series:'#2a78d6',
-  s1:'#2a78d6', s2:'#eb6834', s3:'#1baf7a', border:'rgba(11,11,11,0.10)'};
+  s1:'#2a78d6', s2:'#eb6834', s3:'#1baf7a', s4:'#8a5cd1', s5:'#e3a72f', border:'rgba(11,11,11,0.10)'};
 var DARK = {plane:'#0d0d0d', surface:'#1a1a19', primary:'#ffffff', secondary:'#c3c2b7',
   muted:'#898781', grid:'#2c2c2a', axis:'#383835', series:'#3987e5',
-  s1:'#3987e5', s2:'#d95926', s3:'#199e70', border:'rgba(255,255,255,0.10)'};
+  s1:'#3987e5', s2:'#d95926', s3:'#199e70', s4:'#9b72e0', s5:'#d19a2a', border:'rgba(255,255,255,0.10)'};
 var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
 var PAL = (mq && mq.matches) ? DARK : LIGHT;
 function css(P){ return CSS_T.replace(/__(\\w+)__/g, function(_, k){ return P[k]; }); }
@@ -1298,8 +1561,9 @@ function refreshSel(){
     if(srcOn[gr[0]] && modOn[gr[1]] && userOn[gr[2]]) SEL.push(g);
   }
 }
-// Sum one section's per-group cells over SEL, decoded into per-bin objects.
-function sumSection(sec){
+// Sum one section's per-group cells over SEL, decoded into per-bin objects. kind names the
+// RAWK entry that can re-bin the same section from rows (line mode, standalone page).
+function sumSection(sec, kind){
   var nb = sec.edges.length - 1, n = sec.n;
   var out = [];
   for(var b=0; b<nb; b++){
@@ -1312,6 +1576,7 @@ function sumSection(sec){
     out.push({lo: sec.edges[b], hi: sec.edges[b+1], c: c});
   }
   out.f = sec.f || 1;
+  out.sec = sec; out.kind = kind;
   return out;
 }
 // Merge each f fine bins into one bar. Every cell is a count or a sum, so this is exact.
@@ -1326,8 +1591,65 @@ function coarsen(bins){
   }
   return out;
 }
+// Row layouts are packRaw's; each cell mirrors the build-time section of the same name.
+function addCost(a, o, r){ for(var k=0; k<5; k++) a[o+k] += r[10+k]; }
+var RAWK = {
+  prompt: {rows:'r', n:14, v:function(r){ return r[1]+r[2]+r[3]; }, cell:function(a, o, r){
+    a[o]++; a[o+1] += r[1]; a[o+2] += r[2]; a[o+3] += r[3];
+    if(r[4] != null){ a[o+4] += r[4]; a[o+5]++; }
+    a[o+6] += r[5]; a[o+7] += r[6]; a[o+8] += r[9]; addCost(a, o+9, r); }},
+  gap: {rows:'r', n:11, v:function(r){ return r[7]; }, cell:function(a, o, r){
+    a[o]++; a[o+1] += r[2]; a[o+2] += r[5]; a[o+3] += r[6];
+    if(r[4] != null){ a[o+4] += r[4]; a[o+5]++; }
+    addCost(a, o+6, r); }},
+  turns: {rows:'s', n:1, v:function(r){ return r[1]; }, cell:function(a, o){ a[o]++; }},
+  dur: {rows:'s', n:4, v:function(r){ return r[2]; }, cell:function(a, o, r){
+    a[o]++; a[o+1] += r[3]; a[o+2] += r[4]; a[o+3] += r[5]; }},
+  inp: {rows:'i', n:4, v:function(r){ return r[2]; }, cell:function(a, o, r){
+    a[o+2*r[1]]++; a[o+2*r[1]+1] += r[2]; }},
+  runs: {rows:'u', n:2, v:function(r){ return r[1]; }, cell:function(a, o, r){ a[o]++; a[o+1] += r[2]; }},
+  comp: {rows:'c', n:7, v:function(r){ return r[1]; }, cell:function(a, o, r){
+    a[o]++; a[o+1] += r[1]; a[o+2] += r[2];
+    if(r[3] != null){ a[o+3] += r[3]; a[o+4]++; }
+    a[o+5] += r[4]; a[o+6] += r[5]; }}
+};
+function binOf(edges, v){
+  if(!(v > edges[0])) return 0;
+  var lo = 0, hi = edges.length - 1;
+  while(lo < hi - 1){ var mid = (lo + hi) >> 1; if(v < edges[mid]) hi = mid; else lo = mid; }
+  return Math.min(lo, edges.length - 2);
+}
+// The selected rows binned at one bin per plot pixel over the section's range. Memoized per
+// render (RAWMEMO is reset there); log bins that round to zero width stay empty, as at build.
+var RAWMEMO = {};
+function rawBins(kind, sec, isLog){
+  var key = kind + (isLog ? 'L' : '') + IW;
+  if(RAWMEMO[key]) return RAWMEMO[key];
+  var K = RAWK[kind], lo = sec.edges[0], hi = sec.edges[sec.edges.length-1];
+  var n = Math.round(IW), edges = [], i;
+  if(isLog){
+    var a = Math.log10(Math.max(1, lo)), z = Math.log10(Math.max(hi, lo + 1));
+    for(i=0; i<=n; i++) edges.push(Math.round(Math.pow(10, a + (z - a)*i/n)));
+  } else {
+    var step = Math.max(1, Math.ceil((hi - lo)/n));
+    n = Math.max(1, Math.ceil((hi - lo)/step));
+    for(i=0; i<=n; i++) edges.push(lo + i*step);
+  }
+  var cells = [];
+  for(i=0; i<n*K.n; i++) cells.push(0);
+  var on = {}, drop = VIEW === VIEWS.drop && K.rows === 'r';
+  for(i=0; i<SEL.length; i++) on[SEL[i]] = 1;
+  RAW[K.rows].forEach(function(r){
+    if(!on[r[0]] || (drop && r[8])) return;
+    var v = K.v(r);
+    if(v != null) K.cell(cells, binOf(edges, v)*K.n, r);
+  });
+  var out = [];
+  for(i=0; i<n; i++) out.push({lo: edges[i], hi: edges[i+1], c: cells.slice(i*K.n, (i+1)*K.n)});
+  return RAWMEMO[key] = out;
+}
 function sumTotals(){
-  var NT = 16, t = new Array(NT);
+  var NT = 23, t = new Array(NT);
   for(var k=0; k<NT; k++) t[k] = 0;
   for(var i=0; i<SEL.length; i++){
     var a = VIEW.tot[SEL[i]];
@@ -1335,7 +1657,8 @@ function sumTotals(){
   }
   return {n:t[0], cr:t[1], cw:t[2], dec:t[3], respSum:t[4], respN:t[5],
     cwG:t[6], cwE:t[7], sessions:t[8], turns:t[9], durSum:t[10], durN:t[11],
-    comp:t[12], cPre:t[13], cPost:t[14], cInf:t[15]};
+    comp:t[12], cPre:t[13], cPost:t[14], cInf:t[15], inp:t[16],
+    cost:[t[17], t[18], t[19], t[20], t[21]], unpriced:t[22]};
 }
 function sumHour(){
   var sum = [], cnt = [];
@@ -1369,9 +1692,19 @@ function fmtDur(ms){
   return (ms/86400000).toFixed(1)+'d';
 }
 function pct(a, b){ return b > 0 ? Math.round(100*a/b)+'%' : '0%'; }
+// µ$ → dollars, with as many decimals as a small amount needs.
+function fmtUsd(u){ var d = u/1e6, a = Math.abs(d);
+  if(a >= 1e3) return '$'+(d/1e3).toFixed(1)+'k';
+  if(a >= 10) return '$'+d.toFixed(0);
+  if(a >= 0.1) return '$'+d.toFixed(2);
+  if(a === 0) return '$0';
+  return '$'+d.toPrecision(2); }
+function fmtDay(d){ return new Date(d*86400000).toISOString().slice(5,10); }
 
-var W = 920, H = 260, M = {t:14, r:16, b:40, l:52};
-var IW = W - M.l - M.r, IH = H - M.t - M.b;
+var W, H, M = {t:14, r:16, b:40, l:52}, IW, IH;
+// Plot size for the charts drawn next (the session pair is half width).
+function size(w, h){ W = w; H = h; IW = W - M.l - M.r; IH = H - M.t - M.b; }
+size(920, 260);
 
 // Chart primitives — every colour comes from PAL as a literal attribute value.
 function gridLine(y){ return el('line',{x1:M.l, y1:y, x2:M.l+IW, y2:y, stroke:PAL.grid, 'stroke-width':1}); }
@@ -1416,14 +1749,15 @@ function blankSvg(hostEl){
   hostEl.innerHTML = ''; hostEl.appendChild(svg); return svg;
 }
 
-// Per-chart line/bars switch, keyed by chart id. Line is the default.
-var MODE = {};
-function modeToggle(id, hostEl){
+// Per-chart line/bars switch, keyed by chart id. Line is the default; the stacked-composition
+// charts open on bars, where the shares read best.
+var MODE = {'stack-count': 'bars', 'cw-split': 'bars', 'gap-cw': 'bars', 'cost-gap': 'bars'};
+function modeToggle(id, hostEl, modes){
   var card = hostEl.parentNode;
   if(!card || card.querySelector('.mode')) return;
   var box = document.createElement('div');
   box.className = 'mode';
-  ['line', 'bars'].forEach(function(m){
+  (modes || ['line', 'bars']).forEach(function(m){
     var a = document.createElement('a');
     a.textContent = m; a.setAttribute('data-m', m);
     a.addEventListener('click', function(){ MODE[id] = m; render(); });
@@ -1437,46 +1771,86 @@ function paintMode(hostEl, mode){
   [].forEach.call(box.children, function(a){
     a.className = a.getAttribute('data-m') === mode ? 'on' : ''; });
 }
+// Series a chart's legend has switched off: HIDE[id][k] for share k, HIDE[id][nSeg] for the
+// total. Clicking a legend entry flips it and redraws.
+var HIDE = {};
+// Legend entries, total first (unless noTotal). names[k] / colors[k] follow the HIDE indices.
+function legend(id, names, colors, noTotal, key){
+  var box = $(id + '-legend'); if(!box) return;
+  key = key || id;
+  var off = HIDE[key] || (HIDE[key] = {}), last = names.length - 1;
+  var order = names.map(function(_, k){ return k; });
+  if(!noTotal) order = [last].concat(order.slice(0, last));
+  box.innerHTML = '';
+  order.forEach(function(k){
+    var sp = document.createElement('span');
+    sp.className = 'pick' + (off[k] ? ' off' : '');
+    sp.innerHTML = '<i style="background:' + colors[k] + '"></i>' + names[k];
+    sp.setAttribute('title', 'show / hide');
+    sp.addEventListener('click', function(){ off[k] = !off[k]; render(); });
+    box.appendChild(sp);
+  });
+}
 // Generic binned chart, drawn as bars or as lines through the bin centres.
 // opts: height(bin) -> bar height in data units,
 // segs(bin) -> [[color, value], …] stacked shares (optional; one solid bar otherwise; in line
 // mode each share becomes its own line, with the total drawn over them),
+// names -> legend html per share then the total (makes each one switchable; see HIDE),
 // fmtY, fmtX, tip(bin), xlabel, mean (value for the dashed reference line), meanLabel,
-// zeros (an empty bin is a real 0 — counts — rather than "no data" — averages).
-// bins come in fine (see coarsen); line mode plots them as they are, bars merge them.
+// meanOf (series index the mean belongs to; the total by default),
+// zeros (an empty bin is a real 0 — counts — rather than "no data" — averages),
+// marks(svg, bins, bw, maxH, off) for extra overlays.
+// bins come in fine (see coarsen); bars merge them, line mode plots them as they are — or,
+// with per-row data on the page, re-bins at one bin per pixel (rawBins).
 function drawBins(id, bins, isLog, opts){
   var hostEl = $(id); if(!hostEl) return;
   modeToggle(id, hostEl);
   var line = (MODE[id] || 'line') === 'line';
   paintMode(hostEl, line ? 'line' : 'bars');
-  if(!line) bins = coarsen(bins);
+  if(line && RAW && bins.kind) bins = rawBins(bins.kind, bins.sec, isLog);
+  else if(!line) bins = coarsen(bins);
   var svg = blankSvg(hostEl);
   if(!bins.length) return;
+  var segsOf = function(b){
+    var segs = opts.segs ? opts.segs(b) : [[PAL.series, 1]], tot = 0;
+    segs.forEach(function(s){ tot += s[1]; });
+    return {segs: segs, tot: tot};
+  };
+  var first = segsOf(bins[0]).segs, nSeg = first.length, multi = nSeg > 1;
+  var off = HIDE[id] || (HIDE[id] = {});
+  if(opts.names) legend(id, opts.names, first.map(function(s){ return s[0]; }).concat([PAL.primary]));
+  var share = function(b, k){ var s = segsOf(b); return s.tot > 0 ? opts.height(b) * s.segs[k][1] / s.tot : 0; };
+  // What is actually drawn for a bin: the tallest visible line, or the visible part of the stack.
+  var shown = function(b){
+    if(!multi) return opts.height(b);
+    var m = 0, k;
+    if(line){ m = off[nSeg] ? 0 : opts.height(b); for(k=0; k<nSeg; k++) if(!off[k]) m = Math.max(m, share(b, k)); }
+    else { if(!(segsOf(b).tot > 0)) return opts.height(b); for(k=0; k<nSeg; k++) if(!off[k]) m += share(b, k); }
+    return m;
+  };
   var fmtY = opts.fmtY || fmt, fmtX = opts.fmtX || fmt;
   var maxH = 1;
-  for(var i=0; i<bins.length; i++) maxH = Math.max(maxH, opts.height(bins[i]));
+  for(var i=0; i<bins.length; i++) maxH = Math.max(maxH, shown(bins[i]));
   for(var g=0; g<=4; g++){ var y = M.t + IH - IH*g/4;
     svg.appendChild(gridLine(y));
     svg.appendChild(tickText(M.l-8, y+4, 'end', fmtY(maxH*g/4))); }
   svg.appendChild(axisLine());
   var bw = IW / bins.length;
   var step = Math.ceil(bins.length/8);
-  if(line) drawLines(svg, bins, bw, maxH, opts);
+  if(line) drawLines(svg, bins, bw, maxH, opts, nSeg, off, share);
   bins.forEach(function(b, i){
-    var h = IH * opts.height(b) / maxH, x = M.l + i*bw, w = Math.max(1, bw-2);
+    var h = IH * shown(b) / maxH, x = M.l + i*bw, w = Math.max(1, bw-2);
     if(line){
       var hitL = el('rect',{x:x, y:M.t, width:bw, height:IH, fill:'transparent'});
       hitL.addEventListener('mousemove', function(e){ showTip(opts.tip(b), e); });
       hitL.addEventListener('mouseleave', hideTip);
       svg.appendChild(hitL);
     } else if(h > 0){
-      var segs = opts.segs ? opts.segs(b) : [[PAL.series, 1]];
-      var tot = 0;
-      segs.forEach(function(s){ tot += s[1]; });
-      if(tot <= 0) segs = [[PAL.series, 1]], tot = 1;
-      var y = M.t + IH;
-      segs.forEach(function(s){
-        var sh = h * s[1] / tot; if(sh <= 0) return; y -= sh;
+      var y = M.t + IH, sg = segsOf(b);
+      if(!(sg.tot > 0)) svg.appendChild(el('rect',{x:x+1, y:y-h, width:w, height:h, fill:PAL.series}));
+      else sg.segs.forEach(function(s, k){
+        if(off[k] && multi) return;
+        var sh = IH * share(b, k) / maxH; if(sh <= 0) return; y -= sh;
         svg.appendChild(el('rect',{x:x+1, y:y, width:w, height:sh, fill:s[0]}));
       });
       var hit = el('rect',{x:x+1, y:M.t+IH-h, width:w, height:h, fill:'transparent'});
@@ -1486,27 +1860,23 @@ function drawBins(id, bins, isLog, opts){
     }
     if(i % step === 0) svg.appendChild(tickText(x, M.t+IH+16, 'middle', fmtX(b.lo)));
   });
-  if(opts.mean != null) meanLine(svg, opts.mean, maxH, opts.meanLabel);
-  if(opts.marks) opts.marks(svg, bins, bw, maxH);
+  var meanOf = opts.meanOf != null ? opts.meanOf : nSeg;
+  if(opts.mean != null && !(multi && off[meanOf])) meanLine(svg, opts.mean, maxH, opts.meanLabel);
+  if(opts.marks) opts.marks(svg, bins, bw, maxH, off);
   svg.appendChild(axisLabel(M.l+IW/2, H-4, opts.xlabel + (isLog ? ' (log bins)' : '')));
   return svg;
 }
 
-// Line mode for drawBins: one path per stacked share (value = bar height × share) plus the
-// total, through each bin's centre. Bins with no data are stepped over, unless opts.zeros.
-function drawLines(svg, bins, bw, maxH, opts){
-  var segsOf = function(b){
-    var segs = opts.segs ? opts.segs(b) : [[PAL.series, 1]], tot = 0;
-    segs.forEach(function(s){ tot += s[1]; });
-    return {segs: segs, tot: tot};
-  };
-  var first = segsOf(bins[0]).segs, nSeg = first.length;
+// Line mode for drawBins: one path per visible stacked share (value = bar height × share) plus
+// the total, through each bin's centre. Bins with no data are stepped over, unless opts.zeros.
+function drawLines(svg, bins, bw, maxH, opts, nSeg, off, share){
+  var first = opts.segs ? opts.segs(bins[0]) : [[PAL.series, 1]];
   var series = [];
-  if(nSeg > 1) for(var k=0; k<nSeg; k++) series.push({color: first[k][0], v: function(k){
-    return function(b){ var s = segsOf(b); return s.tot > 0 ? opts.height(b) * s.segs[k][1] / s.tot : 0; };
+  if(nSeg > 1) for(var k=0; k<nSeg; k++) if(!off[k]) series.push({color: first[k][0], v: function(k){
+    return function(b){ return share(b, k); };
   }(k), w: 1.75});
-  series.push({color: nSeg > 1 ? PAL.primary : first[0][0], v: opts.height, w: 2,
-    dots: bins.length <= 60});
+  if(nSeg === 1 || !off[nSeg]) series.push({color: nSeg > 1 ? PAL.primary : first[0][0],
+    v: opts.height, w: 2, dots: bins.length <= 60});
   series.forEach(function(sr){
     var d = '', started = false;
     bins.forEach(function(b, i){
@@ -1519,6 +1889,57 @@ function drawLines(svg, bins, bw, maxH, opts){
     });
     if(d) svg.appendChild(el('path',{d:d, fill:'none', stroke:sr.color, 'stroke-width':sr.w,
       'stroke-linejoin':'round'}));
+  });
+}
+// Dashed vertical marker at x value v, labelled at the top.
+function vMark(svg, x, color, label){
+  svg.appendChild(el('line',{x1:x, y1:M.t, x2:x, y2:M.t+IH, stroke:color,
+    'stroke-width':1.5, 'stroke-dasharray':'5 4'}));
+  if(!label) return;
+  var t = el('text',{x:x+4, y:M.t+10, 'text-anchor':'start', fill:color, 'font-size':11});
+  t.textContent = label; svg.appendChild(t);
+}
+
+// Horizontal bars, one row per category. items: [{label, v: [value per stacked part], tip}];
+// opts: colors (per part), names (legend; makes each part switchable), fmtV, modes (switch
+// shown top-right; the caller reads MODE[id] before building items).
+function drawCats(id, items, opts){
+  var hostEl = $(id); if(!hostEl) return;
+  var key = id;
+  if(opts.modes){ modeToggle(id, hostEl, opts.modes); key += ':' + (MODE[id] || opts.modes[0]);
+    paintMode(hostEl, MODE[id] || opts.modes[0]); }
+  // Hidden parts are remembered per mode: the parts mean different things in each.
+  var off = HIDE[key] || (HIDE[key] = {});
+  var box = $(id + '-legend');
+  if(opts.names) legend(id, opts.names, opts.colors, true, key);
+  else if(box) box.innerHTML = '';
+  var L = 160, RH = 24, w = 920, plotW = w - L - 80, h = M.t + Math.max(1, items.length)*RH + 28;
+  var svg = el('svg', {viewBox:'0 0 '+w+' '+h, width:w, height:h, role:'img'});
+  hostEl.innerHTML = ''; hostEl.appendChild(svg);
+  if(!items.length){ svg.appendChild(axisLabel(w/2, M.t+RH/2+4, 'nothing in the selection')); return; }
+  var fmtV = opts.fmtV || fmt;
+  var vis = function(it){ var t = 0; it.v.forEach(function(x, k){ if(!off[k]) t += x; }); return t; };
+  var max = Math.max.apply(null, items.map(vis).concat([1e-9]));
+  var bottom = M.t + items.length*RH;
+  for(var g=0; g<=4; g++){ var x = L + plotW*g/4;
+    svg.appendChild(el('line',{x1:x, y1:M.t, x2:x, y2:bottom, stroke:PAL.grid, 'stroke-width':1}));
+    svg.appendChild(tickText(x, bottom+16, 'middle', fmtV(max*g/4))); }
+  items.forEach(function(it, i){
+    var y = M.t + i*RH, x = L;
+    var lab = it.label.length > 24 ? it.label.slice(0, 23) + '…' : it.label;
+    var t = el('text',{x:L-8, y:y+RH/2+4, 'text-anchor':'end', fill:PAL.secondary, 'font-size':12});
+    t.textContent = lab; svg.appendChild(t);
+    it.v.forEach(function(v, k){
+      if(off[k] || !(v > 0)) return;
+      var bw = plotW*v/max;
+      svg.appendChild(el('rect',{x:x, y:y+4, width:bw, height:RH-8, fill:opts.colors[k]}));
+      x += bw;
+    });
+    svg.appendChild(tickText(x+6, y+RH/2+4, 'start', fmtV(vis(it))));
+    var hit = el('rect',{x:0, y:y, width:w, height:RH, fill:'transparent'});
+    hit.addEventListener('mousemove', function(e){ showTip(it.tip || ('<b>'+it.label+'</b>'), e); });
+    hit.addEventListener('mouseleave', hideTip);
+    svg.appendChild(hit);
   });
 }
 
@@ -1539,7 +1960,9 @@ function drawScatter(log){
   svg.appendChild(axisLine());
   for(var g2=0; g2<=4; g2++){
     svg.appendChild(tickText(M.l + IW*g2/4, M.t+IH+16, 'middle', fmt(xMax*g2/4))); }
-  pts.forEach(function(p){
+  var off = HIDE.scatter || (HIDE.scatter = {});
+  legend('scatter', ['responses', 'slot avg'], [PAL.series, PAL.s2]);
+  if(!off[0]) pts.forEach(function(p){
     var c = el('circle',{cx:sx(p[0]), cy:sy(p[1]), r:3.5, fill:PAL.series, 'fill-opacity':0.55});
     c.addEventListener('mousemove', function(e){
       showTip('<b>'+fmt(p[0])+'</b> tok in+out<br><b>'+fmtMs(p[1])+'</b> response', e); });
@@ -1557,6 +1980,7 @@ function drawScatter(log){
     d += (started?' L':'M') + cx.toFixed(1) + ' ' + cy.toFixed(1); started = true;
     dots.push([cx, cy, av, sc[s2]]);
   }
+  if(off[1]) d = '', dots = [];
   if(d) svg.appendChild(el('path',{d:d, fill:'none', stroke:PAL.s2, 'stroke-width':2}));
   dots.forEach(function(pt){
     var c = el('circle',{cx:pt[0], cy:pt[1], r:4, fill:PAL.s2});
@@ -1607,6 +2031,7 @@ function render(){
   var log = logOn;
   VIEW = $('outToggle').checked ? VIEWS.drop : VIEWS.keep;
   refreshSel();
+  RAWMEMO = {};
   var T = sumTotals();
   var mean = {cr: T.n?T.cr/T.n:0, cw: T.n?T.cw/T.n:0, dec: T.n?T.dec/T.n:0,
     resp: T.respN?T.respSum/T.respN:0, cwG: T.n?T.cwG/T.n:0, cwE: T.n?T.cwE/T.n:0};
@@ -1614,11 +2039,12 @@ function render(){
   mean.cPre = T.comp ? T.cPre/T.comp : 0;
   mean.cPost = T.comp ? T.cPost/T.comp : 0;
   var sec = log ? VIEW.log : VIEW.lin;
-  var bins = sumSection(sec);
+  var bins = sumSection(sec, 'prompt');
   var promptX = 'total prompt tokens';
 
   // Session-level charts first: they frame everything below them.
-  var tb = sumSection(log ? VIEW.turnsLog : VIEW.turns);
+  size(450, 220);
+  var tb = sumSection(log ? VIEW.turnsLog : VIEW.turns, 'turns');
   drawBins('sess-turns', tb, log, {
     height: function(b){ return b.c[0]; },
     segs: function(b){ return [[PAL.series, 1]]; },
@@ -1630,7 +2056,7 @@ function render(){
     tip: function(b){ return '<b>'+Math.round(b.lo)+'</b>–<b>'+Math.round(b.hi)+'</b> turns<br><b>'+
       b.c[0]+'</b> sessions'; }
   });
-  var db = sumSection(log ? VIEW.durLog : VIEW.dur);
+  var db = sumSection(log ? VIEW.durLog : VIEW.dur, 'dur');
   drawBins('sess-dur', db, log, {
     height: function(b){ return b.c[0]; },
     segs: function(b){ return [[PAL.s3, 1]]; },
@@ -1640,9 +2066,10 @@ function render(){
     tip: function(b){ return '<b>'+fmtDur(b.lo)+'</b>–<b>'+fmtDur(b.hi)+'</b><br><b>'+
       b.c[0]+'</b> sessions'; }
   });
+  size(920, 260);
 
   // Compaction: count by the context size that triggered it, and what it left behind.
-  var cb = sumSection(log ? VIEW.compLog : VIEW.comp);
+  var cb = sumSection(log ? VIEW.compLog : VIEW.comp, 'comp');
   var compX = 'context tokens when compaction was issued';
   drawBins('comp-count', cb, log, {
     height: function(b){ return b.c[0]; },
@@ -1661,7 +2088,10 @@ function render(){
   drawBins('comp-post', cb, log, {
     height: function(b){ return b.c[0] ? b.c[1]/b.c[0] : 0; },
     segs: function(b){ return [[PAL.s1, b.c[2]], [PAL.s2, Math.max(0, b.c[1]-b.c[2])]]; },
-    xlabel: compX, mean: mean.cPost, meanLabel: 'avg result ' + fmt(mean.cPost),
+    names: ['kept: <b>'+fmt(mean.cPost)+'</b> avg',
+      'dropped: <b>'+fmt(Math.max(0, mean.cPre-mean.cPost))+'</b> avg ('+pct(T.cPre-T.cPost, T.cPre)+')',
+      'at trigger: <b>'+fmt(mean.cPre)+'</b> avg'],
+    xlabel: compX, mean: mean.cPost, meanOf: 0, meanLabel: 'avg result ' + fmt(mean.cPost),
     tip: function(b){
       var n = b.c[0] || 1;
       return '<b>'+fmt(b.lo)+'</b>–<b>'+fmt(b.hi)+'</b> tok<br><b>'+fmt(b.c[1]/n)+
@@ -1669,10 +2099,6 @@ function render(){
         ' kept)<br>'+b.c[0]+' compactions';
     }
   });
-  $('comp-post-legend').innerHTML =
-    '<span><i class="sw1"></i>kept: <b>'+fmt(mean.cPost)+'</b> avg</span>'+
-    '<span><i class="sw2"></i>dropped: <b>'+fmt(Math.max(0, mean.cPre-mean.cPost))+'</b> avg ('+
-    pct(T.cPre-T.cPost, T.cPre)+')</span>';
   $('comp-note').textContent = T.comp
     ? ' · ' + T.comp + ' compaction' + (T.comp===1?'':'s') +
       (T.cInf ? ', ' + T.cInf + ' inferred from a context drop (no explicit record)' : '')
@@ -1681,6 +2107,8 @@ function render(){
   drawBins('stack-count', bins, log, {
     height: function(b){ return b.c[0]; },
     segs: function(b){ return [[PAL.s1, b.c[1]], [PAL.s2, b.c[2]], [PAL.s3, b.c[3]]]; },
+    names: ['Cache Read: <b>'+fmt(mean.cr)+'</b>', 'Cache Write: <b>'+fmt(mean.cw)+'</b>',
+      'Decode: <b>'+fmt(mean.dec)+'</b>', 'Prompt Size: <b>'+fmt(mean.total)+'</b>'],
     fmtY: function(v){ return String(Math.round(v)); },
     zeros: true,
     xlabel: promptX,
@@ -1693,24 +2121,17 @@ function render(){
     // Mark the AVERAGE prompt composition on the token (x) axis: cumulative cache read,
     // +cache write, +decode — the last is the average total prompt size. Vertical because
     // these are token values, which is what x measures. Values are shown in the legend.
-    marks: function(svg, bs, bw){
-      [[mean.cr, PAL.s1], [mean.cr+mean.cw, PAL.s2], [mean.total, PAL.s3]].forEach(function(m){
-        if(!(m[0] > 0)) return;
-        var x = binX(bs, log, m[0], bw);
-        svg.appendChild(el('line',{x1:x, y1:M.t, x2:x, y2:M.t+IH, stroke:m[1],
-          'stroke-width':1.5, 'stroke-dasharray':'5 4'}));
+    marks: function(svg, bs, bw, maxH, off){
+      [[mean.cr, PAL.s1], [mean.cr+mean.cw, PAL.s2], [mean.total, PAL.s3]].forEach(function(m, k){
+        if(m[0] > 0 && !off[k]) vMark(svg, binX(bs, log, m[0], bw), m[1]);
       });
     }
   });
-  $('stack-count-legend').innerHTML =
-    '<span><i class="sw0"></i>Prompt Size: <b>'+fmt(mean.total)+'</b></span>'+
-    '<span><i class="sw1"></i>Cache Read: <b>'+fmt(mean.cr)+'</b></span>'+
-    '<span><i class="sw2"></i>Cache Write: <b>'+fmt(mean.cw)+'</b></span>'+
-    '<span><i class="sw3"></i>Decode: <b>'+fmt(mean.dec)+'</b></span>';
 
   drawBins('stack-resp', bins, log, {
     height: function(b){ return b.c[5] ? b.c[4]/b.c[5] : 0; },
     segs: function(b){ return [[PAL.s1, b.c[1]], [PAL.s2, b.c[2]], [PAL.s3, b.c[3]]]; },
+    names: ['cache read', 'cache write', 'decode', 'response time'],
     fmtY: fmtMs, xlabel: promptX, mean: mean.resp, meanLabel: 'avg ' + fmtMs(mean.resp),
     tip: function(b){
       return '<b>'+fmt(b.lo)+'</b>–<b>'+fmt(b.hi)+'</b> tok<br><b>'+
@@ -1734,6 +2155,9 @@ function render(){
   drawBins('cw-split', bins, log, {
     height: function(b){ return b.c[0] ? (b.c[6]+b.c[7])/b.c[0] : 0; },
     segs: function(b){ return [[PAL.s1, b.c[6]], [PAL.s2, b.c[7]]]; },
+    names: ['growth: <b>'+fmt(mean.cwG)+'</b> avg',
+      're-write: <b>'+fmt(mean.cwE)+'</b> avg ('+pct(T.cwE, T.cwG+T.cwE)+' of cache write)',
+      'cache write: <b>'+fmt(mean.cwG + mean.cwE)+'</b> avg'],
     xlabel: promptX, mean: mean.cwG + mean.cwE,
     meanLabel: 'avg ' + fmt(mean.cwG + mean.cwE),
     tip: function(b){
@@ -1743,15 +2167,14 @@ function render(){
         '<br>re-write '+fmt(b.c[7]/n)+' ('+pct(b.c[7], all)+')';
     }
   });
-  $('cw-split-legend').innerHTML =
-    '<span><i class="sw1"></i>growth: <b>'+fmt(mean.cwG)+'</b> avg</span>'+
-    '<span><i class="sw2"></i>re-write: <b>'+fmt(mean.cwE)+'</b> avg ('+pct(T.cwE, T.cwG+T.cwE)+' of cache write)</span>';
 
-  var gaps = sumSection(VIEW.gap);
+  var gaps = sumSection(VIEW.gap, 'gap');
   drawBins('gap-cw', gaps, true, {
     height: function(b){ return b.c[0] ? b.c[1]/b.c[0] : 0; },
     segs: function(b){ return [[PAL.s1, b.c[2]], [PAL.s2, b.c[3]]]; },
+    names: ['growth', 're-write', 'cache write'],
     xlabel: 'gap since previous request', fmtX: fmtDur,
+    marks: ttlMarks,
     tip: function(b){
       var n = b.c[0] || 1, all = b.c[2]+b.c[3];
       return 'gap <b>'+fmtDur(b.lo)+'</b>–<b>'+fmtDur(b.hi)+'</b><br><b>'+fmt(b.c[1]/n)+
@@ -1761,8 +2184,189 @@ function render(){
 
   drawScatter(log);
   drawHour(log);
+  drawCost(T, bins, gaps, log);
+  drawTools(log);
 
   tiles(T);
+}
+
+// ── Cost ────────────────────────────────────────────────────────────────────
+// Every cost is µ$ in five parts: uncached input, cache read, cache write that is growth,
+// cache write that is re-write, decode. Unpriced responses (Codex, local) carry zeros.
+var PARTS = ['input', 'cache read', 'write: growth', 'write: re-write', 'decode'];
+function partColors(){ return [PAL.s4, PAL.s1, PAL.s5, PAL.s2, PAL.s3]; }
+function sum5(c, o){ return c[o]+c[o+1]+c[o+2]+c[o+3]+c[o+4]; }
+function partSegs(c, o){ var col = partColors();
+  return [0,1,2,3,4].map(function(k){ return [col[k], c[o+k]]; }); }
+function partTip(c, o, n){
+  var all = sum5(c, o) || 1;
+  return PARTS.map(function(p, k){ return p+' '+fmtUsd(c[o+k]/(n||1))+' ('+pct(c[o+k], all)+')'; }).join('<br>');
+}
+function partNames(tot, n){
+  var all = sum5(tot, 0);
+  return PARTS.map(function(p, k){ return p+': <b>'+fmtUsd(tot[k]/(n||1))+'</b> ('+pct(tot[k], all)+')'; });
+}
+function drawCost(T, bins, gaps, log){
+  var all = sum5(T.cost, 0);
+  var apiEquiv = SEL.some(function(g){ return meta.sources[meta.groups[g][0]] === 'claude-sub' &&
+    VIEW.tot[g][17]+VIEW.tot[g][18]+VIEW.tot[g][19]+VIEW.tot[g][20]+VIEW.tot[g][21] > 0; });
+  var priced = T.n - T.unpriced;
+  $('cost-note').innerHTML = 'Anthropic list prices; Bedrock +10% (regional); cache writes 2× input on ' +
+    'the subscription (1&nbsp;h TTL), 1.25× on Bedrock (5&nbsp;min). Subscription cost is ' +
+    '<b>API-equivalent</b> — what the same traffic would cost on the API.' +
+    (T.unpriced ? ' ' + fmt(T.unpriced) + ' responses (Codex, local) are unpriced and left out.' : '');
+  var t = [[(apiEquiv ? 'cost (API-equiv)' : 'cost'), fmtUsd(all)],
+    ['per session', T.sessions ? fmtUsd(all/T.sessions) : '—'],
+    ['per response', priced ? fmtUsd(all/priced) : '—'],
+    ['cache re-write', pct(T.cost[3], all) + ' of cost'],
+    ['cache read', pct(T.cost[1], all) + ' of cost']];
+  $('cost-tiles').innerHTML = t.map(function(kv){
+    return '<div class="tile"><div class="v">'+kv[1]+'</div><div class="k">'+kv[0]+'</div></div>'; }).join('');
+
+  // Trim to the days the selection has; the edges span every source's days.
+  var db = sumSection(VIEW.day), d0 = 0, d1 = db.length;
+  while(d0 < d1 && !db[d0].c[0]) d0++;
+  while(d1 > d0 && !db[d1-1].c[0]) d1--;
+  var dbs = db.slice(d0, d1); dbs.f = 1;
+  drawBins('cost-day', dbs, false, {
+    height: function(b){ return sum5(b.c, 1); },
+    segs: function(b){ return partSegs(b.c, 1); },
+    names: partNames(T.cost, 1).concat(['total: <b>'+fmtUsd(all)+'</b>']),
+    fmtY: fmtUsd, fmtX: fmtDay, zeros: true, xlabel: 'day (UTC)',
+    tip: function(b){ return '<b>'+fmtDay(b.lo)+'</b><br><b>'+fmtUsd(sum5(b.c, 1))+'</b> · '+b.c[0]+
+      ' resp<br>'+partTip(b.c, 1, 1); }
+  });
+  drawBins('cost-prompt', bins, log, {
+    height: function(b){ return b.c[0] ? sum5(b.c, 9)/b.c[0] : 0; },
+    segs: function(b){ return partSegs(b.c, 9); },
+    names: partNames(T.cost, priced).concat(['avg: <b>'+fmtUsd(priced ? all/priced : 0)+'</b> per response']),
+    fmtY: fmtUsd, xlabel: 'total prompt tokens',
+    mean: priced ? all/priced : null, meanLabel: 'avg ' + fmtUsd(priced ? all/priced : 0),
+    tip: function(b){ return '<b>'+fmt(b.lo)+'</b>–<b>'+fmt(b.hi)+'</b> tok<br><b>'+
+      fmtUsd(b.c[0] ? sum5(b.c, 9)/b.c[0] : 0)+'</b> avg · '+b.c[0]+' resp<br>'+partTip(b.c, 9, b.c[0]); }
+  });
+  drawBins('cost-gap', gaps, true, {
+    height: function(b){ return b.c[0] ? sum5(b.c, 6)/b.c[0] : 0; },
+    segs: function(b){ return partSegs(b.c, 6); },
+    names: partNames(T.cost, priced).concat(['avg per response']),
+    fmtY: fmtUsd, fmtX: fmtDur, xlabel: 'gap since previous request',
+    marks: ttlMarks,
+    tip: function(b){ return 'gap <b>'+fmtDur(b.lo)+'</b>–<b>'+fmtDur(b.hi)+'</b><br><b>'+
+      fmtUsd(b.c[0] ? sum5(b.c, 6)/b.c[0] : 0)+'</b> avg · '+b.c[0]+' resp<br>'+partTip(b.c, 6, b.c[0]); }
+  });
+
+  // By model: $ or tokens, summed from the per-group totals.
+  var usd = (MODE['cost-model'] || '$') === '$';
+  var by = {};
+  SEL.forEach(function(g){
+    var m = meta.models[meta.groups[g][1]], a = VIEW.tot[g];
+    var v = usd ? [a[17], a[18], a[19], a[20], a[21]] : [a[16], a[1], a[6], a[7], a[3]];
+    var e = by[m] || (by[m] = {v:[0,0,0,0,0], n:0});
+    for(var k=0; k<5; k++) e.v[k] += v[k];
+    e.n += a[0];
+  });
+  var f = usd ? fmtUsd : fmt;
+  var items = Object.keys(by).map(function(m){ return {label:m, v:by[m].v, n:by[m].n}; })
+    .filter(function(it){ return sum5(it.v, 0) > 0; })
+    .sort(function(a, b){ return sum5(b.v, 0) - sum5(a.v, 0); });
+  items.forEach(function(it){
+    var tot = sum5(it.v, 0) || 1;
+    it.tip = '<b>'+it.label+'</b> · '+fmt(it.n)+' resp<br><b>'+f(tot)+'</b>'+(usd ? ' · '+fmtUsd(tot/(it.n||1))+'/resp' : ' tok')+
+      '<br>'+PARTS.map(function(p, k){ return p+' '+f(it.v[k])+' ('+pct(it.v[k], tot)+')'; }).join('<br>');
+  });
+  drawCats('cost-model', items, {modes:['$', 'tokens'], colors: partColors(), names: PARTS, fmtV: f});
+}
+// Cache TTL markers for an idle-gap axis; the bars' edges are cut at these (cutLogEdges).
+function ttlMarks(svg, bs, bw){
+  [[300000, '5m · Bedrock TTL'], [3600000, '1h · subscription TTL']].forEach(function(m){
+    if(m[0] > bs[0].lo && m[0] < bs[bs.length-1].hi) vMark(svg, binX(bs, true, m[0], bw), PAL.secondary, m[1]);
+  });
+}
+
+// ── Tools vs user input ─────────────────────────────────────────────────────
+var TRIGS = ['user prompt', 'tool result', 'other'];
+// Run lengths and message sizes are heavy-tailed enough that linear bins show one spike, so
+// these two always bin log (as the idle-gap charts do).
+function drawTools(log){
+  var rb = sumSection(VIEW.runsLog, 'runs');
+  var nr = 0;
+  rb.forEach(function(b){ nr += b.c[0]; });
+  drawBins('tool-runs', rb, true, {
+    height: function(b){ return b.c[0]; },
+    fmtY: fmt,
+    fmtX: function(v){ return String(Math.round(v)); },
+    zeros: true, xlabel: 'model requests per user prompt',
+    tip: function(b){ return '<b>'+Math.round(b.lo)+'</b>–<b>'+Math.round(b.hi)+'</b> requests<br><b>'+
+      b.c[0]+'</b> prompts'+(b.c[0] ? '<br>avg '+fmtDur(b.c[1]/b.c[0])+' to the last one' : ''); }
+  });
+  $('runs-note').textContent = nr ? ' · ' + fmt(nr) + ' prompts' : ' · none found';
+
+  var ib = sumSection(VIEW.inpLog, 'inp');
+  var it = [0, 0, 0, 0];
+  ib.forEach(function(b){ for(var k=0; k<4; k++) it[k] += b.c[k]; });
+  drawBins('inp-size', ib, true, {
+    height: function(b){ return b.c[0] + b.c[2]; },
+    segs: function(b){ return [[PAL.s1, b.c[0]], [PAL.s2, b.c[2]]]; },
+    names: ['user prompts: <b>'+fmt(it[0])+'</b>, avg '+fmt(it[0] ? it[1]/it[0] : 0)+' tok',
+      'tool results: <b>'+fmt(it[2])+'</b>, avg '+fmt(it[2] ? it[3]/it[2] : 0)+' tok',
+      'all'],
+    fmtY: fmt, zeros: true,
+    xlabel: 'message tokens (mostly estimated)',
+    tip: function(b){ return '<b>'+fmt(b.lo)+'</b>–<b>'+fmt(b.hi)+'</b> tok<br>user prompts <b>'+b.c[0]+
+      '</b><br>tool results <b>'+b.c[2]+'</b>'; }
+  });
+
+  var mode = MODE['tool-mix'] || 'calls';
+  var tb = sumSection(VIEW.tool), items = [];
+  tb.forEach(function(b, i){
+    var c = b.c; if(!c[0] || i >= meta.tools.length) return;
+    var v = mode === 'calls' ? [c[0]] : mode === 'tokens' ? [c[2], c[1]] : [c[4] ? c[3]/c[4] : 0];
+    items.push({label: meta.tools[i], v: v, tip: '<b>'+meta.tools[i]+'</b><br><b>'+fmt(c[0])+'</b> calls'+
+      '<br>result '+fmt(c[2])+' tok (avg '+fmt(c[2]/c[0])+')<br>call '+fmt(c[1])+' tok'+
+      (c[4] ? '<br>avg '+fmtMs(c[3]/c[4])+' call→result' : '')});
+  });
+  items.sort(function(a, b){ return b.v.reduce(function(x, y){ return x+y; }, 0) - a.v.reduce(function(x, y){ return x+y; }, 0); });
+  drawCats('tool-mix', items, {modes:['calls', 'tokens', 'time'],
+    colors: mode === 'tokens' ? [PAL.s2, PAL.s1] : [PAL.series],
+    names: mode === 'tokens' ? ['result tokens', 'call tokens'] : null,
+    fmtV: mode === 'time' ? fmtMs : fmt});
+
+  // Shares of each session's wall clock, by session length: absolute time would just trace the
+  // diagonal. The 100% total line is off until asked for. Coarse bins even in line mode: a
+  // share needs a few sessions behind it, and there are few sessions.
+  var wb = coarsen(sumSection(VIEW.durLog));
+  var wt = [0, 0, 0, 0];
+  wb.forEach(function(b){ for(var k=0; k<4; k++) wt[k] += b.c[k]; });
+  var wall = wt[1] + wt[2] + wt[3];
+  if(!HIDE.wall) HIDE.wall = {3: true};
+  drawBins('wall', wb, true, {
+    height: function(b){ return b.c[1]+b.c[2]+b.c[3] > 0 ? 1 : 0; },
+    segs: function(b){ return [[PAL.s1, b.c[1]], [PAL.s2, b.c[2]], [PAL.s3, b.c[3]]]; },
+    names: ['model: <b>'+pct(wt[1], wall)+'</b>', 'tools: <b>'+pct(wt[2], wall)+'</b>',
+      'user / idle: <b>'+pct(wt[3], wall)+'</b>', 'all (avg session <b>'+fmtDur(wt[0] ? wall/wt[0] : 0)+'</b>)'],
+    fmtY: function(v){ return Math.round(v*100)+'%'; }, fmtX: fmtDur, xlabel: 'session duration',
+    tip: function(b){ var n = b.c[0] || 1, a = b.c[1]+b.c[2]+b.c[3];
+      return '<b>'+fmtDur(b.lo)+'</b>–<b>'+fmtDur(b.hi)+'</b> · '+b.c[0]+' sessions<br>model '+
+        fmtDur(b.c[1]/n)+' ('+pct(b.c[1], a)+')<br>tools '+fmtDur(b.c[2]/n)+' ('+pct(b.c[2], a)+
+        ')<br>user / idle '+fmtDur(b.c[3]/n)+' ('+pct(b.c[3], a)+')'; }
+  });
+
+  // trig cell: [n, cwGrowth, cwExpiry, respSum, respN, costSum, costN]
+  var tm = MODE['trig'] || 'requests';
+  var gb = sumSection(VIEW.trig), ti = [];
+  gb.forEach(function(b, i){
+    var c = b.c, n = c[0]; if(!n || i > 2) return;
+    var v = tm === 'requests' ? [n] : tm === 'cache write' ? [c[1]/n, c[2]/n]
+      : tm === 'response' ? [c[4] ? c[3]/c[4] : 0] : [c[6] ? c[5]/c[6] : 0];
+    ti.push({label: TRIGS[i], v: v, tip: '<b>'+TRIGS[i]+'</b> · '+fmt(n)+' requests<br>cache write avg '+
+      fmt((c[1]+c[2])/n)+' ('+pct(c[2], c[1]+c[2])+' re-write)'+
+      (c[4] ? '<br>avg '+fmtMs(c[3]/c[4])+' response' : '')+(c[6] ? '<br>avg '+fmtUsd(c[5]/c[6])+' per request' : '')});
+  });
+  if(tm !== 'requests') ti = ti.filter(function(it){ return it.v.some(function(x){ return x > 0; }); });
+  drawCats('trig', ti, {modes:['requests', 'cache write', 'response', 'cost'],
+    colors: tm === 'cache write' ? [PAL.s1, PAL.s2] : [PAL.series],
+    names: tm === 'cache write' ? ['growth', 're-write'] : null,
+    fmtV: tm === 'response' ? fmtMs : tm === 'cost' ? fmtUsd : fmt});
 }
 
 function tiles(T){
@@ -1889,6 +2493,7 @@ $('foot').textContent = 'Sources and models are auto-detected per response. Cach
 $('outToggle').checked = true;   // outliers off by default: 0-size and idle-gap artifacts
 $('outToggle').addEventListener('change', render);
 render();
+}
 })();
 </script>`;
 }
@@ -1940,4 +2545,5 @@ if (require.main === module) {
   main().catch(e => { console.error(`ccstats: ${e.message}`); process.exitCode = 1; });
 }
 
-module.exports = { runSkel, runStats, buildModel, buildView, buildViews, isOutlier };
+module.exports = { runSkel, runStats, buildModel, buildView, buildViews, isOutlier, sessionShape,
+  priceOf, SECTIONS };
