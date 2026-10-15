@@ -5814,7 +5814,7 @@ function fsResolve(p) {
   if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
   return path.resolve(os.homedir(), p);
 }
-const FS_CAT_MAX = 1 << 20;
+const FS_CAT_MAX = 16 << 20;
 function fsRequest(op, raw) {
   const p = fsResolve(raw);
   let st; try { st = fs.statSync(p); } catch (e) {
