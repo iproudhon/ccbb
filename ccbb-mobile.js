@@ -347,8 +347,7 @@ body.has-max .panel:not(.max){display:none}
 /* ── session panel ── */
 .subhead{flex:0 0 auto;padding:6px 12px 7px;background:var(--bg-alt);border-bottom:1px solid var(--line);
   font-size:11.5px;color:var(--ink-soft);display:flex;flex-direction:column;gap:3px}
-.subhead .sdir{color:var(--ink-soft)}
-.subhead .swhen{color:var(--ink-faint)}
+.subhead .si-host{max-height:50vh;overflow:auto}
 /* The status line lives at the foot now, where the desktop puts it and where a status
    line belongs — it was the third line of a header block that is itself folded away most
    of the time. It is the list footer's twin, .foot and all: same pills, same type, so the
@@ -366,20 +365,21 @@ body.has-max .panel:not(.max){display:none}
 .sfoot .tot{gap:5px}
 .sfoot .fwin{padding-left:5px;padding-right:5px;gap:3px}
 .sfoot .fwin em{font-size:8.5px}
-.sfoot .fsub{color:var(--ink)}
+.sfoot .sl-cost{flex:0 0 auto;color:var(--ink);font-weight:400}
 /* Turns without the word: a bare count next to the money reads as a count, and "turns:"
    was four characters the line could not spare. Sub-agent turns are the same number in
    miniature, the way the pills wear their percentages. */
-.sfoot .fturns b{color:var(--ink);font-weight:600}
-.sfoot .fturns em{font-style:normal;font-size:9px;color:var(--ink-soft)}
+.sfoot .sl-turns{flex:0 0 auto}
+.sfoot .sl-turns b{color:var(--ink);font-weight:600}
+.sfoot .sl-sub{font-size:9px;color:var(--ink-soft)}
 
 /* Half a point under the rest of the line. A monospace face reads a size larger than the
    sans beside it anyway, and this is the field that was still one character too wide at
    375pt with both windows counting down and the cache gone cold — the worst case the line
    has, and the one it has to survive. */
-.sfoot .fctx{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+.sfoot .sl-ctx{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
   font-family:ui-monospace,Menlo,monospace;font-size:10.5px}
-.sl-cold{color:var(--warn)}
+.sfoot .sl-ctx b{font-weight:400;color:var(--ink)}
 .transcript{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
   padding:10px 12px 4px;overflow-anchor:none}
 .msg{margin-bottom:14px}
@@ -1164,7 +1164,7 @@ function headButtons(specs, menu){
 function panelMenu(root, head, menuFn){
   var pop = null, sub = root.querySelector('.subhead');
   nsWatchWidth(root, head);
-  function onOutside(e){ if (!head.contains(e.target) && !(pop && pop.contains(e.target))) fold(); }
+  function onOutside(e){ if (!head.contains(e.target) && !(sub && sub.contains(e.target))) fold(); }
   function fold(){
     if (!root.classList.contains('menu')) return;
     root.classList.remove('menu');
@@ -1669,10 +1669,7 @@ function createMuxPanel(sid, server, snapshot){
   root.appendChild(head);
 
   var body = el('div','pbody',
-    '<div class="subhead">'+
-      '<div class="sdir" data-r="dir"></div>'+
-      '<div class="swhen" data-r="when"></div>'+
-    '</div>');
+    '<div class="subhead"><div class="si-host" data-r="info"></div></div>');
   root.appendChild(body);
   var host = el('div');
   body.appendChild(host);
@@ -1698,8 +1695,9 @@ function createMuxPanel(sid, server, snapshot){
     input.addEventListener('blur', function(){finish(true);});
     input.addEventListener('keydown', function(e){if(e.key==='Enter'){e.preventDefault();finish(true);}else if(e.key==='Escape')finish(false);});
   });
-  var dirEl = body.querySelector('[data-r="dir"]');
-  var whenEl = body.querySelector('[data-r="when"]');
+  var infoEl = body.querySelector('[data-r="info"]');
+  siWire(infoEl);
+  infoEl.innerHTML = siGridHtml({ cwd: (snapshot && snapshot.state && snapshot.state.cwd) || '', sessionId: sid });
 
   var resumeButton = snapshot ? muxStartButton(head, sid, server, 'codex', function(){removePanel(p);}) : null;
   var lastCwd = (snapshot && snapshot.state && snapshot.state.cwd) || '';
@@ -1714,18 +1712,13 @@ function createMuxPanel(sid, server, snapshot){
     onChrome: function(c){
       lastCwd = c.cwd || lastCwd;
       titleEl.textContent = c.title || shortSessionId(sid);
-      dirEl.textContent = ltr(c.cwd || '');
       // 'exited' is the case the desktop used to miss too: the child is gone but the
       // socket is not, and "connected" alone painted a finished session green.
       var alive = c.live;
       if (resumeButton) resumeButton.hidden = alive;
       dotEl.innerHTML = activityGlyph(c.info && c.info.agent, !snapshot);
       dotEl.className = 'dot' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
-      var bits = [c.connected ? (c.status || 'idle') : 'disconnected'];
-      if (c.permissionMode) bits.push('mode ' + c.permissionMode);
-      if (c.info && c.info.model) bits.push(prettyModel(c.info.model));
-      if (c.clients && c.clients.length > 1) bits.push(c.clients.length + ' controllers');
-      whenEl.textContent = bits.join('  ·  ');
+      infoEl.innerHTML = siGridHtml(siMuxModel(c, sid));
     },
   });
 
@@ -1816,10 +1809,7 @@ function createSessionPanel(sid, server){
   root.appendChild(head);
 
   var body = el('div','pbody',
-    '<div class="subhead">'+
-      '<div class="sdir" data-r="dir"></div>'+
-      '<div class="swhen" data-r="when"></div>'+
-    '</div>'+
+    '<div class="subhead"><div class="si-host" data-r="info"></div></div>'+
     '<div class="trwrap">'+
       '<div class="transcript" data-r="tr"></div>'+
       '<button class="jump" data-r="jump">&#8595; new</button>'+
@@ -1847,8 +1837,8 @@ function createSessionPanel(sid, server){
 
   var dotEl = head.querySelector('[data-r="dot"]');
   var titleEl = head.querySelector('[data-r="title"]');
-  var dirEl = body.querySelector('[data-r="dir"]');
-  var whenEl = body.querySelector('[data-r="when"]');
+  var infoEl = body.querySelector('[data-r="info"]');
+  siWire(infoEl);
   var slineEl = body.querySelector('[data-r="sline"]');
   var transcript = body.querySelector('[data-r="tr"]');
   var jumpEl = body.querySelector('[data-r="jump"]');
@@ -1883,73 +1873,45 @@ function createSessionPanel(sid, server){
   // — header —
   function renderHead(){
     titleEl.textContent = (INFO && INFO.title) || '(untitled)';
-    dirEl.textContent = ltr((INFO && INFO.projectPath) || '');
     var live = INFO && INFO.live;
     if (resumeButton) resumeButton.hidden = !INFO || !!live;
     dotEl.className = 'dot' + (live ? (INFO.liveStatus === 'idle' ? ' idle' : ' live') : '');
     renderWhen();
   }
+  // The info grid behind ⋮, the desktop's: binary and compact-at come from the process
+  // (INFO.proc) while it is live.
   function renderWhen(){
-    if (!STATS) { whenEl.textContent = ''; return; }
-    var bits = ['last ' + rel(STATS.lastActivity)];
-    if (INFO && INFO.live && INFO.liveStatus === 'idle' && INFO.liveStatusAt)
-      bits.push('waiting ' + rel(INFO.liveStatusAt).replace(' ago',''));
-    else if (INFO && INFO.live) bits.push('working');
-    whenEl.textContent = bits.join('  ·  ');
+    var pr = INFO && INFO.proc, status = '';
+    if (INFO && !INFO.live) status = 'not running';
+    else if (INFO && INFO.liveStatus === 'idle')
+      status = '<b>idle</b>' + (INFO.liveStatusAt ? ' &middot; waiting ' + esc(rel(INFO.liveStatusAt).replace(' ago','')) : '');
+    else if (INFO) status = '<b>working</b>';
+    infoEl.innerHTML = siGridHtml({
+      cwd: INFO && INFO.projectPath, sessionId: sid,
+      bin: pr && pr.bin, binNote: pr && pr.via, model: pr && pr.model, compactAt: pr ? pr.compactAt : null,
+      status: status, st: STATS, sub: siOnPlan(STATS, SUB),
+    });
   }
   // This session's server, when it is on a Claude.ai plan.
   var SUB = null;
-  function onPlan(){
-    if (!SUB || !SUB.windows || !STATS) return false;
-    // A Bedrock or API-key session on a machine that also has a login is not billed to
-    // that plan, so the plan's windows say nothing about this session.
-    return (STATS.providers||[]).some(function(x){ return x.provider === 'anthropic' && x.cost > 0; });
-  }
   function loadSub(){
     // No ?cost=1: this panel wants the windows, not a whole-history cost pass.
     return api('/api/subscription').then(function(r){ return r.json(); }).then(function(d){
       if (destroyed) return;
       SUB = (d && d.account) ? d : null;
-      renderStatusLine();
+      renderStatusLine(); renderWhen();
     }).catch(function(){});
   }
-  // The status line of statusline-instructions.md, less three things. The month-to-date
-  // figure ccbb cannot know. The model and the turn count were dropped on purpose: the
-  // block behind ⋮ names the one and the transcript above is the other, and what is left
-  // is the part nothing else on the screen says — spend, the plan windows it is drawn
-  // from, and the context that prices the next resend. No session status here either;
-  // the dot in the title bar has carried that all along.
-  // The cost is ccbb's own list-price estimate rather than Claude Code's reported spend —
-  // on a plan the windows beside it are the real limit anyway.
+  // The status line, the desktop's (siFootHtml): cost, plan windows, turns, ctx now/peak/
+  // resend. The resend price turns to cache-write, in orange, once the cache has expired.
   function renderStatusLine(){
     var foot = slineEl.parentNode;
     foot.classList.toggle('empty', !STATS);
     if (!STATS) { slineEl.innerHTML = ''; return; }
-    var st = STATS;
-    var model = (st.context && st.context.model) || (st.models && st.models[0] && st.models[0].model) || '';
-    // The context carries the provider of the turn that set it; before any turn is seen, fall
-    // back to the session's dominant provider so a Bedrock session isn't priced as first-party.
-    var prov = (st.context && st.context.provider) || (st.providers && st.providers[0] && st.providers[0].provider) || '';
-    var pr = priceFor(model, prov) || { cacheRead:0, cacheWrite5m:0, cacheWrite1h:0 };
-    var ctx = st.context ? (st.context.tokens||0) : 0;
-    var peak = Math.max(ctx, st.contextMax ? (st.contextMax.tokens||0) : 0);
-    var read = ctx * (pr.cacheRead||0) / 1e6;
-    var ttl = st.cacheTtl || 300;
-    var lastA = st.lastAssistantAt ? Date.parse(st.lastAssistantAt) : NaN;
-    var cold = !isNaN(lastA) && (Date.now() - lastA) > ttl * 1000;
-    var write = ctx * ((ttl >= 3600 ? pr.cacheWrite1h : pr.cacheWrite5m) || 0) / 1e6;
-    // No middot separators, unlike the list's footer: a filled pill is already its own
-    // object, and the two dots cost more width than the ctx figure had to spare at 375pt.
-    var turns = st.turns || 0, subTurns = st.subTurns || 0;
-    var html = '<span class="fsub">' + fmtCost(st.cost) + '</span>';
-    if (onPlan()) html += subFootHtml(SUB, true);
-    html += '<span class="fturns"><b>' + turns + '</b>' +
-      (subTurns ? '<em>+' + subTurns + '</em>' : '') + '</span>';
-    html += '<span class="fctx">ctx:' + fmtK(ctx) + '/' + fmtK(peak) +
-      '/' + fmtCost(read) + (cold && ctx ? '<span class="sl-cold">-&gt;' + fmtCost(write) + '</span>' : '') +
-      '</span>';
-    slineEl.innerHTML = html;
+    var m = { st: STATS, sub: siOnPlan(STATS, SUB) };
+    fitFoot(slineEl, function(lvl){ slineEl.innerHTML = siFootHtml(m, lvl); });
   }
+  onFootResize(slineEl, function(){ if (STATS) renderStatusLine(); });
   // Wall-clock, not data: the cache goes cold with nothing written anywhere, so nothing
   // but a timer can notice. 10s, the same cadence the status-line spec asks of the shell.
   var tick = setInterval(function(){

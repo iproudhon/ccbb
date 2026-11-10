@@ -274,7 +274,6 @@ function fmtTokShort(n){ n=n||0; if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+'M
 function fmtCost(c){ return '$'+(c||0).toFixed(2); }
 function fmtDur(ms){ if(ms==null||!isFinite(ms)||ms<0)return ''; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return (s<10?s.toFixed(1):String(Math.round(s)))+'s'; var m=Math.floor(s/60); if(m<60)return m+'m '+Math.round(s%60)+'s'; var h=Math.floor(m/60); if(h<24)return h+'h '+(m%60)+'m'; return Math.floor(h/24)+'d '+(h%24)+'h'; }
 function fmtPct(part,whole){ return (whole>0?(100*part/whole):0).toFixed(1)+'%'; }
-function fmtStatDate(iso){ return fd(iso); }
 // Agent marks from @lobehub/icons-static-svg (MIT); activity color stays on the circle.
 var OPENAI_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"></path></svg>';
 var CLAUDE_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"></path></svg>';
@@ -697,12 +696,12 @@ const MUX_BORROWED = [
   'tool-time', 'tool-toggle', 'tool-gap',
   'input-area', 'input-inner', 'input-tools', 'input-row', 'input-box',
   'send-btn', 'stop-btn', 'hist-btn', 'exp-btn',
-  'sv-foot', 'sl', 'sl-ctx', 'sl-sub', 'sl-note', 'fwins', 'fwin', 'subturns',
+  'sv-foot', 'sl', 'sl-cost', 'sl-turns', 'sl-ctx', 'sl-sub', 'sl-rs', 'fwins', 'fwin',
   'html-frame', 'flw', 'flw-head', 'flw-title', 'flw-btns', 'flw-btn', 'flw-body', 'flw-grip',
   'cmd-content',
 ];
 // A selector that only makes sense inside ccbb web's own page shell.
-const MUX_CSS_SKIP = /(^|[\s,])(\.ro|\.sv|\.view|\.view-body|\.hdr-stats|#views)(?![-\w])/;
+const MUX_CSS_SKIP = /(^|[\s,])(\.ro|\.sv|\.view|\.view-body|#views)(?![-\w])/;
 function muxHostCss() {
   const out = [];
   const want = new RegExp('\\.(' + MUX_BORROWED.join('|') + ')(?![-\\w])');
@@ -891,24 +890,12 @@ body.view-dragging,body.view-dragging *{cursor:grabbing!important;user-select:no
 .hdr-title-input{font-weight:600;font-size:13px;font-family:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:2px 6px;flex:1;min-width:0;box-shadow:0 0 0 3px var(--accent-soft)}
 .hdr-title-input:focus{outline:none}
 .sv-stats{padding:8px 12px 9px;background:var(--bg);max-height:44vh;overflow:auto}
-.hdr-proj{font-size:11px;color:var(--ink-soft);overflow-wrap:anywhere;font-variant-numeric:tabular-nums;display:block;margin-bottom:2px}
-.hdr-proj b{font-weight:600;color:var(--ink)}
-.hdr-stats{font-size:11px;color:var(--ink-faint);line-height:1.55;font-variant-numeric:tabular-nums;display:block}
-.hdr-stats b{font-weight:600;color:var(--ink-soft)}
-.hdr-stats .sub{color:var(--ink-faint)}
-/* Plan windows, hung directly off the session cost with no separator — "$1.23/5h:24%/w:41%"
-   is one figure, the way the status line reads it. */
-.hdr-stats .plan-win{color:var(--ink-soft);cursor:help}
-.subturns{font-size:0.8em;color:var(--ink-faint)}
 /* Session headers use the same activity palette and agent marks as the list. */
 .status-dot{width:14px;height:14px;border-radius:50%;background:currentColor;
   color:#57606a;flex-shrink:0}
 .status-dot.live{color:#2da44e;animation:pulse 1.6s ease-in-out infinite}
 .status-dot.idle{color:#d4a72c;animation:none}
 .status-dot svg{display:block;width:10px;height:10px;margin:2px}
-.hdr-status{display:none;font-size:11px;color:#8a6d1a;margin-top:3px;font-variant-numeric:tabular-nums}
-.hdr-status.show{display:block}
-.hdr-status b{font-weight:600}
 .query-ind{position:absolute;bottom:14px;right:16px;width:16px;height:16px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;display:none;animation:spin .7s linear infinite;pointer-events:none;z-index:5}
 .query-ind.show{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -1314,7 +1301,6 @@ body.view-dragging,body.view-dragging *{cursor:grabbing!important;user-select:no
 /* toast (replaces alert(): alerts block browser automation and yank focus) */
 #toast{position:fixed;bottom:18px;right:18px;background:#3d3d3a;color:#fff;border-radius:10px;padding:10px 16px;font-size:13px;z-index:99;display:none;max-width:420px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 /* A mux view's body: the client is a flex column that wants to fill it. */
-.hdr-sid{font-family:ui-monospace,Menlo,Consolas,monospace;user-select:all;cursor:text}
 .sv .mux-tag{font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--accent);
   border:1px solid var(--accent);border-radius:4px;padding:0 3px;flex-shrink:0}
 .mux-body>.muxv{flex:1 1 auto;min-height:0;height:auto}
@@ -1808,7 +1794,7 @@ function openSession(sid, server, mux, title, replace){
   fetch(apiBase(srv)+'/api/session-info/'+sid).then(function(r){ return r.json(); }).then(function(d){
     var info = { sessionId: sid, server: srv, title: (d&&d.title)||'', projectPath: (d&&d.projectPath)||'',
                  live: !!(d&&d.live), liveStatus: (d&&d.liveStatus)||null, liveStatusAt: (d&&d.liveStatusAt)||null,
-                 stats: (d&&d.stats)||null };
+                 stats: (d&&d.stats)||null, proc: (d&&d.proc)||null };
     // Nobody is running it, so there is no pane to show: the transcript opens in the mux
     // renderer, read-only, with ▶ to resume it there. Any failure keeps the old view.
     if (info.live) return placeView(createSessionView(info), replace);
@@ -2495,61 +2481,6 @@ function createListView(){
 // instead, so the transcript gets the space back.
 var SEND_TIP_OFF = 'Session not running in a tmux pane here — input disabled. // commands still work.';
 
-// The header block a session view opens behind its dots button: the project path and
-// when it last moved, then turns / cost / model / token split / context. Written once
-// here rather than in the view because the mux view shows the SAME block for the same
-// reason — a mux session is an ordinary Claude session with an ordinary transcript, and
-// two copies of this would be two answers to "what did it cost".
-//
-// sub is the /api/subscription payload, or null; the plan string is dropped when this
-// session's spend did not go to that plan.
-function hdrPlanWinHtml(st, sub){
-  if (!sub || !sub.windows) return '';
-  // A Bedrock or API-key session on a machine that also has a login is not billed to
-  // that plan, so its windows say nothing about this session.
-  var onPlan = (st.providers||[]).some(function(p){ return p.provider === 'anthropic' && p.cost > 0; });
-  if (!onPlan) return '';
-  var s = subWinStr(sub.windows);
-  return s ? '<span class="plan-win" title="'+esc(subWinTitle(sub))+'">'+esc(s)+'</span>' : '';
-}
-function hdrPlanPillsHtml(st, sub, lvl){
-  if (!sub || !sub.windows) return '';
-  var onPlan = (st.providers||[]).some(function(p){ return p.provider === 'anthropic' && p.cost > 0; });
-  if (!onPlan) return '';
-  var w = sub.windows, s = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
-  return s ? '<span class="fwins" title="'+esc(subWinTitle(sub))+'">'+s+'</span>' : '';
-}
-function renderHdrStats(projEl, statsEl, st, projectPath, sub, sessionId){
-  // The full session id, selectable. Every page shows the short form somewhere — the
-  // list's ID column, this page's own title when it has no name — but the id you have
-  // to paste into claude --resume or ccbb attach is the whole one, and it appeared
-  // nowhere but the URL.
-  if (projEl) projEl.innerHTML = (projectPath?'<b>'+esc(projectPath)+'</b>':'') +
-    (sessionId ? '  &middot;  <span class="hdr-sid" title="Session id">'+esc(sessionId)+'</span>' : '') +
-    (st ? '  &middot;  last '+esc(fmtStatDate(st.lastActivity))+'  &middot;  started '+esc(fmtStatDate(st.startedAt)) : '');
-  if (!st) { if (statsEl) statsEl.textContent = ''; return; }
-  if (!statsEl) return;
-  var models = (st.models||[]).filter(function(m){ return m.cost>=0.005; });
-  var modelStr = models.length>=2
-    ? ' ('+models.map(function(m){ return esc(prettyModel(m.model))+': '+fmtCost(m.cost); }).join(' · ')+')'
-    : (models.length===1?' <span class="sub">('+esc(prettyModel(models[0].model))+')</span>':'');
-  var c = st.categories||{}, totCost = st.cost||0;
-  function cat(label,key){ var x=c[key]||{tokens:0,cost:0}; return '<span class="rl-lbl">'+label+'</span> '+fmtTokShort(x.tokens)+' <span class="rl-pct">'+fmtPct(x.cost,totCost)+'</span>'; }
-  var tokStr = cat('cr','cacheRead')+'  '+cat('cw','cacheWrite')+'  '+cat('cm','cacheMiss')+'  '+cat('out','output')+'  '+cat('in','input')+
-    (fmtDur(st.avgResponseMs)?'  <span class="rl-lbl">t</span> '+fmtDur(st.avgResponseMs)+
-      (st.avgOutTps?' <span title="output tokens per second of whole response time (queue + prefill + decode), not decode speed">'+st.avgOutTps.toFixed(1)+' out/s</span>':''):'');
-  var ctx = st.context, cmax = st.contextMax;
-  var peakStr = ctx && cmax && fmtTokShort(cmax.tokens)!==fmtTokShort(ctx.tokens)
-    ? ' <span class="subturns">peak '+fmtTokShort(cmax.tokens)+'</span>' : '';
-  var ctxStr = ctx ? '  &middot;  ctx:'+(ctx.postCompact?'~':'')+'<b>'+fmtTokShort(ctx.tokens)+'</b>/'+fmtCost(ctx.cost)+peakStr+
-    (ctx.postCompact?' <span class="subturns">post-compact</span>':'') : '';
-  var turns = st.turns||0, subTurns = st.subTurns||0;
-  var subStr = subTurns>0?' <span class="subturns">+'+subTurns+'</span>':'';
-  statsEl.innerHTML = '<b>'+turns+'</b>'+subStr+' turn'+(turns===1?'':'s')+
-    '  &middot;  <b>'+fmtCost(st.cost)+'</b>'+hdrPlanWinHtml(st, sub)+modelStr+
-    '  &middot;  <b>'+fmtTokShort(st.totalTokens)+'</b>  '+tokStr+ctxStr;
-}
-
 // — a session's terminal, inside the view's own content area —
 // Shared by both session views. It was written inside createSessionView and stayed there
 // while the mux view had no pane to attach to; now that a mux session resolves to one
@@ -2720,13 +2651,12 @@ function createMuxSessionView(INFO){
   barMain.innerHTML = '<div class="status-dot mux" title="Driven over the mux protocol, not a tmux pane">'+activityGlyph(INFO.agent || (INFO.sessionId.indexOf('codex:') === 0 ? 'codex' : 'claude'), !INFO.snapshot)+'</div>'
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
     + '<div class="hdr-title">'+esc(INFO.title || shortSessionId(INFO.sessionId))+'</div>';
-  // The same header block ccbb's own session view opens behind the dots, from the same
-  // stats object — the mux computes it off the transcript, which is where ccbb reads it
-  // too. .hdr-status carries what only a mux session has: the permission mode, the model,
-  // who else is attached, and how the child exited if it did.
+  // The same info panel ccbb's own session view opens behind the dots (siGridHtml), fed
+  // from the chrome the mux client pushes: its live stats, plan windows, mode, clients.
   var headEl = document.createElement('div');
   headEl.className = 'sv-stats';
-  headEl.innerHTML = '<span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status show"></div>';
+  headEl.innerHTML = '<div class="si-host"></div>';
+  siWire(headEl);
   el.appendChild(makeViewBar(v, barMain, { close:true, term:!INFO.snapshot, resume:!!INFO.snapshot, menu:true, headEl:headEl }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
@@ -2743,9 +2673,7 @@ function createMuxSessionView(INFO){
       if (INFO.snapshot) INFO.snapshot.state.title = val;
     });
   });
-  var projEl = headEl.querySelector('.hdr-proj');
-  var statsEl = headEl.querySelector('.hdr-stats');
-  var statusRow = headEl.querySelector('.hdr-status');
+  var infoEl = headEl.querySelector('.si-host');
 
   var body = document.createElement('div');
   body.className = 'view-body mux-body';
@@ -2757,30 +2685,12 @@ function createMuxSessionView(INFO){
   // wants an element it owns outright; .terming hides this one and reveals the terminal.
   body.insertBefore(host, body.firstChild);
 
-  var subInfo = null, lastStats = null, lastChrome = null;
+  var lastChrome = null;
   function paintHead(){
-    renderHdrStats(projEl, statsEl, lastStats, (lastChrome && lastChrome.cwd) || INFO.projectPath, subInfo, INFO.sessionId);
-    var c = lastChrome;
-    if (!c) { statusRow.textContent = ''; return; }
-    var bits = [];
-    bits.push('<b>'+esc(c.connected ? (c.status || 'idle') : 'disconnected')+'</b>');
-    if (c.permissionMode) bits.push('mode '+esc(c.permissionMode));
-    if (c.info && c.info.bin && c.info.bin !== 'claude') bits.push(esc(c.info.bin));
-    if (c.info && c.info.model) bits.push(esc(prettyModel(c.info.model)));
-    if (c.info && c.info.agent === 'codex' && c.info.endpoint) bits.push('Native TUI: <code>'+esc('codex resume --remote '+c.info.endpoint+' '+c.info.nativeId)+'</code>');
-    if (c.clients && c.clients.length) bits.push(c.clients.map(function(x){
-      return esc(x.label)+' ('+esc(x.kind)+')'; }).join(', '));
-    if (c.info && c.info.exit) bits.push('exited ('+esc(String(c.info.exit.code == null ? c.info.exit.signal : c.info.exit.code))+')');
-    statusRow.innerHTML = bits.join('  &middot;  ');
+    infoEl.innerHTML = lastChrome ? siGridHtml(siMuxModel(lastChrome, INFO.sessionId))
+      : siGridHtml({ cwd: INFO.projectPath, sessionId: INFO.sessionId });
   }
-  // Plan windows are an account fact, not a transcript one, so nothing pushes them.
-  function fetchSub(){
-    if (INFO.sessionId.indexOf('codex:') === 0) return;
-    fetch(API+'/api/subscription').then(function(r){ return r.json(); })
-      .then(function(d){ subInfo = (d && d.account) ? d : null; paintHead(); }).catch(function(){});
-  }
-  fetchSub();
-  var subTimer = setInterval(fetchSub, 60000);
+  paintHead();
 
   // base is the PREFIX the client hangs everything off. Proxied through ccbb web the
   // socket lands on <base>/mux — the outer /mux is this server's prefix, the inner one
@@ -2796,7 +2706,6 @@ function createMuxSessionView(INFO){
     label: 'web-' + shortSessionId(INFO.sessionId),
     machine: SRV,
     bar: false,
-    onStats: function(st){ lastStats = st; paintHead(); },
     onChrome: function(c){
       lastChrome = c;
       titleEl.textContent = c.title;
@@ -2840,7 +2749,6 @@ function createMuxSessionView(INFO){
   // claude process nobody can see either. The mux only acts on it if the room is
   // empty — another browser, or a terminal on ccbb attach, keeps it alive.
   v.destroy = function(){
-    clearInterval(subTimer);
     if (v.closeTerm) v.closeTerm();
     try { v.client.destroy({ closeSession: true }); } catch(e){}
   };
@@ -2900,7 +2808,8 @@ function createSessionView(INFO){
   // status line at the foot, and this is the detail behind them.
   var headEl = document.createElement('div');
   headEl.className = 'sv-stats';
-  headEl.innerHTML = '<span class="hdr-proj"></span><span class="hdr-stats"></span><div class="hdr-status"></div>';
+  headEl.innerHTML = '<div class="si-host"></div>';
+  siWire(headEl);
   el.appendChild(makeViewBar(v, barMain, { close:true, term:true, menu:true, resume:true, headEl:headEl }));
   var dotEl = barMain.querySelector('.status-dot');
   var titleEl = barMain.querySelector('.hdr-title');
@@ -2941,9 +2850,7 @@ function createSessionView(INFO){
     '<div class="sv-foot"><span class="sl"></span></div>';
   el.appendChild(body);
   v.bodyEl = body;
-  var projEl = headEl.querySelector('.hdr-proj');
-  var statsEl = headEl.querySelector('.hdr-stats');
-  var statusRow = headEl.querySelector('.hdr-status');
+  var infoEl = headEl.querySelector('.si-host');
   var footEl = body.querySelector('.sv-foot .sl');
   var transcript = body.querySelector('.transcript');
   var jumpMarker = body.querySelector('.jump-marker');
@@ -3016,10 +2923,7 @@ function createSessionView(INFO){
   // This session's server, when it's on a Claude.ai plan. Its two rolling windows ride
   // beside the session cost as "$1.23/5h:24%/w:41%" — on a plan the dollars are notional
   // list price and the windows are the figure that actually runs out.
-  var subInfo = null, lastStats = null;
-  // The plan windows for the foot, as pills. The header block draws the same windows as
-  // prose (hdrPlanWinHtml, from renderHdrStats), where a bar would not sit in the line.
-  function planPillsHtml(st, lvl) { return hdrPlanPillsHtml(st, subInfo, lvl); }
+  var subInfo = null, lastStats = null, statusHtml = '';
   function fetchSub() {
     fetch(API+'/api/subscription').then(function(r){ return r.json(); })
       .then(function(d){
@@ -3028,40 +2932,26 @@ function createSessionView(INFO){
       }).catch(function(){});
   }
   function renderStats(st) {
-    if (!st) { statsEl.textContent = ''; footEl.innerHTML = ''; return; }
+    if (!st) { infoEl.innerHTML = ''; footEl.innerHTML = ''; return; }
     lastStats = st;
-    renderHdrStats(projEl, statsEl, st, INFO.projectPath, subInfo, INFO.sessionId);
+    paintInfo();
     renderFoot();
   }
-  // The status line: session cost, the plan windows it is drawn from, and context as
-  // current/peak/resend. No monthly estimate — that one is a whole-machine figure and this
-  // line is one session's. The model used to lead it and no longer does — the header block
-  // behind the dots names it in full, with the rest of them beside it. The turn count kept
-  // its number and lost its label: next to the money, a bare count reads as a count.
+  // The block behind ⋮. Binary and Compact at come from the running process (/proc), so a
+  // session that is not running shows them as unknown.
+  function paintInfo(){
+    var st = lastStats, pr = (st && st.proc) || INFO.proc;
+    infoEl.innerHTML = siGridHtml({
+      cwd: INFO.projectPath, sessionId: INFO.sessionId,
+      bin: pr && pr.bin, binNote: pr && pr.via, model: pr && pr.model,
+      compactAt: pr ? pr.compactAt : null, status: statusHtml,
+      st: st, sub: siOnPlan(st, subInfo),
+    });
+  }
   function renderFoot(){
     var st = lastStats;
     if (!st) { footEl.innerHTML = ''; return; }
-    fitFoot(footEl, function (lvl) { footEl.innerHTML = footHtml(st, lvl); });
-  }
-  function footHtml(st, lvl){
-    var ctx = st.context, cmax = st.contextMax;
-    var ctxStr = '';
-    if (ctx) {
-      // The peak is only worth a slot when it is somewhere the session has actually
-      // been. On a session at its own high-water mark "45K/45K" is one number printed
-      // twice, and it was crowding out figures that differ.
-      var peak = (cmax && cmax.tokens > ctx.tokens) ? cmax.tokens : 0;
-      ctxStr = (lvl >= FOOT_LVL_CTX_LABEL ? '' : 'ctx:')+(ctx.postCompact?'~':'')+
-        '<b>'+fmtTokShort(ctx.tokens)+'</b>'+(peak ? '/'+fmtTokShort(peak) : '')+
-        '/'+fmtCost(ctx.cost);
-    }
-    var turns = st.turns||0, subTurns = st.subTurns||0;
-    return [
-      '<b>'+fmtCost(st.cost)+'</b>',
-      planPillsHtml(st, lvl),
-      '<span><b>'+turns+'</b>'+(subTurns?'<span class="sl-sub">+'+subTurns+'</span>':'')+'</span>',
-      ctxStr ? '<span class="sl-ctx">'+ctxStr+'</span>' : '',
-    ].filter(Boolean).join('');
+    fitFoot(footEl, function (lvl) { footEl.innerHTML = siFootHtml({ st: st, sub: siOnPlan(st, subInfo) }, lvl); });
   }
   onFootResize(footEl, renderFoot);
   // Session state from the live sidecar: busy = Claude is working, idle = it finished the
@@ -3082,15 +2972,11 @@ function createSessionView(INFO){
     dotEl.className = className;
     var title = !live ? 'Not running' : (idle ? 'Waiting for input' : 'Working');
     dotEl.title = title;
-    if (idle) {
-      var at = d.statusUpdatedAt, since = relSince(at);
-      statusRow.innerHTML = '⏸ finished responding' + (at ? ' at <b>'+esc(fd(at))+'</b>' : '') +
-        ' · waiting for input' + (since ? ' <b>'+since+'</b>' : '');
-      statusRow.classList.add('show');
-    } else {
-      statusRow.classList.remove('show');
-      statusRow.innerHTML = '';
-    }
+    var at = d && d.statusUpdatedAt, since = relSince(at);
+    statusHtml = !live ? 'not running'
+      : idle ? '<b>idle</b>' + (since ? ' &middot; waiting ' + since : '') + (at ? ' <span class="si-dim">since ' + esc(fd(at)) + '</span>' : '')
+      : '<b>working</b>';
+    if (lastStats) { paintInfo(); renderFoot(); }
   }
   var queryCount = 0;
   function queryStart(){ queryCount++; queryEl.classList.add('show'); }
@@ -4023,7 +3909,8 @@ function createSessionView(INFO){
 
   renderTitle();
   renderStats(INFO.stats);
-  setStatus({ live: INFO.live, status: INFO.liveStatus, statusUpdatedAt: INFO.liveStatusAt });
+  lastStatus = { live: INFO.live, status: INFO.liveStatus, statusUpdatedAt: INFO.liveStatusAt };
+  setStatus(lastStatus);
   fetchSub();
   refreshDrivable();
   connect();
@@ -6619,7 +6506,7 @@ function runWeb(args) {
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/live$/)))
       return send(res, 200, sessionLiveness(m[1]));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/stats$/)))
-      return send(res, 200, getSessionStats(m[1]));
+      return send(res, 200, Object.assign({}, getSessionStats(m[1]), { proc: require('./ccbb-common').sessionProc(m[1]) }));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/pane$/))) {
       const loc = paneForSession(m[1]);
       return send(res, 200, { pane: loc ? loc.pane : null });

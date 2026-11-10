@@ -274,12 +274,7 @@ const APP_CSS = `
 
 /* The standalone session index is a .muxv only to inherit the theme: it is a
    document, not a live view, so it must not become the flex column. */
-/* ccbb's .sv-foot lays out its own left-hand run of numbers; what is mux-specific —
-   who else is attached, a credential refresh, the exit code — rides at the right, and
-   .sl has to be able to grow for margin-left:auto to have anywhere to push it. */
 .muxv .sv-foot .sl { flex: 1 1 auto; }
-.muxv .sv-foot .sl-note { margin-left: auto; padding-left: 12px; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
 
 .muxv.plain { display: block; height: auto; overflow: auto; }
 
@@ -1040,7 +1035,7 @@ function apply(ev) {
     // decode rate after it. Subagents' are on the wire too but would make the figure jump.
     case 'gen':
       if (ev.parentToolUseId) return;
-      S.info.lastGen = ev;
+      S.info.lastResultAt = Date.parse(ev.ts) || Date.now();
       return paintChrome();
 
     case 'thinking_tokens':
@@ -1064,6 +1059,7 @@ function apply(ev) {
         S.info.contextPeak = Math.max(S.info.contextPeak || 0, ctx);
       }
       if (!ev.live) S.info.turns = (S.info.turns || 0) + 1;
+      S.info.lastResultAt = Date.parse(ev.ts) || Date.now();
       if (ev.isError && ev.result) note('error: ' + txt(ev.result));
       return paintChrome();
     }
@@ -1737,70 +1733,20 @@ function sessionName(i) {
   return (i && (i.title || i.label)) || shortSessionId(SESSION);
 }
 
-// The shrink ladder's rungs, from ccbb's SHARED_JS. A host that did not include that
-// file still gets a footer — one that never shrinks, which is what it did before.
-var LVL = (typeof FOOT_LVL_CTX_LABEL === 'number')
-  ? { pct: FOOT_LVL_PCT, clients: FOOT_LVL_CLIENTS, ctx: FOOT_LVL_CTX_LABEL }
-  : { pct: 99, clients: 99, ctx: 99 };
-
-// The status line, in ccbb web's own shape: money first, then turns, then context as
-// current/peak. What is mux-specific — who else is attached, a credential refresh, the
-// exit code, the last transient note — goes to the right, out of the way of the numbers
-// people actually scan for. lvl is the shrink level fitFoot is trying; see the ladder in
-// ccbb web's SHARED_JS, which both footers share so they give up detail in one order.
-function fmtSecs(ms) { var s = (ms || 0) / 1000; return (s < 10 ? s.toFixed(1) : String(Math.round(s))) + 's'; }
-function footHtml(i, lvl) {
-  var money = i.cost == null ? '<b>cost: —</b>' : '<b>' + (i.agent === 'codex' ? '~' : '') + '$' + Number(i.cost).toFixed(2) + '</b>';
-  // The plan windows, as ccbb's own pills. On a Claude.ai plan the dollars are notional
-  // list price and these are the figure that actually runs out, so a status line without
-  // them is missing the number people are really watching. footWin/subWinTitle come from
-  // ccbb's SHARED_JS — the pill is one object, drawn by one function, in both clients.
-  // A Claude session's own windows (its rate_limit_event) beat the account read: they are
-  // per turn, and on ANTHROPIC_AUTH_TOKEN they are the only reading there is.
-  var sub = i.agent === 'codex' ? { windows: typeof codexWindows === 'function' ? codexWindows(i.rateLimits || (SUB && SUB.rateLimits)) : {} }
-    : i.planWindows && (!SUB || !SUB.windows || !SUB.fetchedAt || (i.planWindowsAt || 0) >= SUB.fetchedAt)
-      ? Object.assign({}, SUB, { windows: i.planWindows, fetchedAt: i.planWindowsAt || null, source: 'session' }) : SUB;
-  var pills = sub && sub.windows && typeof footWin === 'function'
-    ? (function () {
-        var w = sub.windows, p = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
-        return p ? '<span class="fwins" title="' + esc(subWinTitle(sub)) + '">' + p + '</span>' : '';
-      })()
-    : '';
-  var turns = '<span><b>' + (i.turns || 0) + '</b>' +
-    (i.subTurns ? '<span class="sl-sub">+' + i.subTurns + '</span>' : '') + '</span>';
-  var ctxStr = '';
-  if (i.contextTokens) {
-    // Only a peak the session has actually been above is worth a slot: at the high-water
-    // mark "45K/45K" is the same number twice, crowding out figures that differ.
-    var peak = (i.contextPeak || 0) > i.contextTokens ? i.contextPeak : 0;
-    var ctxCost = i.stats && i.stats.context ? i.stats.context.cost : null;
-    ctxStr = '<span class="sl-ctx">' + (lvl >= LVL.ctx ? '' : 'ctx:') +
-      (i.contextPostCompact ? '~' : '') +
-      '<b>' + fmtTokShort(i.contextTokens) + '</b>' + (peak ? '/' + fmtTokShort(peak) : '') +
-      (ctxCost != null ? '/$' + Number(ctxCost).toFixed(2) : '') + '</span>';
-  }
-  var gen = i.lastGen, genStr = '';
-  if (gen && lvl < LVL.clients && (gen.ttftMs != null || gen.tps)) {
-    var gb = [];
-    if (gen.ttftMs != null) gb.push((lvl >= LVL.pct ? '' : 'ttft ') + fmtSecs(gen.ttftMs));
-    if (gen.tps) gb.push('<b>' + gen.tps.toFixed(1) + '</b> tok/s');
-    genStr = '<span class="sl-gen" title="Last response: time to first token, then decode rate (' +
-      (gen.outTokens || 0) + ' output tokens in ' + fmtSecs(gen.decodeMs) + ')">' + gb.join(' \u00b7 ') + '</span>';
-  }
-  var right = [];
-  // "2 controllers" spelled out is four times the width of the fact it carries, and the
-  // fact is only ever a small number of people.
-  if (S.clients.length > 1 && lvl < LVL.clients) right.push(S.clients.length + 'x');
-  if (i.auth && i.auth.isAuthenticating) right.push('refreshing credentials\u2026');
-  if (i.exit) right.push('exited (' + (i.exit.code == null ? i.exit.signal : i.exit.code) + ')');
-  var fresh = S.notes.filter(function (n) { return Date.now() - n.at < 20000; });
-  var pin = fresh.filter(function (n) { return n.pinned; }).pop();
-  var last = fresh[fresh.length - 1];
-  if (pin) right.push(pin.text);
-  if (last && last !== pin) right.push(last.text);
-  return [money, pills, turns, ctxStr, genStr,
-    right.length ? '<span class="sl-note">' + esc(right.join(' \u00b7 ')) + '</span>' : ''
-  ].filter(Boolean).join('');
+// The plan windows that apply to this session. A Claude session's own (its
+// rate_limit_event) beat the account read: they are per turn, and on ANTHROPIC_AUTH_TOKEN
+// they are the only reading there is. Codex has its own rate limits.
+function muxSub(i) {
+  if (i.agent === 'codex') return { windows: typeof codexWindows === 'function' ? codexWindows(i.rateLimits || (SUB && SUB.rateLimits)) : {} };
+  return i.planWindows && (!SUB || !SUB.windows || !SUB.fetchedAt || (i.planWindowsAt || 0) >= SUB.fetchedAt)
+    ? Object.assign({}, SUB, { windows: i.planWindows, fetchedAt: i.planWindowsAt || null, source: 'session' }) : SUB;
+}
+// The status line: ccbb's shared one (cost, plan, turns, ctx) when the host page carries
+// SHARED_JS; the standalone page gets the bare numbers.
+function footHtml(i, lvl, st, sub) {
+  if (typeof siFootHtml === 'function') return siFootHtml({ st: st, sub: sub, approx: i.agent === 'codex', lastAt: i.lastResultAt }, lvl);
+  return '<b>' + (i.cost == null ? 'cost: —' : '$' + Number(i.cost).toFixed(2)) + '</b> <span><b>' + (i.turns || 0) + '</b></span>' +
+    (i.contextTokens ? ' <span class="sl-ctx">ctx:<b>' + fmtTokShort(i.contextTokens) + '</b></span>' : '');
 }
 
 function paintChrome() {
@@ -1844,9 +1790,12 @@ function paintChrome() {
   if (i.agent === 'codex') { var inp = Q('.input-box'); if (inp) inp.dataset.ph = 'Message Codex… (Ctrl+Enter to send; queued while busy; /steer to interrupt direction)'; }
   if (mode && mode.value !== (i.permissionMode || 'default')) mode.value = i.permissionMode || 'default';
 
+  var st = typeof siLiveStats === 'function' ? siLiveStats(i) : null;
+  var sub = muxSub(i);
+  if (st && typeof siOnPlan === 'function' && i.agent !== 'codex' && (st.providers || []).length) sub = siOnPlan(st, sub);
   var sl = Q('.sv-foot .sl');
-  if (sl && typeof fitFoot === 'function') fitFoot(sl, function (lvl) { sl.innerHTML = footHtml(i, lvl); });
-  else if (sl) sl.innerHTML = footHtml(i, 0);
+  if (sl && typeof fitFoot === 'function') fitFoot(sl, function (lvl) { sl.innerHTML = footHtml(i, lvl, st, sub); });
+  else if (sl) sl.innerHTML = footHtml(i, 0, st, sub);
   // Pushed OUT through one callback rather than letting the host reach into this
   // instance for it. One seam to keep correct, and the standalone page just does
   // not pass onChrome.
@@ -1854,7 +1803,7 @@ function paintChrome() {
     title: sessionName(i), label: i.label || '', cwd: i.cwd || '',
     live: live, status: live ? activityStatus : 'gone', activity: i.activity || null,
     permissionMode: i.agent === 'codex' ? null : (i.permissionMode || 'default'),
-    connected: connected, clients: S.clients.slice(), info: i, stats: i.stats || null,
+    connected: connected, clients: S.clients.slice(), info: i, stats: st, sub: sub,
   });
 }
 
@@ -2134,7 +2083,7 @@ var CMD_SEQ = 0, CMD_CWD = '';
 // fact, ccbb already computes it, and ccbbBase() reaches it from both hosts. Failure is
 // silent and the pills simply do not appear — a machine on an API key has no windows,
 // and neither does a ccbb that is not answering.
-var SUB = null, subTimer = null;
+var SUB = null, subTimer = null, chromeTimer = null;
 function loadSub() {
   fetch(ccbbBase() + ((S.info.agent === 'codex' || SESSION.indexOf('codex:') === 0) ? '/api/codex/subscription' : '/api/subscription'), { headers: TOKEN ? { 'x-ccbb-token': TOKEN } : {} })
     .then(function (r) { return r.ok ? r.json() : null; })
@@ -2394,6 +2343,7 @@ function wire() {
   } else connect();
   loadSub();
   subTimer = setInterval(loadSub, 60000);
+  chromeTimer = setInterval(function () { if (!document.hidden) paintChrome(); }, 10000);
   input.focus();
 }
 // A deliberate debug surface. The terminal client could be watched through tmux;
@@ -2421,6 +2371,7 @@ var handle = {
     if (o && o.closeSession) send({ op: 'close' });
     dead = true;
     if (subTimer) clearInterval(subTimer);
+    if (chromeTimer) clearInterval(chromeTimer);
     if (scrollFrame != null) cancelAnimationFrame(scrollFrame);
     if (logObserver) logObserver.disconnect();
     if (gapObserver) gapObserver.disconnect();

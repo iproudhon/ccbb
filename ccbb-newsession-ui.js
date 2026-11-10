@@ -1126,4 +1126,7 @@ const JS = 'var NS_EXP_WINS = {};\nvar NS_AUTH = {};\nvar NS_COMPACT = ' + JSON.
   serverChipMenu, nsMenuButtons, sessionMenuDock, nsWatchWidth, sessionMenuItems, nsLastBin, nsSaveBin, nsFillBins, pickBinary, nsDialog, nsK, nsFollowViewport, nsPickField, nsSettingsHtml, nsSettings, openNewSession, nsNarrow, openExplorer,
   nsExplorerModal, nsFileView, explorerBody].map(f => f.toString()).join('\n');
 
-module.exports = { CSS, JS };
+// The session info panel and status line ride along: every page that has these dialogs
+// has session views too.
+const SI = require('./ccbb-session-info-ui');
+module.exports = { CSS: CSS + SI.CSS, JS: JS + '\n' + SI.JS };

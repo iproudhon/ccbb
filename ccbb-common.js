@@ -994,6 +994,29 @@ function sessionLiveness(sessionId) {
     statusUpdatedAt: rec.statusUpdatedAt, cwd: rec.cwd };
 }
 
+// What a live terminal session was started as: the binary, its auto-compact window, and
+// which backend the environment points it at. Read from /proc, so local Linux only; only
+// these few variables are taken from the environment, never the rest (it holds tokens).
+function sessionProc(sessionId) {
+  const rec = liveSessionRecords().get(sessionId);
+  if (!rec || !rec.pid) return null;
+  let argv = [], env = {};
+  try { argv = fs.readFileSync(`/proc/${rec.pid}/cmdline`, 'utf8').split('\0').filter(Boolean); } catch { return null; }
+  try {
+    for (const kv of fs.readFileSync(`/proc/${rec.pid}/environ`, 'utf8').split('\0')) {
+      const i = kv.indexOf('=');
+      const k = kv.slice(0, i);
+      if (['CLAUDE_CODE_AUTO_COMPACT_WINDOW', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL'].includes(k)) env[k] = kv.slice(i + 1);
+    }
+  } catch {}
+  // A node-launched CLI shows node first; the script is the binary.
+  const exe = argv.length > 1 && /(^|\/)node$/.test(argv[0]) && !argv[1].startsWith('-') ? argv[1] : argv[0] || '';
+  const cw = parseInt(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, 10);
+  const via = env.CLAUDE_CODE_USE_BEDROCK === '1' ? 'Bedrock' : env.CLAUDE_CODE_USE_VERTEX === '1' ? 'Vertex'
+    : env.ANTHROPIC_BASE_URL ? 'gateway ' + (() => { try { return new URL(env.ANTHROPIC_BASE_URL).host; } catch { return '?'; } })() : '';
+  return { bin: path.basename(exe), via, compactAt: Number.isFinite(cw) && cw > 0 ? cw : 'default', model: env.ANTHROPIC_MODEL || null };
+}
+
 function liveSessionIds() {
   return new Set(liveSessionRecords().keys());
 }
@@ -1455,6 +1478,7 @@ function getSessionInfo(sessionId) {
     live: live.live,
     liveStatus: live.status || null,
     liveStatusAt: live.statusUpdatedAt || null,
+    proc: rec ? sessionProc(sessionId) : null,
     stats,
   };
 }
@@ -2089,7 +2113,7 @@ module.exports = {
   transcriptEntry, getSessionCwd, getSessionHistory, getSessionHistoryWindow, getSessionToolResult,
   // windowed transcripts
   parseWindow, windowMessages, sliceMessages, messageToolResult, liteMessage,
-  getSubagentHistory, getSessionInfo,
+  getSubagentHistory, getSessionInfo, sessionProc,
   startTail, stopTail, watchSessionChanges,
   // permission parsing
   PROMPT_RE, OPTION_RE, capturePane, parsePrompt, promptFingerprint,
