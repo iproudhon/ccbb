@@ -53,28 +53,36 @@ const APP_CSS = `
   --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --vscode-editor-font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   --vscode-font-size: 14px;
-  --vscode-editor-background: #ffffff;
-  --vscode-editor-foreground: #1f2328;
-  --vscode-sideBar-background: #f6f7f9;
-  --vscode-panel-border: #d8dbe0;
-  --vscode-descriptionForeground: #6a737d;
+  --vscode-editor-background: var(--bg, #ffffff);
+  --vscode-editor-foreground: var(--ink, #1f2328);
+  --vscode-sideBar-background: var(--bg-alt, #f6f7f9);
+  --vscode-panel-border: var(--line, #d8dbe0);
+  --vscode-descriptionForeground: var(--ink-soft, #6a737d);
   --vscode-textLink-foreground: #0a66c2;
-  --vscode-textBlockQuote-background: #f2f4f7;
-  --vscode-textCodeBlock-background: #f2f4f7;
+  --vscode-textBlockQuote-background: var(--code-bg, #f2f4f7);
+  --vscode-textCodeBlock-background: var(--code-bg, #f2f4f7);
   --vscode-button-background: #1f6feb;
   --vscode-button-foreground: #ffffff;
-  --vscode-button-secondaryBackground: #e6e8eb;
-  --vscode-button-secondaryForeground: #1f2328;
-  --vscode-input-background: #ffffff;
-  --vscode-input-foreground: #1f2328;
-  --vscode-input-border: #d8dbe0;
+  --vscode-button-secondaryBackground: var(--line, #e6e8eb);
+  --vscode-button-secondaryForeground: var(--ink, #1f2328);
+  --vscode-input-background: var(--surface, #ffffff);
+  --vscode-input-foreground: var(--ink, #1f2328);
+  --vscode-input-border: var(--line, #d8dbe0);
   --vscode-focusBorder: #1f6feb;
-  --vscode-charts-green: #1a7f37;
-  --vscode-charts-red: #cf222e;
-  --vscode-charts-yellow: #9a6700;
+  --vscode-charts-green: var(--ok, #1a7f37);
+  --vscode-charts-red: var(--err, #cf222e);
+  --vscode-charts-yellow: var(--warn, #9a6700);
   --vscode-diffEditor-insertedTextBackground: #e6ffec;
   --vscode-diffEditor-removedTextBackground: #ffebe9;
   --ccbb-accent: #b95d1f;
+}
+/* The vscode names above follow ccbb's own tokens, so the cards (a question, a permission)
+   go dark with the page instead of staying a white panel under light ink. */
+@supports (color: color-mix(in srgb, red 10%, blue)) {
+  .muxv {
+    --vscode-diffEditor-insertedTextBackground: color-mix(in srgb, var(--ok, #1a7f37) 15%, var(--bg, #fff));
+    --vscode-diffEditor-removedTextBackground: color-mix(in srgb, var(--err, #cf222e) 15%, var(--bg, #fff));
+  }
 }
 /* Was a bare  * { box-sizing }  on the page. Scoped to the subtree so embedding the view
    in ccbb-web.js cannot change the box model of anything outside it. */
@@ -902,6 +910,12 @@ function reset(snap) {
   // request it never saw arrive, so painting the transcript without also painting
   // the cards silently drops the feature.
   paintCards();
+  // A dead session's snapshot carries why it died; the live stderr events that said so
+  // went out before this page attached. Skipped if a reconnect already noted it.
+  (snap.stderr || []).slice(-5).forEach(function (t) {
+    t = String(t || '').trim();
+    if (t && !S.notes.some(function (n) { return n.text === t; })) note(t);
+  });
 }
 
 function apply(ev) {
@@ -1038,18 +1052,18 @@ function apply(ev) {
       S.info.status = 'idle';
       S.info.activity = null;
       setBusy(false);
-      if (ev.costUsd) S.info.cost = (S.info.cost || 0) + ev.costUsd;
-      // Context is what the last API call actually carried, which is input plus what
-      // it read from cache — the same figure ccbb web's own footer shows, computed
-      // the same way so the two cannot disagree. The peak is kept because a /compact
-      // drops the current figure and the number you want then is what it was.
+      // ev.live: the mux already moved cost, turns and context response by response
+      // (its 'stats' events), so adding the turn's totals here would count it twice.
+      if (!ev.live && ev.costUsd) S.info.cost = (S.info.cost || 0) + ev.costUsd;
+      // Context is what the last API call actually carried. The peak is kept because a
+      // /compact drops the current figure and the number you want then is what it was.
       var u = ev.usage || {};
       var ctx = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
-      if (ctx) {
+      if (!ev.live && ctx) {
         S.info.contextTokens = ctx;
         S.info.contextPeak = Math.max(S.info.contextPeak || 0, ctx);
       }
-      S.info.turns = (S.info.turns || 0) + 1;
+      if (!ev.live) S.info.turns = (S.info.turns || 0) + 1;
       if (ev.isError && ev.result) note('error: ' + txt(ev.result));
       return paintChrome();
     }
@@ -1066,7 +1080,7 @@ function apply(ev) {
        'contextMax', 'contextPostCompact'].forEach(function (k) {
         if (ev[k] != null) S.info[k] = ev[k];
       });
-      if (ON_STATS) ON_STATS(S.info.stats);
+      if (ON_STATS && ev.stats) ON_STATS(S.info.stats);
       return paintChrome();
     }
     case 'mode':   S.info.permissionMode = ev.permissionMode; return paintChrome();
@@ -1089,7 +1103,16 @@ function apply(ev) {
       S.info.auth = ev.body;
       return paintChrome();
     case 'retry':  note('retrying the API call'); return paintChrome();
-    case 'rate_limit': note('rate limited', true); return paintChrome();
+    case 'rate_limit':
+      // Sent every turn on a plan, mostly with status "allowed": the windows are news, the
+      // note only when a limit actually bit.
+      // Stamped with the server's time: it is compared with SUB.fetchedAt, also the server's.
+      if (ev.windows && (ev.windows.fiveHour || ev.windows.sevenDay)) {
+        S.info.planWindows = ev.windows;
+        S.info.planWindowsAt = ev.at || Date.parse(ev.ts) || Date.now();
+      }
+      if (ev.info && ev.info.status === 'rejected') note('rate limited', true);
+      return paintChrome();
     case 'stderr': note(String(ev.text || '').trim()); return;
     case 'hook': case 'goal': case 'autocompact': case 'system': case 'unknown': case 'turn_start':
       return;
@@ -1732,7 +1755,11 @@ function footHtml(i, lvl) {
   // list price and these are the figure that actually runs out, so a status line without
   // them is missing the number people are really watching. footWin/subWinTitle come from
   // ccbb's SHARED_JS — the pill is one object, drawn by one function, in both clients.
-  var sub = i.agent === 'codex' ? { windows: typeof codexWindows === 'function' ? codexWindows(i.rateLimits || (SUB && SUB.rateLimits)) : {} } : SUB;
+  // A Claude session's own windows (its rate_limit_event) beat the account read: they are
+  // per turn, and on ANTHROPIC_AUTH_TOKEN they are the only reading there is.
+  var sub = i.agent === 'codex' ? { windows: typeof codexWindows === 'function' ? codexWindows(i.rateLimits || (SUB && SUB.rateLimits)) : {} }
+    : i.planWindows && (!SUB || !SUB.windows || !SUB.fetchedAt || (i.planWindowsAt || 0) >= SUB.fetchedAt)
+      ? Object.assign({}, SUB, { windows: i.planWindows, fetchedAt: i.planWindowsAt || null, source: 'session' }) : SUB;
   var pills = sub && sub.windows && typeof footWin === 'function'
     ? (function () {
         var w = sub.windows, p = footWin('5h', w.fiveHour, lvl) + footWin('7d', w.sevenDay, lvl);
@@ -2121,6 +2148,8 @@ function runLocal(raw) {
   var name = sp === -1 ? b : b.slice(0, sp);
   var args = sp === -1 ? '' : b.slice(sp + 1);
   if (!name) return;
+  // The phone's viewport readout (ccbb-mobile.js), not a shell command.
+  if (name === 'vp' && window.ccbbVpToggle) return window.ccbbVpToggle();
   // Everything the renderer needs lives inside .command, exactly as it does for a
   // command the child answered — one shape, one renderer, and no second path that
   // can be styled differently by accident.

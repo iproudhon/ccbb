@@ -157,7 +157,8 @@ function status(value) {
     await evaluate(`document.querySelector('${selector}').blur()`);
     assert(await evaluate('document.body.classList.contains("kb")'), 'blur alone does not restore footer');
     await evaluate('resizeViewport(844)');
-    assert.equal(await evaluate('getComputedStyle(document.getElementById("stack")).paddingBottom'), '34px');
+    // The footer sits on the bottom edge: no bottom safe-area inset on #stack.
+    assert.equal(await evaluate('getComputedStyle(document.getElementById("stack")).paddingBottom'), '0px');
     if (!await evaluate('document.querySelector(".muxv.input-max") !== null || document.body.classList.contains("comp-max")'))
       assert.notEqual(await evaluate(`getComputedStyle(document.querySelector('${footer}')).display`), 'none');
   }

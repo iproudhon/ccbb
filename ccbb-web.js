@@ -366,7 +366,7 @@ function subWinTitle(sub){
   var w = sub.windows, parts = [];
   if (w.fiveHour) parts.push('5-hour window '+subPct(w.fiveHour)+' used, resets in '+fmtUntil(w.fiveHour.resetsAt));
   if (w.sevenDay) parts.push('7-day window '+subPct(w.sevenDay)+' used, resets in '+fmtUntil(w.sevenDay.resetsAt));
-  if (sub.fetchedAt) parts.push('read '+fmtUntilAge(sub.fetchedAt)+' ago from '+(sub.source==='api'?'the account API':'Claude Code\\'s cache'));
+  if (sub.fetchedAt) parts.push('read '+fmtUntilAge(sub.fetchedAt)+' ago from '+(sub.source==='api'?'the account API':sub.source==='session'?'a session\\'s last turn':'Claude Code\\'s cache'));
   return parts.join('\\n');
 }
 function fmtUntilAge(ms){
@@ -5318,13 +5318,16 @@ function wrapScript(args) {
 // it, and a browser that reflowed the window you are working in would be intolerable.
 // The floating window (#_) does not: it is a window you sized, with a remembered grid,
 // and it behaves like every other tmux client — it resizes the session to fit itself.
+// Nor is a window ccbb made for the terminal: nobody else's work is laid out in it, and
+// made in a tmux session with no client attached it is born at default-size (80x24), so
+// pinning held the phone at 25 rows on a screen with room for 40.
 function openTerm(cols, rows, sessionId, pin) {
   cols = clampInt(cols, 20, 500, 80);
   rows = clampInt(rows, 5, 200, 24);
   const id = String(++termIds);
   const shell = process.env.SHELL || '/bin/bash';
   const target = sessionId ? termTargetFor(String(sessionId)) : null;
-  const pinned = !!target && pin !== false;
+  const pinned = !!target && pin !== false && target.where !== 'window';
   // Pinned, the browser's cols/rows are a HINT and tmux overrules it: sizing the pty to
   // the box the page happens to have would resize tmux on attach, while sizing it to
   // tmux leaves the far end untouched and hands the browser a grid to scale its font to.
@@ -5683,7 +5686,10 @@ function closeAllTerms() {
 // Standalone, the daemon dying reaped them; here nothing else would.
 function closeMux() {
   if (mux) { try { mux.killAll(); } catch {} }
-  try { fs.unlinkSync(path.join(CLAUDE_DIR, 'ccbb-mux', 'address')); } catch {}
+  // The same dir the address was written to, and only if it is still ours: a second
+  // ccbb web (CCBB_HOME set, a test on another port) must not unpublish the first.
+  const f = path.join(process.env.CCBB_HOME || CLAUDE_DIR, 'ccbb-mux', 'address');
+  try { if (JSON.parse(fs.readFileSync(f, 'utf8')).pid === process.pid) fs.unlinkSync(f); } catch {}
 }
 process.on('exit', () => { closeAllTerms(); closeMux(); });
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {

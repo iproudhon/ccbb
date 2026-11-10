@@ -393,32 +393,32 @@ class Session {
     let file = null;
     try { file = common.findSessionJsonl(resumeId); } catch (e) {}
     if (!file) return;
-    let lines;
-    try { lines = fs.readFileSync(file, 'utf8').split('\n'); } catch (e) { return; }
-
-    const keep = [];
-    for (const line of lines) {
-      if (!line) continue;
+    let keep = [];
+    // Line by line: a long session's transcript is past the size readFileSync can
+    // return as one string, and that failure used to seed nothing at all.
+    const onLine = line => {
       let j;
-      try { j = JSON.parse(line); } catch (e) { continue; }
+      try { j = JSON.parse(line); } catch (e) { return; }
       // The file holds a dozen record types the wire never sends — attachment,
       // file-history-snapshot, mode, custom-title. Only the two that are turns.
       // The on-disk carrier for a background task reporting back. Not a turn — it is
       // never rendered — but it is the only record on disk of how a backgrounded call
       // ended, so it rides along and is replayed in order with the turns it belongs to.
       if (j.type === 'queue-operation' && j.operation === 'enqueue' &&
-          String(j.content || '').indexOf('<task-notification>') >= 0) { keep.push(j); continue; }
-      if (j.type !== 'user' && j.type !== 'assistant') continue;
-      if (j.isSidechain) continue;              // a subagent's own thread, not this one's
+          String(j.content || '').indexOf('<task-notification>') >= 0) { keep.push(j); return; }
+      if (j.type !== 'user' && j.type !== 'assistant') return;
+      if (j.isSidechain) return;              // a subagent's own thread, not this one's
       if (j.cwd) this._diskCwd = j.cwd;
       if (j.type === 'assistant' && j.message && j.message.model && j.message.model[0] !== '<') this._diskModel = j.message.model;
       // A compact summary is a user message whose content is the ENTIRE prior
       // conversation. Rendered as a turn it is a wall of text nobody wrote; the
       // turns it summarizes are still in this same file, above it.
-      if (j.isCompactSummary) continue;
-      if (j.isVisibleInTranscriptOnly) continue;
+      if (j.isCompactSummary) return;
+      if (j.isVisibleInTranscriptOnly) return;
       keep.push(j);
-    }
+      if (keep.length > 2 * HISTORY_SEED) keep = keep.slice(keep.length - HISTORY_SEED);
+    };
+    try { common.forEachLine(file, onLine); } catch (e) { return; }
     // The tail, not the whole thing: this.messages is capped, and a 6000-line
     // transcript seeded whole would leave the live turns evicting the history they
     // were meant to continue. What a person opening a resumed session wants is the
@@ -506,7 +506,10 @@ class Session {
         contextMax: (st.context && st.context.max) || 0,
         contextPostCompact: !!(st.context && st.context.postCompact),
       };
-      const same = !renamed && Object.keys(next).every(k => this.state[k] === next[k]);
+      // Live per-response updates (trackUsage) move this.state between recounts, so a
+      // match here does not mean clients already hold this stats object.
+      const same = !renamed && !this._liveDirty && Object.keys(next).every(k => this.state[k] === next[k]);
+      this._liveDirty = false;
       Object.assign(this.state, next);
       // The whole stats object rides along for the header block ccbb web opens behind
       // the dots — the same shape /api/session/<id>/stats returns, because it IS that.
@@ -570,6 +573,18 @@ class Session {
       clients: [...this.clients].map(c => ({ label: c.label, kind: c.kind, pid: c.pid || null })),
     };
     if (w.omitted) { snap.omitted = w.omitted; snap.omittedAfter = w.omittedAfter; }
+    // Why it died lives only in the event ring, which a fresh attach never replays, so
+    // a dead session opened with a bare "exited (code 1)". Hand over the stderr written
+    // since the child last said anything else — earlier warnings are not why it died.
+    if (this.state.status === 'exited') {
+      const errs = [];
+      for (let i = this.events.length - 1; i >= 0 && errs.length < 20; i--) {
+        const k = this.events[i].kind;
+        if (k === 'stderr') errs.unshift(String(this.events[i].text || ''));
+        else if (k !== 'status' && k !== 'stats') break;
+      }
+      if (errs.length) snap.stderr = errs;
+    }
     return snap;
   }
 
@@ -617,8 +632,10 @@ class Session {
     const was = this.state.status;
     // Message starts between tool calls belong to the same turn. Only a new
     // submission or work starting from idle supersedes a pending interrupt.
-    if (submitted || was !== 'busy' || !this.turnLive)
+    if (submitted || was !== 'busy' || !this.turnLive) {
       this._workVersion = (this._workVersion || 0) + 1;
+      if (was !== 'busy') this._liveCounted = false;
+    }
     this.turnLive = true;
     if (was !== 'busy') { this.state.turnStartedAt = Date.now(); this.state.outTokens = 0; }
     this.state.status = 'busy';
@@ -819,20 +836,34 @@ class Session {
         // Provisional: the turn's own numbers, so the footer moves the instant the turn
         // ends. refreshStats replaces them with the transcript's a moment later, which is
         // the figure that survives a reattach.
-        this.state.cost = (this.state.cost || 0) + (m.total_cost_usd || 0);
-        this.state.turns += (m.num_turns || 0);
-        this.state.tokens += (u.input_tokens || 0) + (u.output_tokens || 0) +
-          (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        // Not when the responses already moved them one by one (trackUsage): that would
+        // count the turn twice until the recount lands.
+        const live = !!this._liveCounted;
+        if (!live) {
+          this.state.cost = (this.state.cost || 0) + (m.total_cost_usd || 0);
+          this.state.turns += (m.num_turns || 0);
+          this.state.tokens += (u.input_tokens || 0) + (u.output_tokens || 0) +
+            (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        }
+        this._liveCounted = false;
         this.refreshStats();
         return this.emit('result', {
-          isError: !!m.is_error, subtype: m.subtype, stopReason: m.stop_reason,
+          isError: !!m.is_error, subtype: m.subtype, stopReason: m.stop_reason, live,
           costUsd: m.total_cost_usd, usage: u, durationMs: m.duration_api_ms,
           result: m.result, errors: m.errors,
         });
       }
 
-      case 'rate_limit_event':
-        return this.emit('rate_limit', { info: m.rate_limit_info });
+      case 'rate_limit_event': {
+        const windows = common.claudeWindows(m.rate_limit_info);
+        const at = Date.now();
+        if (windows.fiveHour || windows.sevenDay) {
+          this.state.planWindows = windows;
+          this.state.planWindowsAt = at;
+          common.noteSessionWindows(windows, at);
+        }
+        return this.emit('rate_limit', { info: m.rate_limit_info, windows, at });
+      }
 
       // --include-hook-events. Useful in its own right, and the only way a client
       // can tell "a hook is thinking" from "the model is thinking".
@@ -1277,6 +1308,49 @@ class Session {
     }
   }
 
+  // The footer between turn ends. A turn of tool calls is many API responses, and the
+  // transcript recount (refreshStats) is a full re-read — over a second on a session of
+  // hundreds of MB — so it runs at turn end (and through the first turn, for the title).
+  // Each response's own usage, priced the way the transcript reader prices it, moves
+  // cost, turns and context the moment the response is complete; the next recount
+  // replaces these with the exact figures (spike-discounted peak, context cost, and any
+  // response a mid-turn recount had already read being counted twice in between).
+  trackUsage(key, e) {
+    if (!this._usage) this._usage = new Map();
+    if (e.type === 'message_start') {
+      const msg = e.message || {};
+      this._usage.set(key, { id: msg.id || '', model: msg.model || this.state.model || '', u: { ...(msg.usage || {}) } });
+      return;
+    }
+    const r = this._usage.get(key);
+    if (!r) return;
+    if (e.type === 'message_delta' && e.usage) {
+      for (const k of Object.keys(e.usage)) if (e.usage[k] != null) r.u[k] = e.usage[k];
+      return;
+    }
+    if (e.type !== 'message_stop') return;
+    this._usage.delete(key);
+    const u = r.u, inp = u.input_tokens || 0, out = u.output_tokens || 0;
+    const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
+    const p = common.priceForModel(r.model, common.providerOf(r.id, r.model));
+    const cc = u.cache_creation || null;
+    const cw5 = cc ? (cc.ephemeral_5m_input_tokens || 0) : cw, cw1 = cc ? (cc.ephemeral_1h_input_tokens || 0) : 0;
+    const cost = (inp * p.input + out * p.output + cr * p.cacheRead + cw5 * p.cacheWrite5m + cw1 * p.cacheWrite1h) / 1e6;
+    const st = this.state;
+    st.cost = (st.cost || 0) + cost;
+    st.tokens = (st.tokens || 0) + inp + out + cr + cw;
+    if (key) st.subTurns = (st.subTurns || 0) + 1;
+    else {
+      st.turns = (st.turns || 0) + 1;
+      const ctx = inp + cr + cw + out;   // computeSessionStats' context figure
+      if (ctx) { st.contextTokens = ctx; st.contextPeak = Math.max(st.contextPeak || 0, ctx); st.contextPostCompact = false; }
+    }
+    this._liveCounted = this._liveDirty = true;
+    this.emit('stats', { cost: st.cost, tokens: st.tokens, turns: st.turns, subTurns: st.subTurns,
+      contextTokens: st.contextTokens, contextPeak: st.contextPeak, contextPostCompact: st.contextPostCompact });
+    this.mux.notifyChange();
+  }
+
   onStreamEvent(m) {
     const e = m.event || {};
     // One open message per stream: the main agent and each subagent (forwarded with
@@ -1286,6 +1360,7 @@ class Session {
     if (!this._streamMsgIds) this._streamMsgIds = new Map();
     const streamMsgId = this._streamMsgIds.get(streamKey) || null;
     this.trackGen(streamKey, e);
+    this.trackUsage(streamKey, e);
     if (e.type === 'message_start') {
       this.flushDelta();
       // A turn can also begin without passing through submit — a session resumed with
@@ -1756,6 +1831,14 @@ async function runNew(args) {
   if (o.bin && !o.agent) o.agent = agentOfBin(o.bin);
   if (o.bin && !agentOfBin(o.bin)) { console.error(`ccbb: '${o.bin}' — the binary's name must start with claude or codex`); process.exit(1); }
   if (o.agent !== 'codex' && !o.bin) { console.error('ccbb: name the binary to run: ccbb claude|claude.pass|claude.aws|codex|<path> …'); process.exit(1); }
+  // `ccbb claude` means the claude THIS shell runs. ccbb web is often a launchd job
+  // with its own PATH — a stale ~/.local/bin/claude ahead of the current one, no ~/bin
+  // for wrappers like claude.pass — so a bare name is resolved here and sent as a path.
+  if (o.bin && !o.bin.includes('/')) {
+    const hit = String(process.env.PATH || '').split(path.delimiter).map(d => d && path.join(d, o.bin))
+      .find(f => { try { return f && fs.statSync(f).isFile() && (fs.accessSync(f, fs.constants.X_OK), true); } catch { return false; } });
+    if (hit) o.bin = path.resolve(hit);   // a relative PATH entry is relative to HERE, not ccbb web
+  }
   if (o.agent !== 'codex' && o.resume) o.resume = await resolveResume(o.resume.trim());
   const detach = o.detach; delete o.detach;
   const r = await api('/api/sessions', 'POST', o);

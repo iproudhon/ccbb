@@ -152,16 +152,12 @@ const MOBILE_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<!-- black-translucent is the whole of the "use the full screen" story: with default or
-     black, iOS reserves the status bar, the page starts below it, and safe-area-inset-top
-     is 0 even in standalone — which is why the --safe-t padding below did nothing. Only
-     this value puts the page under the clock and makes that inset real. Apple has it
-     marked deprecated with nothing to replace it (display:fullscreen and theme_color in
-     the manifest are both ignored on iOS), so it stays until it stops working. Note the
-     value is read when the icon is added: changing it needs the Home Screen app deleted
-     and re-added, not just a reload. Known cost: the clock and battery are drawn white
-     regardless of theme, so in light mode they sit on the cream header. -->
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- No apple-mobile-web-app-status-bar-style: the default keeps the status bar opaque and
+     starts the page below it. black-translucent put the page under the clock, but a Home
+     Screen app then blurred the top of the page behind the status bar and reported
+     every height (innerHeight, the visual viewport, dvh/svh) 59pt short of the screen,
+     leaving a band under the footer. The value is read when the icon is added: changing it
+     needs the Home Screen app deleted and re-added, not just a reload. -->
 <meta name="theme-color" content="#f0eee6" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1c1b19" media="(prefers-color-scheme: dark)">
 <title>ccbb</title>
@@ -186,6 +182,8 @@ const MOBILE_HTML = `<!DOCTYPE html>
      unsafe areas in the first place; they only become real in standalone (Home Screen),
      which is how this front-end is meant to be run. */
   --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
+  /* The page's height with the keyboard down. dvh, since Safari's toolbars come and go. */
+  --full-h:100dvh;
 }
 @media (prefers-color-scheme: dark){
   :root{
@@ -213,13 +211,14 @@ body{
 /* Like the terminal, the session stack follows the visible viewport while the
    document keeps its layout size. */
 #stack{position:fixed;top:var(--app-top,0px);left:0;right:0;
-  height:var(--app-h,100dvh);min-height:0;display:flex;flex-direction:column;
+  height:var(--app-h,var(--full-h));min-height:0;display:flex;flex-direction:column;
   overflow:hidden;background:var(--bg);
-  padding-top:var(--safe-t);padding-bottom:var(--safe-b)}
+  padding-top:var(--safe-t)}
+/* No bottom inset: the footer sits on the screen's bottom edge, under the home indicator,
+   rather than above an empty strip the height of it. */
 /* Keyboard up (body.kb, see syncViewport): the composer's bottom edge is the keyboard's
-   top edge. The footer under it and the home-indicator inset would sit behind the
-   keyboard on a full-height page; on one cut to the visual viewport they are dropped. */
-body.kb #stack{padding-bottom:0}
+   top edge. The footer under it would sit behind the keyboard on a full-height page; on
+   one cut to the visual viewport it is dropped. */
 body.kb .sfoot,body.kb .sv-foot{display:none}
 /* The full-screen editor and // output carry their own inset; the keyboard covers it too. */
 body.kb.comp-max .pbody.cmax .composer{padding-bottom:8px}
@@ -508,7 +507,7 @@ body.has-max .panel:not(.max){display:none}
    — see compMaxOwner — so they never stack. The safe-area padding goes on .cmd-head
    rather than on the fixed box, so the strip behind the status bar is the header's
    colour instead of the content's white. */
-body.cmd-max .pbody.cmdmax .cmd-box{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-h,100dvh);
+body.cmd-max .pbody.cmdmax .cmd-box{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-h,var(--full-h));
   z-index:150;border-top:none}
 body.cmd-max .pbody.cmdmax .cmd-head{padding-top:var(--safe-t);min-height:calc(40px + var(--safe-t))}
 body.cmd-max .pbody.cmdmax .cmd-content{padding-bottom:calc(10px + var(--safe-b))}
@@ -572,7 +571,7 @@ body.cmd-max .pbody.cmdmax .cmd-content{padding-bottom:calc(10px + var(--safe-b)
    while 100vh does not, so a bottom-anchored send button would sit behind the keys. Its
    own safe-area padding, because it sits outside the stack's padding.
    --app-top follows visualViewport.offsetTop when Safari pans on focus. */
-body.comp-max .pbody.cmax .composer{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-h,100dvh);
+body.comp-max .pbody.cmax .composer{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-h,var(--full-h));
   z-index:150;border-top:none;
   padding-top:calc(8px + var(--safe-t));
   padding-bottom:calc(8px + var(--safe-b))}
@@ -909,13 +908,23 @@ function syncViewport(){
   var vv = mobileViewport();
   if (vv.scale > 1.01) return;
   var doc = document.documentElement;
-  doc.style.setProperty('--app-h', vv.height+'px');
-  doc.style.setProperty('--app-top', vv.offsetTop+'px');
+  var kb = keyboardUp();
+  // Keyboard down in our own window: the CSS fallbacks (top 0, --full-h) are the screen. The
+  // visual viewport is followed only while the keyboard is up, and always in a host's iframe
+  // (ttn), whose own 100dvh is the frame's layout size.
+  if (!kb && viewportWindow === window) {
+    doc.style.removeProperty('--app-h');
+    doc.style.removeProperty('--app-top');
+  } else {
+    doc.style.setProperty('--app-h', vv.height+'px');
+    doc.style.setProperty('--app-top', vv.offsetTop+'px');
+  }
   // With the keyboard up the composer sits right on it: the home-indicator inset and
   // the status footer under the composer belong to the screen's edge, and the keyboard
   // is covering that edge (see body.kb).
-  document.body.classList.toggle('kb', keyboardUp());
+  document.body.classList.toggle('kb', kb);
   if (termState && termState.fitViewport) termState.fitViewport();
+  if (vpEl) vpPaint();
 }
 // Recheck while focused and through keyboard dismissal, covering missed events
 // during keyboard animations. Terminal fitting skips unchanged geometry.
@@ -956,6 +965,70 @@ if (viewportWindow !== window) {
 window.addEventListener('resize', syncViewport);
 window.addEventListener('orientationchange', function(){ setTimeout(syncViewport, 250); });
 syncViewport();
+
+// ── viewport readout ─────────────────────────────────────────────────────────
+// What iOS reports, on the phone itself: a Home Screen app has no inspector at hand and
+// its viewport numbers differ from a Safari tab's. Toggled by //vp in any composer, or
+// ?vp=1 / ?vp=0 in the URL; remembered per device.
+var vpEl = null, vpProbes = null;
+function vpStored(on){
+  try {
+    if (on === true) localStorage.setItem('ccbb.vp', '1');
+    else if (on === false) localStorage.removeItem('ccbb.vp');
+    return localStorage.getItem('ccbb.vp') === '1';
+  } catch(e){ return !!on; }
+}
+function vpPaint(){
+  if (!vpEl) return;
+  var px = function(v){ return Math.round(v * 10) / 10; };
+  var vv = window.visualViewport, doc = document.documentElement;
+  var st = document.getElementById('stack'), r = st ? st.getBoundingClientRect() : null;
+  var rows = [
+    ['standalone', String(!!navigator.standalone) + ' / ' + matchMedia('(display-mode: standalone)').matches],
+    ['screen', screen.width + 'x' + screen.height + ' @' + devicePixelRatio],
+    ['inner', innerWidth + 'x' + innerHeight + '  client h ' + doc.clientHeight],
+    ['visual', vv ? px(vv.width) + 'x' + px(vv.height) + ' top ' + px(vv.offsetTop) + ' scale ' + px(vv.scale) : 'none'],
+    ['vh dvh', vpProbes.vh.offsetHeight + ' ' + vpProbes.dvh.offsetHeight],
+    ['svh lvh', vpProbes.svh.offsetHeight + ' ' + vpProbes.lvh.offsetHeight],
+    ['safe t/b', vpProbes.st.offsetHeight + ' / ' + vpProbes.sb.offsetHeight],
+    ['--app-h/top', (doc.style.getPropertyValue('--app-h') || 'unset') + ' / ' + (doc.style.getPropertyValue('--app-top') || 'unset')],
+    ['kb', String(document.body.classList.contains('kb'))],
+    ['#stack', r ? px(r.top) + '..' + px(r.bottom) + ' h ' + px(r.height) : 'none'],
+  ];
+  vpEl.innerHTML = '';
+  rows.forEach(function(row){
+    var d = document.createElement('div');
+    d.textContent = row[0] + ': ' + row[1];
+    vpEl.appendChild(d);
+  });
+}
+function vpShow(on){
+  if (on && !vpEl) {
+    vpProbes = {};
+    [['vh', 'height:100vh'], ['dvh', 'height:100dvh'], ['svh', 'height:100svh'], ['lvh', 'height:100lvh'],
+     ['st', 'height:0;padding-top:env(safe-area-inset-top)'], ['sb', 'height:0;padding-top:env(safe-area-inset-bottom)']
+    ].forEach(function(p){
+      var d = document.createElement('div');
+      d.style.cssText = 'position:fixed;top:0;left:-50px;width:1px;visibility:hidden;pointer-events:none;' + p[1];
+      document.body.appendChild(d);
+      vpProbes[p[0]] = d;
+    });
+    vpEl = document.createElement('div');
+    vpEl.style.cssText = 'position:fixed;left:8px;right:8px;top:35%;z-index:99999;pointer-events:none;' +
+      'background:rgba(0,0,0,.78);color:#fff;font:12px/1.45 ui-monospace,Menlo,monospace;padding:8px 10px;border-radius:8px';
+    document.body.appendChild(vpEl);
+    vpPaint();
+  } else if (!on && vpEl) {
+    vpEl.remove(); vpEl = null;
+    for (var k in vpProbes) vpProbes[k].remove();
+    vpProbes = null;
+  }
+}
+window.ccbbVpToggle = function(){ vpShow(vpStored(!vpStored())); };
+(function(){
+  var q = new URLSearchParams(location.search).get('vp');
+  vpShow(vpStored(q === '1' ? true : q === '0' ? false : undefined));
+})();
 
 // ── panel stack ───────────────────────────────────────────────────────────────
 var stackEl = document.getElementById('stack');
@@ -2465,6 +2538,7 @@ function createSessionPanel(sid, server){
     var name = sp === -1 ? cbody : cbody.slice(0, sp);
     var args = sp === -1 ? '' : cbody.slice(sp+1);
     if (!name) return;
+    if (name === 'vp' && window.ccbbVpToggle) return window.ccbbVpToggle();   // the viewport readout, not a shell command
     execCmd({ name:name, args:args, cwd:cmdCwd });
   }
   // The last call is kept so ↻ runs the same command in the directory it first ran in.
@@ -2877,10 +2951,12 @@ function openTerminal(server, sessionId){
     if (t.destroyed) return;
     var vv = mobileViewport();
     if (vv.scale > 1.01) return;
-    var top = vv.offsetTop + 'px', h = vv.height + 'px';
+    // Keyboard down in our own window: the screen, as syncViewport has it (--full-h).
+    var kb = keyboardUp(), own = !kb && viewportWindow === window;
+    var top = own ? '0px' : vv.offsetTop + 'px', h = own ? 'var(--full-h)' : vv.height + 'px';
     // The home-indicator inset belongs at the screen edge, not between the
     // software keyboard and our keys. Some browsers retain it with keys up.
-    var pad = keyboardUp() ? '0px' : '';
+    var pad = kb ? '0px' : '';
     // syncViewport also polls this while the keyboard may be moving; an unchanged
     // geometry must not refit, which would resend the size to the pty every tick.
     // Width is checked too: a side-by-side resize changes only the columns.

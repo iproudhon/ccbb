@@ -139,6 +139,28 @@ function blockChars(b) {
   }
   try { return JSON.stringify(b).length; } catch { return 0; }
 }
+// A file's lines, read in chunks: a long session's transcript passes V8's ~512 MiB
+// string limit, where readFileSync(…, 'utf8') throws. Opens eagerly so a missing file
+// throws here, not on the first iteration. 0x0a never occurs inside a UTF-8 sequence.
+function fileLines(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  return (function* () {
+    try {
+      const chunk = Buffer.alloc(8 * 1024 * 1024);
+      let carry = null, pos = 0, n;
+      while ((n = fs.readSync(fd, chunk, 0, chunk.length, pos)) > 0) {
+        pos += n;
+        let buf = chunk.subarray(0, n);
+        if (carry) { buf = Buffer.concat([carry, buf]); carry = null; }
+        let start = 0, nl;
+        while ((nl = buf.indexOf(0x0a, start)) !== -1) { yield buf.toString('utf8', start, nl); start = nl + 1; }
+        if (start < buf.length) carry = Buffer.from(buf.subarray(start));
+      }
+      if (carry) yield carry.toString('utf8');
+    } finally { fs.closeSync(fd); }
+  })();
+}
+
 function contentChars(content) {
   if (typeof content === 'string') return content.length;
   return Array.isArray(content) ? content.reduce((n, b) => n + blockChars(b), 0) : 0;
@@ -261,10 +283,10 @@ function buildClaudeSkeleton(sessionId, usagePaths) {
   let version = null, startedAt = null, lastActivity = null;
   for (const filePath of usagePaths) {
     const isMain = filePath === mainPath;
-    let text;
-    try { text = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
+    let lines;
+    try { lines = fileLines(filePath); } catch { continue; }
     let lastUserTs = null;
-    for (const line of text.split('\n')) {
+    for (const line of lines) {
       if (!line.trim()) continue;
       let d;
       try { d = JSON.parse(line); } catch { continue; }
@@ -378,8 +400,8 @@ function codexMessageRow(payload, ts) {
   return { type, tokens: estTokens(chars), ts: isNaN(ts) ? null : ts, est: 1 };
 }
 function buildCodexSkeleton(filePath) {
-  let text;
-  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+  let lines;
+  try { lines = fileLines(filePath); } catch { return null; }
   const responses = [], messages = [];
   const models = new Set(), sources = new Set();
   let sessionId = path.basename(filePath, '.jsonl');
@@ -405,7 +427,7 @@ function buildCodexSkeleton(filePath) {
       respMs,
     });
   };
-  for (const line of text.split('\n')) {
+  for (const line of lines) {
     if (!line.trim()) continue;
     let d;
     try { d = JSON.parse(line); } catch { continue; }

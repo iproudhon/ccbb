@@ -33,6 +33,7 @@
 //
 //   ccbb attach <session-id> [--label me@laptop] [--url ws://…]
 
+const path = require('path');
 const readline = require('readline');
 const { muxAddress } = require('./ccbb-mux');
 const common = require('./ccbb-common');
@@ -59,7 +60,7 @@ const STATUS_DEBOUNCE_MS = 300;
 function statusLineConfig() {
   try {
     const dir = process.env.CLAUDE_CONFIG_DIR || common.CLAUDE_DIR;
-    const j = JSON.parse(require('fs').readFileSync(require('path').join(dir, 'settings.json'), 'utf8'));
+    const j = JSON.parse(require('fs').readFileSync(path.join(dir, 'settings.json'), 'utf8'));
     const sl = j && j.statusLine;
     if (!sl || sl.type !== 'command' || !sl.command) return null;
     return { command: sl.command, padding: Number(sl.padding) || 0,
@@ -105,6 +106,8 @@ class StatusLine {
     // rate_limits switches to its subscription layout. Same reader as ccbb web's footer.
     let sub = null;
     try { sub = common.getSubscription(); } catch {}
+    if (st.planWindows && (!sub || !sub.windows || !sub.fetchedAt || (st.planWindowsAt || 0) >= sub.fetchedAt))
+      sub = { windows: st.planWindows };
     if (sub && sub.windows) {
       const w = k => sub.windows[k] ? { used_percentage: sub.windows[k].pct, resets_at: sub.windows[k].resetsAt } : undefined;
       p.rate_limits = { five_hour: w('fiveHour'), seven_day: w('sevenDay') };
@@ -681,6 +684,7 @@ class TuiClient {
   // that were byte-matched against the real CLI be re-run on every repaint.
   out(s) {
     if (s == null) return;
+    this.outCount = (this.outCount || 0) + 1;
     if (this.sink) { this.sink.push(...String(s).split('\n')); return; }
     if (!this.tty) { process.stdout.write(s + '\n'); return; }
     this.push({ t: 'lines', lines: String(s).split('\n') });
@@ -857,7 +861,7 @@ class TuiClient {
     const st = this.state;
     const cost = st.agent === 'codex' ? (st.cost == null ? 'cost: —' : `~$${Number(st.cost).toFixed(2)}`) : (st.cost ? `$${Number(st.cost).toFixed(2)}` : '$0.00');
     const ctx = st.contextTokens ? `ctx:${Math.round(st.contextTokens / 1000)}k` : null;
-    const windows = st.agent === 'codex' ? common.codexWindows(st.rateLimits) : {};
+    const windows = st.agent === 'codex' ? common.codexWindows(st.rateLimits) : (st.planWindows || {});
     const plan = [['5h', windows.fiveHour], ['7d', windows.sevenDay]].filter(([, w]) => w).map(([label, w]) => label + ':' + Math.round(w.pct) + '%').join('  ');
     const bits = [st.agent === 'codex' ? null : st.model || '?', cost, plan, st.turns != null ? `turns:${st.turns}` : null, ctx].filter(Boolean);
     const mode = st.permissionMode || 'manual';
@@ -1052,7 +1056,7 @@ class TuiClient {
   // rather than being drawn over the editor.
   editLine() {
     if (!this.tty || this.editing) return;
-    const fs = require('fs'), os = require('os'), path = require('path');
+    const fs = require('fs'), os = require('os');
     const { spawnSync } = require('child_process');
     const file = path.join(os.tmpdir(), `ccbb-mux-${process.pid}-${Date.now()}.md`);
     try { fs.writeFileSync(file, this.line, { mode: 0o600 }); } catch { return; }
@@ -1215,17 +1219,44 @@ class TuiClient {
     this.statusLine.update(this.state, this.lastUsage);
     this.peers = m.clients || [];
     this.out(A.gray(`— ${this.state.title || this.state.label || this.state.id} · ${this.state.cwd} · ${this.state.messages || (m.messages || []).length} messages —`));
-    // An exited session stays in the mux so its transcript stays readable, and a name
-    // still resolves to it once nothing live holds that name — so `ccbb attach api`
-    // can land on a dead session. It renders, it accepts typing, and nothing answers.
-    // Say so on the way in rather than let it look like a session that is merely quiet.
-    if (this.state.status === 'exited') {
-      const ex = this.state.exit || {};
-      this.out(A.red(`— this session has exited${ex.code != null ? ` (code ${ex.code})` : ''}; ` +
-        'its transcript is readable but nothing will answer. Start a new one with `ccbb new`. —'));
-    }
     for (const msg of (m.messages || [])) this.renderMessage(msg);
     for (const p of (m.pending || [])) this.renderRequest(p);
+    // An exited session stays in the mux so its transcript stays readable, and a name
+    // still resolves to it once nothing live holds that name — so `ccbb attach api`
+    // can land on a dead session.
+    if (this.state.status === 'exited') return this.onExited(m.stderr);
+    this.drawPrompt();
+  }
+
+  // The session is dead, either on arrival or while attached — `ccbb claude` attaches
+  // before a child that rejects its arguments has had time to die. Say why, and how to
+  // pick it back up. With a transcript on a terminal, stay as a viewer: it renders and
+  // nothing answers. With nothing to read, or no terminal to read it on, waiting would
+  // only look like a hang, so leave.
+  onExited(stderr) {
+    const shown = !!this.shownMessage;
+    this.state.status = 'exited';
+    this.syncBusy();
+    for (const t of stderr || []) this.out(A.red('  ' + String(t).trimEnd()));
+    const ex = this.state.exit || {};
+    const again = this.state.agent === 'codex' ? 'ccbb codex'
+      : `ccbb ${path.basename(this.state.bin || 'claude')} --resume ${String(this.state.id || '').slice(0, 8)}`;
+    this.out(A.red(`— this session has exited${ex.code != null ? ` (code ${ex.code})` : ex.signal ? ` (${ex.signal})` : ''}; ` +
+      (shown ? `nothing will answer. Pick it up again with \`${again}\`. —` : 'it never started. —')));
+    // The child's last stderr can trail its exit event, and a pipe on macOS is written
+    // asynchronously: give both a moment before leaving.
+    if (!shown || !this.tty) {
+      const code = shown ? 0 : 1;
+      return setTimeout(() => {
+        // What was drawn went to the alternate screen, which restore() discards; with no
+        // transcript it is only the header and the reason, so say it again on the real one.
+        if (this.restore) {
+          this.restore();
+          for (const e of this.entries) if (e.t === 'lines') process.stdout.write(e.lines.join('\n') + '\n');
+        }
+        process.stdout.write('', () => process.exit(code));
+      }, 500);
+    }
     this.drawPrompt();
   }
 
@@ -1297,10 +1328,13 @@ class TuiClient {
         this.endStream();
         this.state.activity = null;
         this.setBusy(false);
-        if (e.costUsd != null) this.state.cost = (this.state.cost || 0) + e.costUsd;
-        this.state.turns = (this.state.turns || 0) + 1;
+        // e.live: the mux already moved these response by response ('stats' events).
         const u = e.usage || {};
-        this.state.contextTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        if (!e.live) {
+          if (e.costUsd != null) this.state.cost = (this.state.cost || 0) + e.costUsd;
+          this.state.turns = (this.state.turns || 0) + 1;
+          this.state.contextTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        }
         this.lastUsage = u;
         this.statusLine.update(this.state, u);
         const why = e.isError ? (e.result || (e.errors || []).map(x => x.message || x).join('; ')) : '';
@@ -1349,6 +1383,7 @@ class TuiClient {
         this.state.activity = e.activity || null;
         this.state.turnStartedAt = e.turnStartedAt || null;
         if (e.exit) this.state.exit = e.exit;
+        if (e.status === 'exited') return this.state.status === 'exited' ? undefined : this.onExited(null);
         return this.setBusy(e.status === 'busy');
       // The transcript-derived figures (cost, turns, context) the web footer runs on;
       // the status-line script gets them too, so the two agree.
@@ -1378,7 +1413,13 @@ class TuiClient {
       case 'stderr': return this.out(A.red('  ' + String(e.text).trimEnd()));
       // Silent on purpose: the list feeds "/" and Tab, it isn't news.
       case 'commands': this.state.commands = e.commands || []; return;
-      case 'rate_limit': case 'goal': case 'autocompact':
+      case 'rate_limit':
+        if (!e.windows || !(e.windows.fiveHour || e.windows.sevenDay)) return;
+        this.state.planWindows = e.windows;
+        this.state.planWindowsAt = e.at || Date.parse(e.ts) || Date.now();
+        this.statusLine.update(this.state, this.lastUsage);
+        return this.paint();
+      case 'goal': case 'autocompact':
       case 'tool_pending': return this.pendingTool(e);
       case 'turn_start': case 'unknown':
         return;
@@ -1405,7 +1446,14 @@ class TuiClient {
     }).join('\n'));
   }
 
+  // Whether any message has drawn something. onExited needs it: meta and synthetic
+  // turns arrive as messages and render as nothing, so a count of messages would not do.
   renderMessage(msg) {
+    const before = (this.outCount || 0) + this.entries.length;
+    try { return this.renderMessageOrUpdate(msg); }
+    finally { if ((this.outCount || 0) + this.entries.length > before) this.shownMessage = true; }
+  }
+  renderMessageOrUpdate(msg) {
     if (!msg.codexType || !msg.id) return this.renderMessageBody(msg);
     const previous = this.codexMessages.get(msg.id);
     if (previous && previous.message.role === msg.role && JSON.stringify(previous.message.blocks) === JSON.stringify(msg.blocks)) return;

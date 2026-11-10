@@ -488,6 +488,14 @@ function maybeRefreshUsage() {
       .finally(() => { usageRefreshing = false; });
   } catch { usageRefreshing = false; }
 }
+// The newest windows a Claude session in this process reported (its rate_limit_event),
+// a third reading beside the two above — and on ANTHROPIC_AUTH_TOKEN the only one.
+// It carries no account identity (the token may not be .claude.json's login), so it is
+// only a fallback: used when neither account-checked reading has windows.
+let sessionWindows = null;
+function noteSessionWindows(windows, at) {
+  if (windows && (windows.fiveHour || windows.sevenDay)) sessionWindows = { at: at || Date.now(), windows };
+}
 // This server's subscription, or null when it isn't on one. Kicks the background
 // refresh and answers from whatever is already on disk.
 function getSubscription() {
@@ -504,6 +512,7 @@ function getSubscription() {
   if (cached && (!cached.accountUuid || cached.accountUuid === account.accountUuid))
     readings.push({ at: Number(cached.fetchedAtMs) || 0, u: cached.utilization, source: 'claude-code' });
   readings.sort((a, b) => b.at - a.at);
+  if (sessionWindows) readings.push({ at: sessionWindows.at, windows: sessionWindows.windows, source: 'session' });
   const creds = oauthCreds();
   const out = {
     server: serverIdentity().name,
@@ -512,7 +521,7 @@ function getSubscription() {
     windows: null, fetchedAt: null, source: null,
   };
   for (const r of readings) {
-    const windows = normalizeUsageWindows(r.u);
+    const windows = r.windows || normalizeUsageWindows(r.u);
     if (!windows) continue;
     out.windows = windows; out.fetchedAt = r.at || null; out.source = r.source;
     break;
@@ -668,7 +677,7 @@ function computeSessionStats(sessionId, opts) {
   for (const filePath of usagePaths) {
     const isMain = filePath === mainPath;
     let entries;
-    try { entries = parseJsonl(fs.readFileSync(filePath, 'utf8')); } catch { continue; }
+    try { entries = readJsonl(filePath); } catch { continue; }
     const fin = finalResponses(entries);
     for (const d of entries) {
       if (isMain) {
@@ -1289,7 +1298,11 @@ function getSessionCwd(sessionId) {
     const whole = head.length < 256 * 1024;
     const hit = scan((whole ? head : head.subarray(0, head.lastIndexOf(0x0a) + 1)).toString('utf8'));
     if (hit || whole) return hit;
-    return scan(fs.readFileSync(filePath, 'utf8'));
+    let found = null;
+    forEachLine(filePath, line => {
+      try { const d = JSON.parse(line); if (d.cwd) { found = d.cwd; return false; } } catch {}
+    });
+    return found;
   } catch { return null; }
 }
 
@@ -1337,18 +1350,15 @@ function historyEntries(filePath) {
     // reads the way it did, so start over.
     if (c && c.offset && !historyMark(fd, c.offset).equals(c.mark)) c = null;
     if (!c) c = { ino: st.ino, offset: 0, entries: [], mark: null, mtimeMs: 0 };
-    let buf = Buffer.alloc(Math.max(0, st.size - c.offset));
-    buf = buf.subarray(0, buf.length ? fs.readSync(fd, buf, 0, buf.length, c.offset) : 0);
     // Only whole lines: the writer may be mid-line, and that line is read next time.
-    const end = buf.lastIndexOf(0x0a) + 1;
-    for (const line of buf.subarray(0, end).toString('utf8').split('\n')) {
-      if (!line.trim()) continue;
+    const end = forEachLine(fd, line => {
+      if (!line.trim()) return;
       let d;
-      try { d = JSON.parse(line); } catch { continue; }
+      try { d = JSON.parse(line); } catch { return; }
       const e = transcriptEntry(d);
       if (e) c.entries.push(e);
-    }
-    if (end) { c.offset += end; c.mark = historyMark(fd, c.offset); }
+    }, { from: c.offset, to: st.size, tail: false });
+    if (end > c.offset) { c.offset = end; c.mark = historyMark(fd, c.offset); }
     c.mtimeMs = st.mtimeMs;
   } catch { return c ? c.entries : []; }
   finally { fs.closeSync(fd); }
@@ -1416,13 +1426,10 @@ function getSubagentHistory(sessionId, agentId) {
   const mainPath = findSessionJsonl(sessionId);
   if (!mainPath) return [];
   const filePath = path.join(path.dirname(mainPath), sessionId, 'subagents', 'agent-' + safe + '.jsonl');
-  let text;
-  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return []; }
+  let parsed;
+  try { parsed = readJsonl(filePath); } catch { return []; }
   const entries = [];
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
+  for (const d of parsed) {
     const e = transcriptEntry(d, { keepSidechain: true });
     if (e) entries.push(e);
   }
@@ -1561,6 +1568,48 @@ function stopTail(sessionId) {
   if (entry.filePath && entry.onChange) { try { fs.unwatchFile(entry.filePath, entry.onChange); } catch {} }
   _tailers.delete(sessionId);
 }
+// Every line of a file, read in chunks. A long session's transcript passes V8's
+// ~512 MiB string limit, where readFileSync(…, 'utf8') throws ERR_STRING_TOO_LONG.
+// Split on the 0x0a byte, which never occurs inside a multi-byte UTF-8 sequence.
+// src is a path or an open fd (left open). opts.from / opts.to: byte range to read
+// (to defaults to EOF).
+// opts.tail === false leaves an unterminated last line unread — the writer may be
+// mid-line. fn returning false stops the read. Returns the offset just past the
+// last line handed to fn.
+function forEachLine(src, fn, opts) {
+  const from = (opts && opts.from) || 0, to = opts && opts.to != null ? opts.to : Infinity;
+  const tail = !opts || opts.tail !== false;
+  const fd = typeof src === 'number' ? src : fs.openSync(src, 'r');
+  try {
+    const chunk = Buffer.alloc(8 * 1024 * 1024);
+    let carry = null, pos = from, done = from, n;
+    while (pos < to && (n = fs.readSync(fd, chunk, 0, Math.min(chunk.length, to - pos), pos)) > 0) {
+      pos += n;
+      let buf = chunk.subarray(0, n);
+      if (carry) { buf = Buffer.concat([carry, buf]); carry = null; }
+      let start = 0, nl;
+      while ((nl = buf.indexOf(0x0a, start)) !== -1) {
+        const stop = nl > start && fn(buf.toString('utf8', start, nl)) === false;
+        start = nl + 1;
+        if (stop) return pos - (buf.length - start);
+      }
+      done = pos - (buf.length - start);
+      if (start < buf.length) carry = Buffer.from(buf.subarray(start));
+    }
+    if (tail && carry && carry.length) { fn(carry.toString('utf8')); done = pos; }
+    return done;
+  } finally { if (fd !== src) fs.closeSync(fd); }
+}
+// parseJsonl over a file, without holding the file as one string.
+function readJsonl(filePath) {
+  const out = [];
+  forEachLine(filePath, line => {
+    if (!line.trim()) return;
+    try { out.push(JSON.parse(line)); } catch { /* torn tail */ }
+  });
+  return out;
+}
+
 function _readNewLines(sessionId) {
   const entry = _tailers.get(sessionId);
   if (!entry || !entry.filePath) return;
@@ -1890,7 +1939,7 @@ function sessionContribution(usagePaths) {
   for (const fp of usagePaths) {
     const isSub = fp !== mainPath;
     let entries;
-    try { entries = parseJsonl(fs.readFileSync(fp, 'utf8')); } catch { continue; }
+    try { entries = readJsonl(fp); } catch { continue; }
     const fin = finalResponses(entries);
     for (const d of entries) {
       // Anchor for response time: the last user entry (prompt or tool_result) before an
@@ -1974,6 +2023,20 @@ function codexWindows(limits) {
   }
   return windows;
 }
+// Claude's own rate_limit_event (stream-json) carries the plan windows on every turn as
+// utilization 0..1. The only source on a session run with ANTHROPIC_AUTH_TOKEN: Claude
+// Code then neither caches cachedUsageUtilization nor leaves OAuth creds ccbb can read.
+function claudeWindows(info) {
+  const windows = {}, u = info && info.unifiedWindows;
+  if (!u) return windows;
+  for (const [key, name] of [['five_hour', 'fiveHour'], ['seven_day', 'sevenDay']]) {
+    const w = u[key];
+    if (!w || !Number.isFinite(w.utilization)) continue;
+    const reset = Number.isFinite(w.resetsAt) ? new Date(w.resetsAt * 1000) : null;
+    windows[name] = { pct: w.utilization * 100, resetsAt: reset && Number.isFinite(reset.getTime()) ? reset.toISOString() : null };
+  }
+  return windows;
+}
 
 // A GFM table the model wrote with every row on one line — "| a | b | |---|---| | 1 | 2 |",
 // rows joined by "| |" — which marked shows as a paragraph of pipes. The separator row
@@ -2002,8 +2065,8 @@ function unjoinTables(src) {
 }
 
 module.exports = {
-  muxTitle, sessionRow,
-  codexWindows, unjoinTables,
+  muxTitle, sessionRow, forEachLine, readJsonl,
+  codexWindows, claudeWindows, unjoinTables,
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
   serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable,
@@ -2018,7 +2081,7 @@ module.exports = {
   // listing + cost summary
   getSessions, sessionContribution, getCostSummary,
   // subscription usage windows
-  getSubscription, subscriptionAccount, maybeRefreshUsage, USAGE_FILE,
+  getSubscription, subscriptionAccount, maybeRefreshUsage, noteSessionWindows, USAGE_FILE,
   // liveness + mutation
   pidAlive, sessionLiveness, liveSessionIds, liveSessionRecords, livePidsForSession, renameSession,
   // tmux + transcript
