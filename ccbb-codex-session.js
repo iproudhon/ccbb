@@ -420,7 +420,11 @@ async function createCodexSession(mux, opt) {
     }
     const untested = !/\/0\.154\./.test(rpc.info.userAgent || '');
     const prior = ref ? await readHistory(rpc, ref) : null;
-    const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref } : { cwd: opt.cwd || process.cwd(), ...(opt.model ? { model: opt.model } : {}), ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
+    // Model and config (Compact at) ride on all three: a resume or fork that dropped them
+    // would quietly run on whatever the thread had. A thread already loaded elsewhere
+    // returned above, untouched — the dialog says so.
+    const pick = { ...(opt.model ? { model: opt.model } : {}), ...(opt.config ? { config: opt.config } : {}) };
+    const result = await rpc.request(ref ? (opt.fork ? 'thread/fork' : 'thread/resume') : 'thread/start', ref ? { threadId: ref, ...pick } : { cwd: opt.cwd || process.cwd(), ...pick, ...(opt.approvalPolicy ? {approvalPolicy:opt.approvalPolicy} : {}), ...(opt.sandbox ? {sandbox:opt.sandbox} : {}), ...(opt.approvalsReviewer ? {approvalsReviewer:opt.approvalsReviewer} : {}) });
     if (!result.thread || !result.thread.id) throw new Error('Codex returned no thread identity');
     if (opt.fork && result.thread.id === ref) throw new Error('Codex fork did not return a distinct thread ID');
     // A reconnect to a thread this mux already holds keeps what it was showing until

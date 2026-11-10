@@ -280,6 +280,8 @@ var OPENAI_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" heig
 var CLAUDE_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"></path></svg>';
 function shortSessionId(id) { return String(id || '').replace(/^codex:/, '').slice(0, 8); }
 // Every session carries its agent's mark, running or not; the circle's colour is the activity.
+// Lobe Icons (@lobehub/icons), like the two above: the server menu's AWS SSO login.
+var AWS_GLYPH = '<svg aria-hidden="true" fill="#fff" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6.763 11.212c0 .296.032.535.088.71.064.176.144.368.256.576.04.063.056.127.056.183 0 .08-.048.16-.152.24l-.503.335a.383.383 0 01-.208.072c-.08 0-.16-.04-.239-.112a2.47 2.47 0 01-.287-.375 6.18 6.18 0 01-.248-.471c-.622.734-1.405 1.101-2.347 1.101-.67 0-1.205-.191-1.596-.574-.39-.384-.59-.894-.59-1.533 0-.678.24-1.23.726-1.644.487-.415 1.133-.623 1.955-.623.272 0 .551.024.846.064.296.04.6.104.918.176v-.583c0-.607-.127-1.03-.375-1.277-.255-.248-.686-.367-1.3-.367-.28 0-.568.031-.863.103-.295.072-.583.16-.862.272-.09.04-.184.075-.28.104a.488.488 0 01-.127.023c-.112 0-.168-.08-.168-.247v-.391c0-.128.016-.224.056-.28a.597.597 0 01.224-.167 4.577 4.577 0 011.005-.36 4.84 4.84 0 011.246-.151c.95 0 1.644.216 2.091.647.44.43.662 1.085.662 1.963v2.586h.016zm-3.24 1.214c.263 0 .534-.048.822-.144a1.78 1.78 0 00.758-.51 1.27 1.27 0 00.272-.512c.047-.191.08-.423.08-.694v-.335a6.66 6.66 0 00-.735-.136 6.02 6.02 0 00-.75-.048c-.535 0-.926.104-1.19.32-.263.215-.39.518-.39.917 0 .375.095.655.295.846.191.2.47.296.838.296zm6.41.862c-.144 0-.24-.024-.304-.08-.064-.048-.12-.16-.168-.311L7.586 6.726a1.398 1.398 0 01-.072-.32c0-.128.064-.2.191-.2h.783c.151 0 .255.025.31.08.065.048.113.16.16.312l1.342 5.284 1.245-5.284c.04-.16.088-.264.151-.312a.549.549 0 01.32-.08h.638c.152 0 .256.025.32.08.063.048.12.16.151.312l1.261 5.348 1.381-5.348c.048-.16.104-.264.16-.312a.52.52 0 01.311-.08h.743c.127 0 .2.065.2.2 0 .04-.009.08-.017.128a1.137 1.137 0 01-.056.2l-1.923 6.17c-.048.16-.104.263-.168.311a.51.51 0 01-.303.08h-.687c-.15 0-.255-.024-.32-.08-.063-.056-.119-.16-.15-.32L12.32 7.747l-1.23 5.14c-.04.16-.087.264-.15.32-.065.056-.177.08-.32.08l-.686.001zm10.256.215c-.415 0-.83-.048-1.229-.143-.399-.096-.71-.2-.918-.32-.128-.071-.215-.151-.247-.223a.563.563 0 01-.048-.224v-.407c0-.167.064-.247.183-.247.048 0 .096.008.144.024.048.016.12.048.2.08.271.12.566.215.878.279.32.064.63.096.95.096.502 0 .894-.088 1.165-.264a.86.86 0 00.415-.758.777.777 0 00-.215-.559c-.144-.151-.416-.287-.807-.415l-1.157-.36c-.583-.183-1.014-.454-1.277-.813a1.902 1.902 0 01-.4-1.158c0-.335.073-.63.216-.886.144-.255.335-.479.575-.654.24-.184.51-.32.83-.415.32-.096.655-.136 1.006-.136.175 0 .36.008.535.032.183.024.35.056.518.088.16.04.312.08.455.127.144.048.256.096.336.144a.69.69 0 01.24.2.43.43 0 01.071.263v.375c0 .168-.064.256-.184.256a.83.83 0 01-.303-.096 3.652 3.652 0 00-1.532-.311c-.455 0-.815.071-1.062.223-.248.152-.375.383-.375.71 0 .224.08.416.24.567.16.152.454.304.877.44l1.134.358c.574.184.99.44 1.237.767.247.327.367.702.367 1.117 0 .343-.072.655-.207.926a2.157 2.157 0 01-.583.703c-.248.2-.543.343-.886.447-.36.111-.734.167-1.142.167z"></path><path d="M.378 15.475c3.384 1.963 7.56 3.153 11.877 3.153 2.914 0 6.114-.607 9.06-1.852.44-.2.814.287.383.607-2.626 1.94-6.442 2.969-9.722 2.969-4.598 0-8.74-1.7-11.87-4.526-.247-.223-.024-.527.272-.351zm23.531-.2c.287.36-.08 2.826-1.485 4.007-.215.184-.423.088-.327-.151l.175-.439c.343-.88.802-2.198.52-2.555-.336-.43-2.22-.207-3.074-.103-.255.032-.295-.192-.063-.36 1.5-1.053 3.967-.75 4.254-.399z"></path></svg>';
 function activityGlyph(agent) { return agent === 'codex' ? OPENAI_GLYPH : CLAUDE_GLYPH; }
 
 // ── subscription windows ──
@@ -1918,6 +1920,8 @@ function createListView(){
         + (RO ? '' : '<span class="chip-term" data-menu="'+esc(s.name)+'" title="New session, terminal, explorer on '+esc(s.name)+'">&#8942;</span>')
         + '</span>';
     }).join('');
+    // Ahead of the ⋮ menu, whose first row shows these.
+    if (!RO) servers.forEach(function(s){ if (s.status !== 'down') nsAuthRefresh(s.name, apiBase(s.name)); });
   }
   async function loadServers(){
     try {
@@ -2813,15 +2817,15 @@ function createMuxSessionView(INFO){
     if (RO || !INFO.snapshot) return;
     // Used only when the app-server has to be launched, but chosen like any other start.
     var codex = INFO.sessionId.indexOf('codex:') === 0;
-    var bin = await pickBinary({ server: SRV, base: API, agent: codex ? 'codex' : 'claude', title: INFO.title || '' });
-    if (!bin) return;
+    var pick = await pickBinary({ server: SRV, base: API, agent: codex ? 'codex' : 'claude', title: INFO.title || '' });
+    if (!pick) return;
     var btn = el.querySelector('.vb-resume');
     if (btn) btn.disabled = true;
     try {
       var r = await fetch(API+'/mux/api/sessions', {method:'POST', headers:{'content-type':'application/json'},
-        body:JSON.stringify(codex ? {agent:'codex', bin:bin, resume:INFO.sessionId, startInactive:true}
+        body:JSON.stringify(Object.assign(codex ? {agent:'codex', resume:INFO.sessionId, startInactive:true}
           : {resume:INFO.sessionId, cwd:INFO.projectPath || INFO.snapshot.state.cwd || undefined,
-             label:INFO.title || undefined, bin:bin})});
+             label:INFO.title || undefined}, pick))});
       var d = await r.json();
       // 409 running-in-mux: what ▶ would make already exists, so open that instead.
       if (!r.ok && !(r.status === 409 && d && d.reason === 'running-in-mux')) throw new Error(d.error || 'Could not start mux session');
@@ -3991,13 +3995,13 @@ function createSessionView(INFO){
     // The mux does not pick a binary: claude / claude.pass / claude.aws are different
     // accounts on the same host, so the choice is asked for every time and only the
     // last answer is remembered, per server.
-    var bin = await pickBinary({ server: SRV, base: API, agent: 'claude', title: INFO.title || '' });
-    if (!bin) return;
+    var pick = await pickBinary({ server: SRV, base: API, agent: 'claude', title: INFO.title || '' });
+    if (!pick) return;
     var btn = el.querySelector('.vb-resume');
     if (btn) btn.disabled = true;
     fetch(API+'/mux/api/sessions', { method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ resume: INFO.sessionId, cwd: INFO.projectPath || undefined,
-        label: INFO.title || undefined, bin: bin }) })
+      body: JSON.stringify(Object.assign({ resume: INFO.sessionId, cwd: INFO.projectPath || undefined,
+        label: INFO.title || undefined }, pick)) })
       .then(function(r){ return r.json().then(function(d){ return { code:r.status, d:d }; }); })
       .then(function(r){
         // 409 running-in-mux is not a failure: the thing the button would have made

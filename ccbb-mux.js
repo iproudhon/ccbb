@@ -125,6 +125,63 @@ function scanBins() {
   return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+// The path a binary name runs as here: the key "per binary" settings are kept under.
+// Not realpath — claude.pass, claude.aws and claude.dsa are all symlinks to claude.sh
+// and are three different binaries; not the basename either — ~/bin/claude and
+// ~/.local/bin/claude are two. The dialog sends names, the CLI sends paths; both land here.
+function binKey(bin) {
+  bin = String(bin || '').trim();
+  if (!bin) return '';
+  if (bin.includes('/')) return path.resolve(bin);
+  for (const d of String(process.env.PATH || '').split(path.delimiter)) {
+    const f = d && path.join(d, bin);
+    try { if (f && fs.statSync(f).isFile()) return path.resolve(f); } catch {}
+  }
+  return bin;
+}
+
+// "Compact at": the context size, in tokens, a session auto-compacts at. Claude takes it
+// as CLAUDE_CODE_AUTO_COMPACT_WINDOW (clamped to the model's window), Codex as the
+// thread's model_auto_compact_token_limit. 200k, 1.5m, 200000; 'default' = leave it.
+// Returns a token count, null for default, or throws EINVAL.
+const COMPACT_MIN = 10000, COMPACT_MAX = 4000000;
+function parseCompactAt(v) {
+  if (v == null || v === '' || /^(default|off|none)$/i.test(String(v).trim())) return null;
+  const m = /^(\d+(?:\.\d+)?)\s*([km]?)$/i.exec(String(v).trim());
+  const n = m && Math.round(Number(m[1]) * ({ k: 1e3, m: 1e6 }[m[2].toLowerCase()] || 1));
+  if (!n || n < COMPACT_MIN || n > COMPACT_MAX) {
+    const e = new Error(`compact-at must be a token count between 10k and 4m (got '${v}')`); e.code = 'EINVAL'; throw e;
+  }
+  return n;
+}
+
+// What the new-session dialog last chose, per binary (binKey): the dialog's default
+// next time. Only the dialog reads it back — the CLI applies an explicit flag or nothing.
+const NEW_SESSION_FILE = () => path.join(MUX_DIR, 'new-session.json');
+function readNewSessionPrefs() {
+  try { const j = JSON.parse(fs.readFileSync(NEW_SESSION_FILE(), 'utf8')); return j && typeof j === 'object' ? j : {}; } catch { return {}; }
+}
+function rememberCompactAt(bin, n) {
+  const key = binKey(bin); if (!key) return;
+  const j = readNewSessionPrefs(); j.compactAt = j.compactAt || {};
+  if (n == null) delete j.compactAt[key]; else j.compactAt[key] = n;
+  ensureDir(MUX_DIR);
+  const tmp = NEW_SESSION_FILE() + '.' + process.pid + '.tmp';
+  try { fs.writeFileSync(tmp, JSON.stringify(j, null, 1), { mode: 0o600 }); fs.renameSync(tmp, NEW_SESSION_FILE()); } catch {}
+}
+function rememberedCompactAt(bin) {
+  const v = (readNewSessionPrefs().compactAt || {})[binKey(bin)];
+  return Number.isFinite(v) ? v : null;
+}
+
+// The models the dialog offers. Claude has no list to ask for: these are the CLI's own
+// aliases, which a wrapper's ANTHROPIC_DEFAULT_*_MODEL maps (claude.dsa → DSA-Max…),
+// and the [1m] ones are where a Compact at over 200K means anything.
+const CLAUDE_MODELS = [
+  { id: 'opus', name: 'Opus' }, { id: 'opus[1m]', name: 'Opus 1M' }, { id: 'sonnet', name: 'Sonnet' },
+  { id: 'sonnet[1m]', name: 'Sonnet 1M' }, { id: 'haiku', name: 'Haiku' }, { id: 'fable', name: 'Fable' },
+];
+
 // `~` expanded and the result required to be a directory — a typo'd cwd would otherwise
 // spawn in it anyway (claude) or fail deep inside an RPC (codex).
 function resolveCwd(cwd) {
@@ -191,6 +248,9 @@ function childEnv(extra) {
   // Start ccbb web from inside a Claude Code session's shell and the inherited value
   // would be 'cli' — the filter misses, and the pane gets adopted again with no sign why.
   env.CLAUDE_CODE_ENTRYPOINT = 'ccbb-mux';
+  // Compact at is ccbb's to set per session (see create). Inherited from a session ccbb
+  // web was started inside, it would apply to every session and "Default" could not clear it.
+  delete env.CLAUDE_CODE_AUTO_COMPACT_WINDOW; delete env.CCBB_COMPACT_WINDOW;
   return Object.assign(env, extra || {});
 }
 
@@ -323,7 +383,7 @@ class Session {
       // agent's own title replaces it as soon as there is one (setTitle). `label` on the
       // wire is the same string, kept for clients that still read it as the address.
       title: name, label: name,
-      bin: opt.bin, model: null, permissionMode: opt.permissionMode || null,
+      bin: opt.bin, model: null, permissionMode: opt.permissionMode || null, compactAt: opt.compactAt || null,
       tools: [], mcpServers: [], plugins: [], commands: [], slashCommands: [],
       capabilities: [], auth: null, cost: 0, tokens: 0, turns: 0,
       contextTokens: 0, contextPeak: 0, stats: null,
@@ -1433,13 +1493,27 @@ class Mux {
   create(o) {
     o = o || {};
     if (o.agent && !['claude', 'codex'].includes(o.agent)) throw new Error('Unknown agent');
+    // compactAt: a size, 'default' (clear), 'remembered' (a restart: whatever the dialog
+    // last chose for this binary), or absent (nothing set, nothing remembered). A size or
+    // 'default' from a caller is also what the dialog offers for this binary next time.
+    const compactBin = o.bin || (o.agent === 'codex' ? 'codex' : '');
+    let remember = false;
+    if (o.compactAt === 'remembered') o.compactAt = rememberedCompactAt(compactBin);
+    else if (o.compactAt !== undefined) { o.compactAt = parseCompactAt(o.compactAt); remember = true; }
+    const keep = () => { if (remember) rememberCompactAt(compactBin, o.compactAt ?? null); };
+    if (o.compactAt == null) delete o.compactAt;
+    else if (o.agent === 'codex') o.config = { ...(o.config || {}), model_auto_compact_token_limit: o.compactAt };
+    // The second name is for the claude.* wrappers, which clear the first before setting
+    // up their mode and re-export it from this one.
+    else o.env = { ...(o.env || {}), CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(o.compactAt), CCBB_COMPACT_WINDOW: String(o.compactAt) };
     // A remote codex app-server resolves its cwd on its own machine, not this one.
     if (o.cwd && !(o.agent === 'codex' && process.env.CCBB_CODEX_ENDPOINT)) o.cwd = resolveCwd(o.cwd);
     if (o.agent === 'codex') {
       if (!this.codexCreates) this.codexCreates = new Map();
       const key = o.resume && !o.fork ? o.resume.replace(/^codex:/, '') : uuid();
       if (this.codexCreates.has(key)) return this.codexCreates.get(key);
-      const creating = require('./ccbb-codex-session').createCodexSession(this, o).finally(() => this.codexCreates.delete(key));
+      const creating = require('./ccbb-codex-session').createCodexSession(this, o)
+        .then(s => { keep(); return s; }).finally(() => this.codexCreates.delete(key));
       this.codexCreates.set(key, creating); return creating;
     }
     o.bin = resolveBin(o.bin);
@@ -1474,6 +1548,7 @@ class Mux {
     }
     const s = new Session(this, o);
     this.sessions.set(s.id, s);
+    keep();
     this.notifyChange();
     return s;
   }
@@ -1541,7 +1616,54 @@ class Mux {
         } finally {rpc.close();}
       })().catch(e=>send(503,{error:e.message})); return;
     }
-    if (p === '/api/bins' && req.method === 'GET') return send(200, { bins: scanBins() });
+    if (p === '/api/bins' && req.method === 'GET') {
+      const remembered = readNewSessionPrefs().compactAt || {};
+      return send(200, { bins: scanBins().map(b => ({ ...b, compactAt: Number.isFinite(remembered[b.path]) ? remembered[b.path] : null })) });
+    }
+    // ?bin=: Claude's aliases, or what the Codex app-server lists. The bin matters for
+    // Codex only when no app-server is up yet — it is the one that gets launched.
+    if (p === '/api/models' && req.method === 'GET') {
+      let bin = url.searchParams.get('bin') || '';
+      if (agentOfBin(bin) !== 'codex') return send(200, { models: CLAUDE_MODELS });
+      try { bin = resolveBin(bin); } catch (e) { return send(400, { error: e.message }); }
+      (async () => {
+        const { CodexSocket, endpoint } = require('./ccbb-codex-session');
+        const rpc = await new CodexSocket(await endpoint(bin)).connect();
+        try {
+          const r = await rpc.request('model/list', {});
+          send(200, { models: (r.data || []).map(m => ({ id: m.model, name: m.displayName || m.model, isDefault: !!m.isDefault })) });
+        } finally { rpc.close(); }
+      })().catch(e => send(503, { error: e.message })); return;
+    }
+    if (p === '/api/agent-auth' || p === '/api/agent-auth/login' || p === '/api/agent-auth/login/code') {
+      const auth = require('./ccbb-agent-auth');
+      // claude*/codex* by name, and sso-hlp* for AWS SSO — a server without sso-hlp
+      // answers `missing` so the UI can leave the AWS icon out rather than show an error.
+      const withBin = (bin, fn) => {
+        let agent = /^sso-hlp/i.test(path.basename(String(bin || ''))) ? 'aws' : null;
+        try { bin = resolveBin(bin); agent = agent || agentOfBin(bin); if (!agent) throw Object.assign(new Error('the binary’s name must start with claude, codex or sso-hlp'), { code: 'EINVAL' }); }
+        catch (e) { return agent === 'aws' ? send(200, { bin, agent, missing: true, loggedIn: false, error: e.message }) : send(400, { error: e.message }); }
+        Promise.resolve(fn(bin, agent)).then(r => send(200, r), e => send(e.code === 'ENOENT' ? 404 : e.code === 'EINVAL' ? 400 : 500, { error: e.message }));
+      };
+      if (req.method === 'GET') {
+        const bin = url.searchParams.get('bin');
+        if (p === '/api/agent-auth') return withBin(bin, (b, a) => auth.status(b, a, { fresh: url.searchParams.get('fresh') === '1', common }));
+        if (p === '/api/agent-auth/login') return withBin(bin, b => ({ login: auth.getLogin(b) }));
+      }
+      if (req.method === 'POST' || req.method === 'DELETE') {
+        let body = '';
+        req.on('data', d => { body += d; if (body.length > 1e5) req.destroy(); });
+        return req.on('end', () => {
+          let o = {}; try { o = JSON.parse(body || '{}'); } catch { return send(400, { error: 'bad json' }); }
+          if (!o || typeof o !== 'object') return send(400, { error: 'bad json' });
+          if (p === '/api/agent-auth/login' && req.method === 'POST') return withBin(o.bin, (b, a) => auth.startLogin(b, a, { force: !!o.force }).then(login => ({ login })));
+          if (p === '/api/agent-auth/login' && req.method === 'DELETE') return withBin(o.bin, b => ({ login: auth.cancelLogin(b) }));
+          if (p === '/api/agent-auth/login/code' && req.method === 'POST') return withBin(o.bin, b => auth.submitCode(b, o.code || '').then(login => ({ login })));
+          send(405, { error: 'method not allowed' });
+        });
+      }
+      return send(405, { error: 'method not allowed' });
+    }
     if (p === '/api/sessions' && req.method === 'GET') return send(200, { sessions: this.list() });
     if (p === '/api/sessions' && req.method === 'POST') {
       let body = '';
@@ -1760,6 +1882,8 @@ Options:
                          Without -n the session is named after this directory until the
                          transcript's own title arrives, which then becomes the name
   -m, --model <model>    model alias or full name
+  --compact-at <size>    auto-compact at this context size: 200k, 1m, 150000
+                         (only when given; the web dialog's remembered value is not used)
   -C, --cwd <dir>        working directory for the session (default: here)
   --permission-mode <m>  manual | auto | acceptEdits | plan | dontAsk | bypassPermissions
   --resume <id>          resume Claude (full id, short id or name), or attach a loaded Codex thread
@@ -1790,6 +1914,7 @@ function parseNew(args) {
     else if (a === '-C' || a === '--cwd') o.cwd = path.resolve(args[++i]);
     else if (a === '-b' || a === '--bin') o.bin = args[++i];
     else if (a === '-m' || a === '--model') o.model = args[++i];
+    else if (a === '--compact-at') o.compactAt = args[++i];
     else if (a === '-n' || a === '--name' || a === '--label') o.name = args[++i];
     else if (a === '--permission-mode') o.permissionMode = args[++i];
     else if (a === '--agent') o.agent = args[++i];
@@ -1802,7 +1927,7 @@ function parseNew(args) {
     // with whatever -b named, and the failure surfaced as a session that never started.
     else return { error: a.startsWith('-') ? `unknown option '${a}'` : `unexpected argument '${a}'` };
   }
-  for (const k of ['cwd', 'bin', 'model', 'name', 'label', 'permissionMode', 'agent', 'resume', 'effort'])
+  for (const k of ['cwd', 'bin', 'model', 'name', 'label', 'permissionMode', 'agent', 'resume', 'effort', 'compactAt'])
     if (k in o && (o[k] == null || String(o[k]).startsWith('-'))) return { error: `option for ${k} is missing its value` };
   return o;
 }
@@ -1916,6 +2041,6 @@ function claudeHistory(id, q) {
   return { ...s.snapshot(win), epoch: 'history' };
 }
 
-module.exports = { runNew, claudeHistory, runStop, agentOfBin, muxSessionsQuiet, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
+module.exports = { parseCompactAt, binKey, runNew, claudeHistory, runStop, agentOfBin, muxSessionsQuiet, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
   TURN_VERBS, SPIN_VERBS, SPIN_FRAMES,
   muxAddress, MUX_DIR };

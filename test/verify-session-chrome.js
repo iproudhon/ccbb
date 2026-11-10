@@ -93,7 +93,7 @@ wss.on('connection',(ws,req)=>ws.send(JSON.stringify(req.url.includes('/mux/mux'
     await until(()=>evaluate('!!document.querySelector("dialog.ns-new[open]")'),'binary picker');
     await evaluate(`(()=>{var d=document.querySelector('dialog.ns-new[open]');d.querySelector('[name=bin]').value='codex';d.querySelector('form').requestSubmit();})()`);
     await until(()=>posts.length===1,'resume request');
-    assert.deepEqual(posts[0],{agent:'codex',bin:'codex',resume:'codex:fixture',startInactive:true});
+    assert.deepEqual(posts[0],{agent:'codex',bin:'codex',resume:'codex:fixture',startInactive:true,compactAt:'default'});
     await until(()=>evaluate('getComputedStyle(document.querySelector(".muxv .input-area")).display !== "none"'),'live composer');
     assert.deepEqual((await evaluate('testErrors')).filter(e=>!e.startsWith('ResizeObserver loop')),[]);
     console.log('OK: '+(mobile?'mobile':'desktop')+' Codex footer, model, activity and mux start');

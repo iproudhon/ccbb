@@ -1276,6 +1276,7 @@ function createListPanel(){
         esc(s.name)+(s.self?'':'')+
         (RO ? '' : '<button class="cterm" data-menu="'+esc(s.name)+'" title="New session, terminal, explorer on '+esc(s.name)+'" aria-label="Actions for '+esc(s.name)+'">&#8942;</button>')+'</span>';
     }).join('');
+    if (!RO) servers.forEach(function(s){ if (s.status !== 'down') nsAuthRefresh(s.name, apiBase(s.name === SELF.name ? null : s.name)); });
   }
   srvEl.addEventListener('click', function(e){
     var t = e.target.closest('[data-menu]');
@@ -1635,8 +1636,9 @@ function muxStartButton(head, sid, server, agent, onStarted){
     var options = {agent:agent, resume:sid};
     if (agent === 'codex') options.startInactive = true;
     var title = (head.querySelector('.ptitle') || {}).textContent || '';
-    options.bin = await pickBinary({ server: server || SELF.name, base: apiBase(server), agent: agent, title: title });
-    if (!options.bin) return;
+    var pick = await pickBinary({ server: server || SELF.name, base: apiBase(server), agent: agent, title: title });
+    if (!pick) return;
+    Object.assign(options, pick);
     button.disabled = true;
     try {
       var r = await fetch(apiBase(server)+'/mux/api/sessions', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(options)});
