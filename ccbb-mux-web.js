@@ -31,6 +31,9 @@
 // nests too.
 
 const ATTACH_PATHS = ['/', '/index.html'];
+// The session pages, under the mux's prefix: a running session (/s/<id>), one that is not
+// (/h/claude/<id>, /h/codex/<thread>), each also as the phone's (/m/ in front).
+const PAGE_PATH = /^(\/m)?\/(?:s|h\/(?:claude|codex))\/[^/]+$/;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
 // The plugin styles entirely from VS Code's CSS variables. Keeping the variable
@@ -120,6 +123,7 @@ const APP_CSS = `
 }
 .muxv .mx-bar .label { font-weight: 600; font-size: 13px; }
 .muxv .mx-bar .cwd { color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.muxv .mx-bar .mx-owner { font-size: 11px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--vscode-descriptionForeground); color: var(--vscode-descriptionForeground); white-space: nowrap; }
 .muxv .mx-bar .spacer { flex: 1 1 auto; }
 .muxv .dot { width: 14px; height: 14px; border-radius: 50%; background: #57606a; flex: 0 0 auto; display: inline-block; }
 .muxv .dot svg { display:block; width:10px; height:10px; margin:2px; }
@@ -323,7 +327,7 @@ var SPIN_VERBS = __SPIN_VERBS__, SPIN_FRAMES = __SPIN_FRAMES__;
 // The shell, built here rather than shipped as HTML: ccbb-web.js would otherwise
 // carry a second copy of this markup, and the ids it used to have cannot survive
 // more than one view on a page anyway.
-function shell(bar) {
+function shell(bar, base) {
   return (bar ? '<div class="mx-bar">' +
       '<span class="dot"></span>' +
       '<span class="label"></span>' +
@@ -336,7 +340,9 @@ function shell(bar) {
         '<option value="bypassPermissions">bypassPermissions</option>' +
       '</select>' +
       '<button class="mx-stop" title="interrupt (Esc)">Stop</button>' +
-      '<a class="mx-up" href="/">sessions</a>' +
+      // base + '/': the session list beside this page — /mux/ under ccbb web, which is
+      // all the public name serves, and / on a standalone mux.
+      '<a class="mx-up" href="' + String((base || '') + '/').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;') + '">sessions</a>' +
     '</div>' : '') +
     // The cards live INSIDE the log, after the messages, rather than in a pane of their
     // own beneath it. A permission or a question belongs where it happened — that is
@@ -388,7 +394,14 @@ var HAS_BAR = opts.bar !== false;
 var ON_CHROME = typeof opts.onChrome === 'function' ? opts.onChrome : null;
 // /exit closes the view the way its X does, so the host that owns the X does it.
 var ON_EXIT = typeof opts.onExit === 'function' ? opts.onExit : null;
+// Framed by a host that ends sessions itself (zdte): /exit and the stops are its to act on.
+var ON_END = typeof opts.onEnd === 'function' ? opts.onEnd : null;
 var ON_MISSING = typeof opts.onMissing === 'function' ? opts.onMissing : null;
+// The session went away under an attached page (stopped elsewhere, a ccbb restart): the
+// reconnect is refused. Without this the view would retry forever on a dead id.
+var ON_GONE = typeof opts.onGone === 'function' ? opts.onGone : null;
+// The session ended while this page watched (stopped from anywhere): once.
+var ON_ENDED = typeof opts.onEnded === 'function' ? opts.onEnded : null;
 // The host's header block wants the whole stats object, not the handful of numbers the
 // status line prints. Separate from onChrome because it changes on a different clock.
 var ON_STATS = typeof opts.onStats === 'function' ? opts.onStats : null;
@@ -398,7 +411,7 @@ var dead = false, reconnectTimer = null, activityTimer = null;
 // turns that were sent before this page existed.
 var ON_HISTORY = null;
 root.className = (root.className ? root.className + ' ' : '') + 'muxv';
-root.innerHTML = shell(HAS_BAR);
+root.innerHTML = shell(HAS_BAR, BASE);
 function Q(sel) { return root.querySelector(sel); }
 
 // ── DOM helpers ────────────────────────────────────────────────────────────
@@ -509,7 +522,9 @@ function md(src) {
            !(lines[i].indexOf('|') >= 0 && i + 1 < lines.length && SEP.test(lines[i + 1]) && lines[i + 1].indexOf('|') >= 0)) { para.push(lines[i]); i++; }
     out.push('<p>' + inline(para.join('\\n')) + '</p>');
   }
-  return out.join('');
+  // Escaped already; safeHtml (SHARED_JS) is the second gate every innerHTML site
+  // shares, so a slip in the converter above cannot become markup on its own.
+  return typeof safeHtml === 'function' ? safeHtml(out.join('')) : out.join('');
 }
 
 // ── Tool renderers ─────────────────────────────────────────────────────────
@@ -881,6 +896,10 @@ function reset(snap) {
   // own turn clock, not from the moment this page opened.
   setBusy(S.info.status === 'busy');
   if (S.info.turnStartedAt) turnStart = S.info.turnStartedAt;
+  // Attaching to a session that already ended: no status event will say so.
+  if (!opts.snapshot && S.info.status === 'exited' && ON_ENDED) {
+    var ended = ON_ENDED; ON_ENDED = null; setTimeout(ended, 0);
+  }
   S.msgs = []; S.byId = {}; S.tools = {}; S.stream = {}; S.final = {};
   (snap.messages || []).forEach(function (m) { upsert(m); });
   S.omitted = snap.omitted || 0; S.omittedAfter = S.omitted ? snap.omittedAfter : null; S.gapBefore = null;
@@ -1014,6 +1033,7 @@ function apply(ev) {
       S.info.activity = ev.activity || null;
       S.info.turnStartedAt = ev.turnStartedAt || null;
       if (ev.exit) S.info.exit = ev.exit;
+      if (ev.status === 'exited' && ON_ENDED) { var ended = ON_ENDED; ON_ENDED = null; setTimeout(ended, 0); }
       setBusy(S.info.status === 'busy');
       if (S.info.status !== 'busy' && Object.keys(S.stream).length) { clearStream(); return paintAll(); }
       return paintChrome();
@@ -1786,7 +1806,14 @@ function paintChrome() {
     }
   } else if (reconnect) reconnect.remove();
   var mode = Q('.mx-mode');
-  if (mode) mode.hidden = i.agent === 'codex';
+  // An owned session's mode is its owner's to set (the mux refuses set_mode without
+  // the key), so the picker goes and a badge says who drives it.
+  if (mode) mode.hidden = i.agent === 'codex' || !!i.owner;
+  if (bar) {
+    var badge = bar.querySelector('.mx-owner');
+    if (i.owner && !badge) { badge = el('span', 'mx-owner'); bar.querySelector('.cwd').after(badge); }
+    if (badge) { badge.hidden = !i.owner; badge.textContent = i.owner || ''; badge.title = i.owner ? 'Driven by ' + i.owner : ''; }
+  }
   if (i.agent === 'codex') { var inp = Q('.input-box'); if (inp) inp.dataset.ph = 'Message Codex… (Ctrl+Enter to send; queued while busy; /steer to interrupt direction)'; }
   if (mode && mode.value !== (i.permissionMode || 'default')) mode.value = i.permissionMode || 'default';
 
@@ -2049,6 +2076,7 @@ function connect() {
     if (m.op === 'ack') {
       // The eager attach refused before any snapshot: the session is gone, not lagging.
       if (m.error === 'no such session' && !S.epoch && ON_MISSING) { dead = true; try { ws.close(); } catch (err) {} return ON_MISSING(); }
+      if (m.error === 'no such session' && S.epoch && ON_GONE) { dead = true; try { ws.close(); } catch (err) {} return ON_GONE(); }
       if (m.error) note(m.error);
       return;
     }
@@ -2078,6 +2106,13 @@ document.addEventListener('visibilitychange', onVisible);
 // (where it is just /mux). Passing an explicit option instead would mean BOOT_JS
 // had to compute the same thing and could compute it differently.
 function ccbbBase() { return BASE.replace(/\\/mux$/, ''); }
+// The few ccbb routes this page calls, through their /mux/api aliases on the standalone
+// page ccbb web serves at /mux/s/<id> (BASE is /mux, with its own bar): that is the page
+// the public name serves, and only /mux/* is served there. A view embedded in ccbb web's
+// own page, and a peer's, keep the root path, which every ccbb (older peers too) answers.
+// opts.aliased says the same for a bar-less page that is still the standalone one (the
+// embed mode another app frames, zdte's: ?embed=1).
+function ccbbApi(p) { return BASE === '/mux' && (HAS_BAR || opts.aliased) ? BASE + p : ccbbBase() + p; }
 var CMD_SEQ = 0, CMD_CWD = '';
 // The plan windows. Read from ccbb rather than from the mux: it is a whole-account
 // fact, ccbb already computes it, and ccbbBase() reaches it from both hosts. Failure is
@@ -2085,7 +2120,7 @@ var CMD_SEQ = 0, CMD_CWD = '';
 // and neither does a ccbb that is not answering.
 var SUB = null, subTimer = null, chromeTimer = null;
 function loadSub() {
-  fetch(ccbbBase() + ((S.info.agent === 'codex' || SESSION.indexOf('codex:') === 0) ? '/api/codex/subscription' : '/api/subscription'), { headers: TOKEN ? { 'x-ccbb-token': TOKEN } : {} })
+  fetch(ccbbApi((S.info.agent === 'codex' || SESSION.indexOf('codex:') === 0) ? '/api/codex/subscription' : '/api/subscription'), { headers: TOKEN ? { 'x-ccbb-token': TOKEN } : {} })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (d) { SUB = d && (d.account || d.rateLimits) ? d : null; paintChrome(); })
     .catch(function () {});
@@ -2131,7 +2166,7 @@ function execLocal(entry, then) {
     paintAll();
     if (then) then(entry.command.out || { kind: 'console', content: entry.command.text || '' });
   }
-  fetch(ccbbBase() + '/api/session/' + encodeURIComponent(SESSION) + '/command',
+  fetch(ccbbApi('/api/session/' + encodeURIComponent(SESSION) + '/command'),
     { method: 'POST', headers: h, credentials: 'same-origin', body: JSON.stringify(entry.command.call) })
     .then(function (r) { return r.json(); })
     .then(function (d) {
@@ -2153,9 +2188,15 @@ function execLocal(entry, then) {
 // The child's own /exit would end the claude process under every attached client.
 // /exit and /quit leave this view, as its X does — which ends the session only if
 // nobody else is attached. /term, /terminate and /stop end it for everyone.
+// Framed (onEnd), all five are the host's: it ends the session its own way.
 function muxCommand(t) {
   if (opts.snapshot) return null;
+  if (ON_END && ['/exit', '/quit', '/term', '/terminate', '/stop'].indexOf(t) >= 0) return ON_END;
   if (t === '/exit' || t === '/quit') return exitView;
+  // An owned session is ended by its owner; the mux would refuse the op anyway, and
+  // leaving the view on a refusal would read as if it had worked.
+  if ((t === '/term' || t === '/terminate' || t === '/stop') && S.info && S.info.owner)
+    return function () { note('Driven by ' + S.info.owner + ' \u2014 stop it there.'); };
   if (t === '/term' || t === '/terminate' || t === '/stop') return function () { send({ op: 'stop' }); exitView(); };
   return null;
 }
@@ -2331,7 +2372,7 @@ function wire() {
       activityTimer = setInterval(function(){
         if (dead || activityPending) return;
         activityPending = true;
-        fetch(BASE.replace(/\\/mux$/, '') + '/api/codex/activity/' + encodeURIComponent(S.info.nativeId))
+        fetch(ccbbApi('/api/codex/activity/' + encodeURIComponent(S.info.nativeId)))
           .then(function(r){if(!r.ok)throw new Error('Activity unavailable');return r.json();})
           .then(function(activity){if(!dead){Object.assign(S.info,activity);paintChrome();}})
           .catch(function(){})
@@ -2405,18 +2446,64 @@ const BOOT_JS = `
 (function () {
 'use strict';
 var qs = new URLSearchParams(location.search);
-var HERE = location.pathname.match(/^(.*)\\/s\\/([^/]+)/) || [];
-var view = window.createMuxView(document.getElementById('app'), {
-  base: HERE[1] || '',
-  session: decodeURIComponent(HERE[2] || ''),
-  token: qs.get('token') || '',
-  label: qs.get('label') || 'web',
-  machine: __MACHINE__,
-  bar: true,
+// /s/<id> is a running session; /h/claude/<id> and /h/codex/<thread> one that is not,
+// read-only from its transcript (the same snapshot ccbb web opens such a row with).
+// /m/ in front of either is the phone's dress: PHONE_CSS and the viewport sync.
+var HERE = location.pathname.match(/^(.*?)(?:\\/m)?\\/(?:s|h\\/(claude|codex))\\/([^/]+)$/) || [];
+var BASE = HERE[1] || '', AGENT = HERE[2] || '', ID = decodeURIComponent(HERE[3] || '');
+// Framed by another app on this origin (zdte's Agent page): no bar of our own — the host
+// has one — and what the bar's X and a missing session would do is the host's to do.
+var EMBED = qs.get('embed') === '1';
+var theme = qs.get('theme');
+if (theme === 'dark' || theme === 'light') document.documentElement.setAttribute('data-theme', theme);
+// The host's theme changed: follow it in place (a reload would lose the draft).
+window.addEventListener('message', function (e) {
+  var d = e.data;
+  if (!EMBED || e.source !== window.parent || e.origin !== location.origin) return;
+  if (d && d.host === 'theme' && (d.theme === 'dark' || d.theme === 'light'))
+    document.documentElement.setAttribute('data-theme', d.theme);
 });
-window.ccbb = view;
-window.addEventListener('error', function (e) { view.errors.push(String(e.message)); });
-window.addEventListener('unhandledrejection', function (e) { view.errors.push(String(e.reason)); });
+var errors = [];
+window.addEventListener('error', function (e) { errors.push(String(e.message)); });
+window.addEventListener('unhandledrejection', function (e) { errors.push(String(e.reason)); });
+function tell(what) {
+  if (EMBED && window.parent !== window) window.parent.postMessage({ ccbb: what, session: ID }, location.origin);
+}
+function open(snapshot) {
+  var view = window.createMuxView(document.getElementById('app'), {
+    base: BASE,
+    session: AGENT === 'codex' ? 'codex:' + ID : ID,
+    token: qs.get('token') || '',
+    label: qs.get('label') || (EMBED ? 'embed' : 'web'),
+    machine: __MACHINE__,
+    bar: !EMBED,
+    aliased: true,
+    snapshot: snapshot || null,
+    onExit: EMBED ? function () { tell('exit'); } : null,
+    // /exit and the stops: the host ends the session.
+    onEnd: EMBED ? function () { tell('end'); } : null,
+    onMissing: EMBED ? function () { tell('missing'); } : null,
+    onGone: EMBED ? function () { tell('missing'); } : null,
+    onEnded: EMBED ? function () { tell('exit'); } : null,
+  });
+  view.errors.push.apply(view.errors, errors);
+  errors = view.errors;
+  window.ccbb = view;
+}
+if (!AGENT) return open(null);
+var hurl = BASE + '/api/' + AGENT + '/history/' + encodeURIComponent(ID);
+fetch(hurl + '?win=5,25').then(function (r) { return r.json(); }).then(function (snap) {
+  if (!snap || snap.error || !snap.state) throw new Error((snap && snap.error) || 'no history');
+  snap.historyUrl = hurl;
+  snap.state.live = false;
+  open(snap);
+}).catch(function (e) {
+  var p = document.createElement('p');
+  p.className = 'mx-none';
+  p.textContent = 'No transcript to show (' + e.message + ').';
+  document.getElementById('app').appendChild(p);
+  tell('missing');
+});
 })();
 `;
 
@@ -2446,6 +2533,34 @@ function machineName() {
 }
 function hostJs() { return host().SHARED_JS || ''; }
 
+// Every page: the dark palette, for ?theme=dark (ccbb-mobile.js's own, so the two read
+// alike), and the line a history page shows when there is no transcript to show.
+const THEME_CSS = `
+:root[data-theme=dark] {
+  color-scheme: dark;
+  --bg:#1c1b19; --bg-alt:#262523; --surface:#232220; --ink:#e6e3db; --ink-soft:#a8a49a;
+  --ink-faint:#7d7a72; --line:#37352f; --line-soft:#2d2c28; --accent:#e08b6b; --accent-soft:#3a2b24;
+  --code-bg:#232220; --warn:#e8944a; --ok:#3fb950; --err:#f85149;
+}
+.mx-none { margin: 40px 24px; color: var(--ink-soft); }
+`;
+
+// The phone page (/m/…): the mux panel as ccbb-mobile.js dresses it — the composer's
+// gutters and 16px input (smaller makes iOS zoom on focus) — on a root (#app, which the
+// factory makes the .muxv itself) that follows the
+// visible viewport (VIEWPORT_JS sets --app-h/--app-top, body.kb while the keyboard is up).
+// The home-indicator inset is padded only with the keyboard down; up, the keyboard covers it.
+const PHONE_CSS = `
+:root { --safe-b: env(safe-area-inset-bottom); --full-h: 100dvh; }
+html, body { overscroll-behavior: none; overflow: hidden; }
+body > #app.muxv { position: fixed; top: var(--app-top, 0px); left: 0; right: 0;
+  height: var(--app-h, var(--full-h)); box-sizing: border-box; }
+body:not(.kb) > #app.muxv { padding-bottom: var(--safe-b); }
+#app.muxv .input-area { padding: 8px 10px; }
+#app.muxv .input-box { font-size: 16px; }
+#app.muxv .mx-wrap { padding: 0 10px; }
+`;
+
 // The standalone page: the shell the factory mounts into, plus the two
 // stylesheets. PAGE_CSS is the half an embedded view must NOT have — inside
 // ccbb-web.js the host owns the body.
@@ -2455,12 +2570,13 @@ const APP_HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
 <title>ccbb mux</title>
-<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0/highlight.min.js" integrity="sha384-wjfDDhOPPdjtva8vWBhWeVprSpmxisEu5aYT3q1JyACqXpdKpo3PWZTMVq24MBix" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.12.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous">
 <style>__CCBB_CSS__</style>
 <style>__APP_CSS__</style>
 <style>__PAGE_CSS__</style>
+<style>__THEME_CSS__</style>
 </head><body>
 <div id="app"></div>
 <script>__SHARED_JS__</script>
@@ -2497,13 +2613,30 @@ function mount(mux) {
   // Built on the first request, not here: mount() runs from the Mux constructor, which
   // can be reached while ccbb-web.js is still loading, and the host assets are not on
   // its exports until it finishes. Memoized after that.
-  let page = null;
-  const pageHtml = () => page || (page = APP_HTML
+  // Two pages: the desktop one, and the phone's (/m/…), which adds PHONE_CSS and the
+  // viewport sync. Each with its own policy, since the policy hashes the page's scripts.
+  const pages = {}, csps = {};
+  const pageHtml = (phone) => pages[phone] || (pages[phone] = APP_HTML
     .replace('__CCBB_CSS__', () => hostCss()).replace('__SHARED_JS__', () => hostJs())
-    .replace('__APP_CSS__', () => APP_CSS).replace('__PAGE_CSS__', () => PAGE_CSS)
-    .replace('__APP_JS__', () => APP_JS).replace('__BOOT_JS__', () => BOOT_JS)
+    .replace('__APP_CSS__', () => APP_CSS)
+    .replace('__PAGE_CSS__', () => PAGE_CSS + (phone ? PHONE_CSS : ''))
+    .replace('__THEME_CSS__', () => THEME_CSS)
+    .replace('__APP_JS__', () => APP_JS)
+    .replace('__BOOT_JS__', () => (phone ? require('./ccbb-viewport').VIEWPORT_JS + '\n' : '') + BOOT_JS)
     // After BOOT_JS is in, since that is where the placeholder lives.
     .replace('__MACHINE__', () => JSON.stringify(machineName())));
+  // The session page's script policy, from the finished page: its CDN scripts by exact
+  // URL (each pinned and checked by its integrity hash as well) and its inline scripts
+  // by their hashes. Nothing else runs — not a script a reply manages to inject, not an
+  // inline handler, not eval. The hashes are of the page as served, so they follow
+  // every edit to the scripts without anyone keeping a list.
+  const sessionCsp = (phone) => csps[phone] || (csps[phone] = (() => {
+    const h = pageHtml(phone);
+    const srcs = [...h.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]);
+    const inline = [...h.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+      .map(m => "'sha256-" + require('crypto').createHash('sha256').update(m[1], 'utf8').digest('base64') + "'");
+    return "script-src 'self' " + [...srcs, ...inline].join(' ') + "; frame-ancestors 'self'; object-src 'none'; base-uri 'none'";
+  })());
   // subPath is the path with the host's prefix already stripped. Standalone there is
   // no prefix and req.url is the whole of it; under ccbb web it is /mux/... and only
   // the caller knows how much to remove.
@@ -2511,15 +2644,26 @@ function mount(mux) {
     if (req.method !== 'GET' && req.method !== 'HEAD') return false;
     let p = subPath;
     if (!p) { try { p = new URL(req.url, 'http://x').pathname; } catch { return false; } }
-    const html = body => {
+    // The list is static (no scripts at all) and says only who may frame it and that there
+    // are no plugins or <base> to retarget it. The session page adds its script-src
+    // (sessionCsp). That one is inherited by the srcdoc frames //ihtml documents render
+    // in, so a document's own scripts do not run on this page — ccbb web's app page,
+    // which has no script-src, still runs them in their sandboxed frame.
+    const html = (body, csp) => {
       const b = Buffer.from(body);
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': b.length,
-        'cache-control': 'no-store' });
+        'cache-control': 'no-store',
+        'content-security-policy': csp || "frame-ancestors 'self'; object-src 'none'; base-uri 'none'",
+        'referrer-policy': 'no-referrer' });
       res.end(req.method === 'HEAD' ? undefined : b);
       return true;
     };
-    if (ATTACH_PATHS.includes(p)) return html(listPage(mux.list(), mux.token));
-    if (/^\/s\/[^/]+$/.test(p)) return html(pageHtml());
+    // The public name never puts the token in a URL: it signs in with a cookie, and a
+    // ?token= there is refused outright, so links carrying it would only leak it.
+    const pub = require('./ccbb-common').isPublicRequest(req);
+    if (ATTACH_PATHS.includes(p)) return html(listPage(mux.list(), pub ? null : mux.token));
+    const m = PAGE_PATH.exec(p);
+    if (m) { const phone = !!m[1]; return html(pageHtml(phone), sessionCsp(phone)); }
     return false;
   };
 }
@@ -2551,6 +2695,7 @@ function muxRows(mux) {
     mux: true,
     muxClients: x.clients || 0,
     muxPending: x.pending || 0,
+    owner: x.owner || null,
   }));
 }
 
@@ -2570,7 +2715,7 @@ function mergeMuxRows(payload, mux) {
     if (i == null) { payload.sessions.push(r); continue; }
     Object.assign(payload.sessions[i], {
       mux: true, live: r.live, liveStatus: r.liveStatus,
-      muxClients: r.muxClients, muxPending: r.muxPending,
+      muxClients: r.muxClients, muxPending: r.muxPending, owner: r.owner,
       title: require('./ccbb-common').muxTitle(payload.sessions[i], r),
       lastActivity: r.lastActivity || payload.sessions[i].lastActivity,
     });
@@ -2578,5 +2723,5 @@ function mergeMuxRows(payload, mux) {
   return payload;
 }
 
-module.exports = { setHostAssets, mount, APP_CSS, PAGE_CSS, APP_JS, BOOT_JS, APP_HTML, listPage,
+module.exports = { setHostAssets, mount, APP_CSS, PAGE_CSS, APP_JS, BOOT_JS, APP_HTML, listPage, PAGE_PATH,
   muxRows, mergeMuxRows };

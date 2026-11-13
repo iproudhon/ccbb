@@ -88,6 +88,41 @@ function peerToken() { return String(readConfig().peerToken || ''); }
 // invite the question of which of the twenty routes belongs to which role.
 function readToken() { return String(readConfig().readToken || ''); }
 
+// The PUBLIC name: a hostname this server is also reached by from outside — through a
+// tunnel that forwards only /mux (zdte's ingress). A request whose Host is that name is
+// treated as coming from the internet, whatever socket it arrived on: only /mux is
+// served, sign-in is the /mux cookie alone, and the mux takes presets only (ccbb-web.js
+// and Mux.create). config `publicHost`, or CCBB_PUBLIC_HOST; empty = no public name.
+// Never written into anything committed — it is a deployment's, not the code's.
+function publicHost() {
+  return String(readConfig().publicHost || process.env.CCBB_PUBLIC_HOST || '').trim().toLowerCase().replace(/:\d+$/, '');
+}
+// Fails closed: once a public name is set, any Host that is not plainly this machine —
+// localhost, an IP literal, or the name ccbb-web listens on (addLocalHost) — is treated
+// as the public name. A tunnel that forwards a Host spelled differently (a trailing dot,
+// another alias) must not open the whole surface.
+// Names reached from outside that still get all of ccbb (a tunnel name of its own, behind
+// its own access policy): config `trustedHosts` or CCBB_TRUSTED_HOSTS (comma-separated).
+// Like publicHost, a deployment's, never written into anything committed.
+const localNames = new Set(['localhost']);
+function addLocalHost(h) { const n = String(h || '').trim().toLowerCase(); if (n) localNames.add(n); }
+function trustedHosts() {
+  const c = readConfig().trustedHosts;
+  const list = Array.isArray(c) ? c : String(process.env.CCBB_TRUSTED_HOSTS || '').split(',');
+  return list.map(h => String(h).trim().toLowerCase().replace(/:\d+$/, '')).filter(Boolean);
+}
+function isPublicRequest(req) {
+  const ph = publicHost();
+  if (!ph || !req || !req.headers) return false;
+  const h = String(req.headers.host || '').trim().toLowerCase();
+  const name = (h.startsWith('[') ? h.slice(1, h.indexOf(']')) : h.replace(/:\d+$/, ''));
+  if (!name) return true;
+  if (name === ph) return true;
+  if (localNames.has(name) || name.endsWith('.localhost') || trustedHosts().includes(name)) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(name) || name.includes(':')) return false;
+  return true;
+}
+
 // ── Pricing ────────────────────────────────────────────────────────────────
 // Model pricing sourced from LiteLLM's community price list (the same data ccusage
 // uses) and refreshed daily — so costs stay current and each model version is priced
@@ -2093,7 +2128,7 @@ module.exports = {
   codexWindows, claudeWindows, unjoinTables,
   CLAUDE_DIR, CONFIG_FILE, CACHE_FILE, readConfig,
   // multi-server
-  serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable,
+  serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable, publicHost, isPublicRequest, addLocalHost,
   // pricing
   PRICING, priceTable: PRICE_TABLE, priceForModel, providerOf, contextMaxFor,
   loadTable, priceForModelIn, tableSig, normalizeId, convertLiteLLM,

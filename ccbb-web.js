@@ -28,10 +28,17 @@ try { muxLib = require('./ccbb-mux'); } catch { muxLib = null; }
 // Constructed at require time so the sessions outlive any one request, but it opens
 // nothing and spawns nothing until something asks it to.
 const mux = muxLib ? new muxLib.Mux({}) : null;
+// A session another app drives (zdte) is named in the info so the page offers "Resume in
+// <owner>" instead of resuming or terminating it here.
+function withOwner(info, id) {
+  const owner = muxLib && muxLib.ownerOf ? muxLib.ownerOf(id) : null;
+  return owner && info && !info.error ? Object.assign({}, info, { owner }) : info;
+}
 // The phone front-end. Same server, same API, its own page — see ccbb-mobile.js.
 const { mobilePageHtml, isMobileUA, serveVendor, setMuxAssets } = require('./ccbb-mobile');
 const {
   serverIdentity, peerList, peerByName, peerToken, readToken, configUnreadable, isCcbbGroupSession,
+  publicHost, isPublicRequest, addLocalHost,
   CLAUDE_DIR, getSessions, getCostSummary, getSubscription, getSessionInfo, getSessionHistory, getSessionHistoryWindow, getSessionToolResult,
   getSubagentHistory, getSessionStats, watchSessionChanges,
   sessionLiveness, pidAlive, renameSession, paneForSession, paneForPids, panesForLiveSessions, injectToPane, transcriptEntry,
@@ -261,6 +268,78 @@ ${require('./ccbb-common').unjoinTables.toString()}
   if (!use()) window.addEventListener('load', use);
 })();
 ${require('./ccbb-newsession-ui').JS}
+
+// ── HTML from Markdown ────────────────────────────────────────────────────────
+// marked passes HTML in its input straight through, and the input is a model's output,
+// a file //cat read, a transcript on disk — none of it ours. Set as innerHTML, a
+// <img onerror> or an <a href="javascript:"> in a reply ran as this page, with this
+// page's cookie and its socket to every session. So every innerHTML that holds rendered
+// Markdown goes through here first: parsed inert (a <template>'s content runs nothing and
+// loads nothing), then kept only as far as an allowlist says — tags a reply can mean,
+// attributes that cannot run anything, and URLs that are web links or images. A tag not
+// on the list is unwrapped (its text stays); one that could only ever be active is
+// dropped with everything in it. Written here rather than vendored: the vendor cache is
+// filled from the network at runtime, and a sanitizer that is missing when the network
+// is should not be how the page fails.
+var SAFE_TAGS = {};
+'a abbr b blockquote br caption code col colgroup dd del details div dl dt em figcaption figure h1 h2 h3 h4 h5 h6 hr i img input ins kbd li mark ol p pre q s samp small span strong sub summary sup table tbody td tfoot th thead tr u ul var'
+  .split(' ').forEach(function(t){ SAFE_TAGS[t] = 1; });
+var SAFE_DROP = {};
+'script style iframe frame frameset object embed applet form textarea select option button base meta link svg math template noscript noembed title head audio video source track canvas portal'
+  .split(' ').forEach(function(t){ SAFE_DROP[t] = 1; });
+var SAFE_ATTRS = {};
+'href src alt title class colspan rowspan align start type checked disabled open lang width height data-lang'
+  .split(' ').forEach(function(a){ SAFE_ATTRS[a] = 1; });
+function safeUrl(v, img) {
+  // What a browser would read: control characters and spaces inside a scheme are ignored
+  // by it ("java\\tscript:"), so they are ignored here too before the scheme is judged.
+  var u = String(v || '').replace(/[\\u0000-\\u0020\\u007f]/g, '');
+  var m = /^([a-z][a-z0-9+.-]*):/i.exec(u);
+  if (!m) return true;                                   // relative, #anchor
+  var sc = m[1].toLowerCase();
+  if (sc === 'http' || sc === 'https') return true;
+  if (!img) return sc === 'mailto';
+  return /^data:image\\/(png|gif|jpe?g|webp);/i.test(u);  // never svg: it carries script
+}
+function safeHtml(html) {
+  // No DOM (a test evaluating these helpers in a bare vm): nothing is being rendered.
+  if (typeof document === 'undefined') return String(html == null ? '' : html);
+  var t = document.createElement('template');
+  t.innerHTML = String(html == null ? '' : html);
+  (function clean(parent) {
+    var kids = Array.prototype.slice.call(parent.childNodes);
+    for (var i = 0; i < kids.length; i++) {
+      var n = kids[i];
+      if (n.nodeType === 3) continue;                    // text
+      if (n.nodeType !== 1) { parent.removeChild(n); continue; }   // comments and the rest
+      var tag = n.nodeName.toLowerCase();
+      // A task list's checkbox is the one input a reply has; anything else is a form.
+      var badInput = tag === 'input' && String(n.getAttribute('type') || '').toLowerCase() !== 'checkbox';
+      if (!SAFE_TAGS[tag] || badInput) {
+        if (SAFE_DROP[tag] || badInput || n.namespaceURI !== 'http://www.w3.org/1999/xhtml') { parent.removeChild(n); continue; }
+        clean(n);
+        while (n.firstChild) parent.insertBefore(n.firstChild, n);
+        parent.removeChild(n);
+        continue;
+      }
+      Array.prototype.slice.call(n.attributes).forEach(function(a){
+        var name = a.name.toLowerCase();
+        if (!SAFE_ATTRS[name] || ((name === 'href' || name === 'src') && !safeUrl(a.value, name === 'src' && tag === 'img'))) n.removeAttribute(a.name);
+      });
+      // Classes only for code highlighting: anything else could borrow the page's own
+      // look (a fake Allow button) from model output.
+      if (n.hasAttribute('class')) {
+        var keep = n.getAttribute('class').split(' ').filter(function(c){ return /^(language-|lang-|hljs)/.test(c); }).join(' ');
+        if (keep) n.setAttribute('class', keep); else n.removeAttribute('class');
+      }
+      if (tag === 'input') n.setAttribute('disabled', '');
+      // Every link leaves in a new tab and takes nothing of this page with it.
+      if (tag === 'a') { n.setAttribute('target', '_blank'); n.setAttribute('rel', 'noopener noreferrer'); }
+      clean(n);
+    }
+  })(t.content);
+  return t.innerHTML;
+}
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -531,7 +610,7 @@ function renderCmdOutput(d) {
     node.appendChild(htmlFrame(d.content || ''));
   } else if (d.kind === 'markdown' && window.marked) {
     node.className = 'cmd-content md';
-    node.innerHTML = marked.parse(d.content || '');
+    node.innerHTML = safeHtml(marked.parse(d.content || ''));
   } else if (d.kind === 'source' || d.kind === 'markdown') {
     node.className = 'cmd-content code' + (d.lang === 'diff' ? ' diff' : '');
     var code = document.createElement('code');
@@ -883,6 +962,7 @@ body.view-dragging,body.view-dragging *{cursor:grabbing!important;user-select:no
 /* ── session view ── */
 /* Which machine this session actually runs on — muted when it's this one. */
 .srv-badge{flex-shrink:0;font-size:11px;font-weight:600;border-radius:5px;padding:1px 7px;background:#ddf4e4;color:#1a7f37;border:1px solid #aceebb}
+.srv-badge.owner-badge{background:transparent;color:inherit;opacity:.7;border-color:currentColor}
 .srv-badge.local{background:var(--line-soft);color:var(--ink-faint);border-color:var(--line)}
 .hdr-title{font-weight:600;font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;cursor:pointer;border-radius:5px;padding:1px 4px;margin:-1px -4px}
 .hdr-title:hover{background:var(--line-soft)}
@@ -1322,9 +1402,9 @@ const APP_HTML = `<!DOCTYPE html>
 <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
 <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
-<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0/highlight.min.js" integrity="sha384-wjfDDhOPPdjtva8vWBhWeVprSpmxisEu5aYT3q1JyACqXpdKpo3PWZTMVq24MBix" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.12.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous">
 <style>__CCBB_CSS__
 __MUX_CSS__
 </style>
@@ -2650,7 +2730,9 @@ function createMuxSessionView(INFO){
   barMain.style.cssText = 'display:flex;align-items:center;gap:10px;flex:1;min-width:0';
   barMain.innerHTML = '<div class="status-dot mux" title="Driven over the mux protocol, not a tmux pane">'+activityGlyph(INFO.agent || (INFO.sessionId.indexOf('codex:') === 0 ? 'codex' : 'claude'), !INFO.snapshot)+'</div>'
     + '<span class="srv-badge'+(isLocal(INFO.server)?' local':'')+'" title="Session lives on '+esc(SRV)+'">'+esc(SRV)+'</span>'
-    + '<div class="hdr-title">'+esc(INFO.title || shortSessionId(INFO.sessionId))+'</div>';
+    + '<div class="hdr-title">'+esc(INFO.title || shortSessionId(INFO.sessionId))+'</div>'
+    // Who drives it, when another app does (zdte): filled from the chrome below.
+    + '<span class="srv-badge owner-badge" hidden></span>';
   // The same info panel ccbb's own session view opens behind the dots (siGridHtml), fed
   // from the chrome the mux client pushes: its live stats, plan windows, mode, clients.
   var headEl = document.createElement('div');
@@ -2685,7 +2767,7 @@ function createMuxSessionView(INFO){
   // wants an element it owns outright; .terming hides this one and reveals the terminal.
   body.insertBefore(host, body.firstChild);
 
-  var lastChrome = null;
+  var lastChrome = null, owner = null;
   function paintHead(){
     infoEl.innerHTML = lastChrome ? siGridHtml(siMuxModel(lastChrome, INFO.sessionId))
       : siGridHtml({ cwd: INFO.projectPath, sessionId: INFO.sessionId });
@@ -2716,6 +2798,16 @@ function createMuxSessionView(INFO){
       var alive = c.live;
       var resumeBtn = el.querySelector('.vb-resume');
       if (resumeBtn) resumeBtn.hidden = alive;
+      // Another app (zdte) holds this session's key: it is resumed and stopped there, so
+      // the ▶ only says where, and the menu has no terminate.
+      owner = (c.info && c.info.owner) || null;
+      var ob = barMain.querySelector('.owner-badge');
+      if (ob) { ob.hidden = !owner; ob.textContent = owner || ''; ob.title = owner ? 'Driven by ' + owner : ''; }
+      if (resumeBtn && owner) {
+        resumeBtn.disabled = true;
+        resumeBtn.textContent = 'Resume in ' + owner;
+        resumeBtn.title = 'Driven by ' + owner + ' \u2014 resume it there';
+      }
       dotEl.innerHTML = activityGlyph(c.info && c.info.agent, !INFO.snapshot);
       dotEl.className = 'status-dot' + (alive ? (c.status === 'idle' ? ' idle' : ' live') : '');
       dotEl.title = c.connected ? (c.status || '') : 'disconnected';
@@ -2723,7 +2815,7 @@ function createMuxSessionView(INFO){
     },
   });
   v.onResume = async function(){
-    if (RO || !INFO.snapshot) return;
+    if (RO || !INFO.snapshot || owner) return;
     // Used only when the app-server has to be launched, but chosen like any other start.
     var codex = INFO.sessionId.indexOf('codex:') === 0;
     var pick = await pickBinary({ server: SRV, base: API, agent: codex ? 'codex' : 'claude', title: INFO.title || '' });
@@ -2759,7 +2851,7 @@ function createMuxSessionView(INFO){
   // there is no taking it back.
   v.onTerminate = function(){
     if (!window.confirm('Terminate "' + (titleEl.textContent || shortSessionId(INFO.sessionId)) + '" on ' + SRV + '?')) return;
-    fetch(API+'/mux/api/sessions/'+encodeURIComponent(INFO.sessionId)+'/stop', { method:'POST' })
+    fetch(API+'/mux/api/sessions/'+encodeURIComponent(INFO.sessionId)+'/stop', { method:'POST', headers:{'content-type':'application/json'}, body:'{}' })
       .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(d){ if (!r.ok) throw new Error(d.error || 'Could not terminate'); }); })
       .then(function(){ closeView(v); })
       .catch(function(e){ toast(e.message); });
@@ -2771,7 +2863,8 @@ function createMuxSessionView(INFO){
       explore: RO ? null : function(){ sessionExplore(SRV, API, INFO.server, (lastChrome && lastChrome.cwd) || INFO.projectPath); },
       term: !RO && live ? v.onTerm : null, termOn: v.termOn,
       termWin: !RO && live ? v.onTermWin : null,
-      terminate: RO ? false : live ? v.onTerminate : null, terminateWhy: 'Not running',
+      terminate: RO ? false : live && !owner ? v.onTerminate : null,
+      terminateWhy: owner ? 'Driven by ' + owner : 'Not running',
     };
   };
   return v;
@@ -3090,7 +3183,7 @@ function createSessionView(INFO){
         msgEls[msgId] = mEl;
         tAppend(mEl);
       }
-      mEl.querySelector('.msg-body').innerHTML = hasText ? marked.parse(joined) : '';
+      mEl.querySelector('.msg-body').innerHTML = hasText ? safeHtml(marked.parse(joined)) : '';
     }
     for (var j=0;j<toolBlocks.length;j++) renderToolUse(toolBlocks[j], hist);
     scrollBottom();
@@ -3218,7 +3311,7 @@ function createSessionView(INFO){
         var text = content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('').trim();
         if (text) {
           var m = document.createElement('div'); m.className='msg';
-          m.innerHTML = '<div class="msg-label">Subagent</div><div class="msg-body">'+marked.parse(text)+'</div>';
+          m.innerHTML = '<div class="msg-label">Subagent</div><div class="msg-body">'+safeHtml(marked.parse(text))+'</div>';
           container.appendChild(m);
         }
         content.filter(function(b){return b.type==='tool_use';}).forEach(function(b){ container.appendChild(subToolCard(b, results[b.id])); });
@@ -5671,6 +5764,71 @@ function cookieToken(req) {
   const m = raw.match(new RegExp('(?:^|;\\s*)' + tokenCookieName(req) + '=([^;]*)'));
   return m ? decodeURIComponent(m[1]) : '';
 }
+// ── the public name ────────────────────────────────────────────────────────
+// A request whose Host is config publicHost came in from outside (common.isPublicRequest):
+// only /mux is served to it, and its sign-in is a cookie of its own — scoped to /mux,
+// Secure (the public name is only ever https, at the tunnel), HttpOnly, and Strict, which
+// a page served on a name of its own can afford where the home-screen app above cannot.
+const PUBLIC_COOKIE = 'ccbb_mux';
+function publicCookieToken(req) {
+  const m = String(req.headers.cookie || '').match(new RegExp('(?:^|;\\s*)' + PUBLIC_COOKIE + '=([^;]*)'));
+  try { return m ? decodeURIComponent(m[1]) : ''; } catch { return ''; }
+}
+// Origin, for every request that changes something and every WebSocket upgrade. A
+// browser sends it on both, so a page on any other origin — another app on another
+// localhost port, a site whose name resolves to 127.0.0.1 — is refused here no matter
+// which cookies ride along. What is accepted:
+//   - on the public name, https://<publicHost> and nothing else;
+//   - elsewhere, the request's own origin (http://<Host>) when Host is a loopback name
+//     or an IP literal — which covers this port, an ssh forward of it to another local
+//     port, and a LAN address, while a DNS name resolving here (rebinding) is not one —
+//     plus the --host name it listens on, https://<Host> (a TLS tunnel), and https://<publicHost>.
+// No Origin at all is a client that is not a browser (curl, the CLI, a peer proxy, zdte's
+// server): nothing a page can make, and still held to the token.
+let listenHost = '127.0.0.1';
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (origin == null) return true;
+  const o = String(origin).toLowerCase();
+  const ph = publicHost();
+  if (ph && o === 'https://' + ph) return true;
+  if (isPublicRequest(req)) return false;
+  const host = String(req.headers.host || '').toLowerCase();
+  if (!host) return false;
+  // https://<Host>: this listener speaks plain HTTP, so an https page can only have
+  // reached it through a TLS proxy holding a certificate for that name (a tunnel such
+  // as ccbb.<domain>) — not by rebinding a name to 127.0.0.1.
+  if (o === 'https://' + host) return true;
+  if (o !== 'http://' + host) return false;
+  const name = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  return name === 'localhost' || name === String(listenHost).toLowerCase() ||
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(name) || name.includes(':');
+}
+const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+// Failed public sign-ins, all callers together (behind the tunnel every peer is
+// loopback): past LOGIN_MAX in LOGIN_WINDOW, /mux/login answers 429 until the window
+// rolls on. A right token is refused too while it lasts — that is the point.
+const LOGIN_MAX = 10, LOGIN_WINDOW = 10 * 60 * 1000;
+let loginFails = [];
+function loginLocked() { const now = Date.now(); loginFails = loginFails.filter(t => now - t < LOGIN_WINDOW); return loginFails.length >= LOGIN_MAX; }
+// The public sign-in. A form of its own rather than sendUnauthorized's: it posts to
+// /mux/login, which is the only place the public cookie can be set from.
+function sendPublicLogin(res, code, badToken, back) {
+  const body = Buffer.from('<!DOCTYPE html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ccbb</title>' +
+    '<body style="font:15px ui-sans-serif,system-ui;padding:40px 24px;color:#3d3d3a;max-width:520px">' +
+    '<h2>ccbb — sign in</h2>' +
+    (badToken ? '<p style="color:#b42318">That token was not accepted.</p>' : '') +
+    '<form method="post" action="/mux/login" style="display:flex;gap:8px;flex-wrap:wrap">' +
+    `<input type="hidden" name="back" value="${String(back || '/mux/').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}">` +
+    '<input name="token" type="password" autocomplete="current-password" autofocus required placeholder="token" ' +
+    'style="flex:1;min-width:200px;font:inherit;padding:8px 10px;border:1px solid #bbb;border-radius:6px">' +
+    '<button type="submit" style="font:inherit;padding:8px 14px;border:1px solid #888;border-radius:6px;background:#f4f4f2;cursor:pointer">Open</button>' +
+    '</form>');
+  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': body.length,
+    'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'self'; base-uri 'none'" });
+  res.end(body);
+}
+
 // Auth, when config sets peerToken. The token can arrive as a header (peer proxies and
 // the hook curl), a cookie (the browser, after one ?token=… visit), or a query param.
 // Unset peerToken = no auth at all, which is the pre-existing single-host behavior.
@@ -5695,6 +5853,15 @@ function authLevel(req, query) {
   }
   warnedBrokenConfig = false;
   const want = peerToken(), ro = readToken();
+  // The public name answers to the full token only, from the header or its own /mux
+  // cookie — never from the URL, never from a local page's cookie, never the read token
+  // (whose one use, /mux, refuses it anyway). And a server with no token at all is open
+  // to whoever reaches it; that is a choice for a loopback port, not for the internet.
+  if (isPublicRequest(req)) {
+    if (!want) return null;
+    const got = req.headers[TOKEN_HEADER] || publicCookieToken(req);
+    return got && safeEq(got, want) ? 'full' : null;
+  }
   if (!want) return 'full';
   const got = req.headers[TOKEN_HEADER] || (query && query.get('token')) || cookieToken(req);
   if (!got) return null;
@@ -6201,14 +6368,52 @@ function runWeb(args) {
   }
 
   serverPort = port;   // the cookie is named after it, so it must be set before we listen
+  listenHost = host;   // an Origin naming it is this server's own (originAllowed)
+  addLocalHost(host);  // and a Host naming it is not the public name
 
   const server = http.createServer((req, res) => {
-    if (forwardProxy.handles(req)) return void forwardProxy.request(req, res);
+    // Ahead of everything, the forward proxy included: a request on the public name is
+    // never anything but a /mux request.
+    const pub = isPublicRequest(req);
+    if (!pub && forwardProxy.handles(req)) return void forwardProxy.request(req, res);
     const { method } = req;
-    const pathname = req.url.split('?')[0];
+    // `let`: an alias under /mux (below) continues as the route it stands for.
+    let pathname = req.url.split('?')[0];
     const qs = req.url.split('?')[1] || '';
     const query = new URLSearchParams(qs);
     let m;
+
+    // Cross-site writes stop here, before auth: a cookie a page can make the browser send
+    // is no evidence the page is ours. See originAllowed.
+    if (MUTATING.has(method) && !originAllowed(req)) return send(res, 403, { error: 'cross-origin request refused' });
+
+    // ── the public name: /mux and nothing else ──
+    if (pub) {
+      if (pathname !== '/mux' && !pathname.startsWith('/mux/')) return send(res, 404, { error: 'not found' });
+      // The token never rides in a URL here — not even once, to be banked: a link is
+      // something people paste, and this one would be the key to the machine.
+      if (query.has('token')) return send(res, 400, { error: 'a token in the URL is refused on this address — sign in at /mux/login' });
+      if (pathname === '/mux/login') {
+        const back0 = q => { const b = String(q || ''); return /^\/mux\/(?![/\\])[^\\\s]*$/.test(b) ? b : '/mux/'; };
+        if (method === 'GET') return sendPublicLogin(res, 200, query.get('login') === '0', back0(query.get('back')));
+        if (method !== 'POST') return send(res, 405, { error: 'method not allowed' });
+        if (!peerToken() || configUnreadable()) return send(res, 403, { error: 'no token is configured for this address' });
+        if (loginLocked()) return send(res, 429, { error: 'too many failed sign-ins — try again later' });
+        return readBody(req, body => {
+          const form = new URLSearchParams(body);
+          const back = back0(form.get('back'));
+          if (!safeEq(form.get('token') || '', peerToken())) {
+            loginFails.push(Date.now());
+            res.writeHead(303, { Location: '/mux/login?login=0&back=' + encodeURIComponent(back) }); return res.end();
+          }
+          res.writeHead(303, {
+            'Set-Cookie': `${PUBLIC_COOKIE}=${encodeURIComponent(form.get('token'))}; Path=/mux; Secure; HttpOnly; SameSite=Strict; Max-Age=31536000`,
+            'Cache-Control': 'no-store', Location: back,
+          });
+          res.end();
+        });
+      }
+    }
 
     const isDesktopPage = method === 'GET' && (pathname === '/' || pathname === '/index.html' ||
       /^\/session\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/session\/[^/]+$/.test(pathname) ||
@@ -6217,8 +6422,11 @@ function runWeb(args) {
     // exists and opens the same client as a panel in the phone app, so a phone that
     // follows a /mux/s link should land there rather than on the standalone page with
     // its own bar and no way back to the session list.
+    // Its other pages, which another app on the public name frames (?embed=1): the phone's
+    // dress of it (/mux/m/s/<id>) and a stopped session's transcript (/mux/h/<agent>/<id>).
     const isMuxPage = method === 'GET' &&
-      (/^\/mux\/s\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/mux\/s\/[^/]+$/.test(pathname));
+      (/^\/mux\/s\/[^/]+$/.test(pathname) || /^\/peer\/[^/]+\/mux\/s\/[^/]+$/.test(pathname) ||
+       /^\/mux\/(?:m\/)?(?:s|h\/(?:claude|codex))\/[^/]+$/.test(pathname));
     const isMobilePage = method === 'GET' && (pathname === '/m' || pathname === '/m/' ||
       pathname === '/m/index.html' || /^\/m\/session\/[^/]+$/.test(pathname) ||
       /^\/m\/peer\/[^/]+\/session\/[^/]+$/.test(pathname) ||
@@ -6266,13 +6474,19 @@ function runWeb(args) {
     }
 
     const level = authLevel(req, query);
+    if (!level && pub) {
+      // A page gets the sign-in form; anything else, a plain 401 it can act on.
+      // Back to the same page, query and all: ?embed=1&theme=… is what makes it the framed one.
+      if (method === 'GET' && (pathname === '/mux/' || isMuxPage)) return sendPublicLogin(res, 401, false, pathname + (qs ? '?' + qs : ''));
+      return send(res, 401, { error: 'unauthorized' });
+    }
     if (!level) return sendUnauthorized(res, isPage, tokenCookieName(req), !!query.get('login'), pathname);
     // Whoever came in with the read token. Every route that changes something — a session's
     // input, a terminal, a peer hop — consults this; everything that only reads ignores it.
     const ro = level === 'read';
     // A page opened as ?token=… banks the token in a cookie and reloads clean, so the
     // secret stops riding in the URL bar (and in every link copied out of it).
-    if (isPage && peerToken() && query.get('token')) {
+    if (!pub && isPage && peerToken() && query.get('token')) {
       const rest = new URLSearchParams(qs); rest.delete('token');
       const loc = pathname + (rest.toString() ? '?' + rest.toString() : '');
       res.writeHead(302, {
@@ -6290,7 +6504,7 @@ function runWeb(args) {
     // ── which UI ──
     // Strictly after the token hand-off above: redirecting first would drop the ?token=
     // and leave a phone's first visit in a 401 loop.
-    if (isPage && (query.get('ui') === 'mobile' || query.get('ui') === 'desktop')) {
+    if (!pub && isPage && (query.get('ui') === 'mobile' || query.get('ui') === 'desktop')) {
       const rest = new URLSearchParams(qs); rest.delete('ui');
       res.writeHead(302, {
         'Set-Cookie': `${UI_COOKIE}=${query.get('ui')}; Path=/; SameSite=Lax; Max-Age=31536000`,
@@ -6300,7 +6514,8 @@ function runWeb(args) {
     }
     // A phone gets the phone UI — including on a deep link, which is how a session URL
     // copied off a desktop is usually opened. `?ui=desktop` once, and it stops.
-    if (isDesktopPage) {
+    // Not on the public name, which has no /m to send a phone to: the mux page is the app there.
+    if (isDesktopPage && !pub) {
       const pref = uiPref(req);
       if (pref === 'mobile' || (!pref && isMobileUA(req.headers['user-agent']))) {
         const loc = '/m' + (pathname === '/' || pathname === '/index.html' ? '' : pathname);
@@ -6318,6 +6533,7 @@ function runWeb(args) {
     // Placed BELOW the ?token=… hand-off and the /m redirect on purpose. Above them
     // it answered first, so a mux page never banked its cookie: open it once with a
     // token, come back without one, get a 401 — on the client the proxy exists for.
+    let aliased = false;
     if (pathname === '/mux' || pathname.startsWith('/mux/')) {
       if (!mux) return send(res, 501, { error: 'ccbb-mux is not installed' });
       // A mux client submits turns and answers permission prompts, so it is a write
@@ -6326,11 +6542,30 @@ function runWeb(args) {
       if (ro) return send(res, 403, { error: 'read-only' });
       // The index page links relatively, so it only resolves under a trailing slash.
       if (pathname === '/mux') { res.writeHead(302, { Location: '/mux/' }); return res.end(); }
-      // A direct call, not a proxy hop. The prefix is stripped here because only this
-      // side knows how much of the path is ours; req.url is left alone so that every
-      // later handler still sees the URL that was actually asked for.
-      return mux.onHttp(req, res, req.url.slice(4) || '/');
+      // Every write to the mux is JSON. A form or a text/plain body is what a page on
+      // another site can send without asking first; the mux never takes either.
+      if (MUTATING.has(method) && !/^application\/json\b/i.test(String(req.headers['content-type'] || '')))
+        return send(res, 415, { error: 'content-type: application/json required' });
+      // The mux page's calls to ccbb web itself — plan windows, Codex activity, // commands
+      // — have names under /mux too, so the page works where /mux is all there is (the
+      // public name). They continue below as the routes they alias; nothing else moves.
+      const sub = pathname.slice(4);
+      if (sub === '/api/subscription' || sub === '/api/codex/subscription' ||
+          /^\/api\/codex\/activity\/[^/]+$/.test(sub) || /^\/api\/session\/[^/]+\/command$/.test(sub) ||
+          // A stopped session's transcript, for /mux/h/<agent>/<id>.
+          (method === 'GET' && /^\/api\/(?:claude|codex)\/history\/[^/]+$/.test(sub))) {
+        // //sh and friends run a shell on this host. Not from the internet.
+        if (pub && /\/command$/.test(sub)) return send(res, 403, { error: '// commands run only on this host’s own address' });
+        pathname = sub; aliased = true;
+      } else {
+        // A direct call, not a proxy hop. The prefix is stripped here because only this
+        // side knows how much of the path is ours; req.url is left alone so that every
+        // later handler still sees the URL that was actually asked for.
+        return mux.onHttp(req, res, req.url.slice(4) || '/');
+      }
     }
+    // Belt and braces: whatever the public name asked for was answered above.
+    if (pub && !aliased) return send(res, 404, { error: 'not found' });
 
     // marked/xterm, fetched by us and cached — see ccbb-mobile.js.
     if (method === 'GET' && serveVendor(pathname, res)) return;
@@ -6476,7 +6711,7 @@ function runWeb(args) {
       return send(res, 200, { ok: true });
     }
     if (method === 'GET' && (m = pathname.match(/^\/api\/session-info\/([^/]+)$/)))
-      return send(res, 200, getSessionInfo(m[1]));
+      return send(res, 200, withOwner(getSessionInfo(m[1]), m[1]));
     // History, whole or windowed. `head`/`tail` open a session without shipping its middle;
     // `from`/`to` fill the gap in, or fetch only what was appended since `total`. Plain
     // /history (no params) still returns everything, which is what the bots want.
@@ -6614,7 +6849,8 @@ function runWeb(args) {
     if (mux) {
       try {
         const dir = path.join(process.env.CCBB_HOME || CLAUDE_DIR, 'ccbb-mux');
-        fs.mkdirSync(dir, { recursive: true });
+        // 0700: the raw logs beside the address file hold everything a child printed.
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
         fs.writeFileSync(path.join(dir, 'address'), JSON.stringify({
           port, host: '127.0.0.1', prefix: '/mux', pid: process.pid, startedAt: new Date().toISOString(),
         }), { mode: 0o600 });
@@ -6649,8 +6885,14 @@ function runWeb(args) {
     };
     wsSend = sendTo;
     server.on('upgrade', (req, socket, head) => {
-      if (forwardProxy.handles(req)) return void forwardProxy.upgrade(req, socket, head);
+      const pub = isPublicRequest(req);
+      if (!pub && forwardProxy.handles(req)) return void forwardProxy.upgrade(req, socket, head);
       const url = req.url || '';
+      // Every upgrade is Origin-checked (originAllowed): a WebSocket is not held to the
+      // same-origin policy, so without this any page could open one with your cookie on it.
+      if (!originAllowed(req)) return socket.destroy();
+      // The public name upgrades to the mux's socket and to nothing else.
+      if (pub && !/^\/mux\//.test(url.split('?')[0])) return socket.destroy();
       const level = authLevel(req, new URLSearchParams(url.split('?')[1] || ''));
       if (!level) return socket.destroy();
       // A socket has no status code to refuse with that a browser would show, so a

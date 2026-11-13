@@ -264,6 +264,7 @@ body.has-max .panel:not(.max){display:none}
 .ptitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   font-weight:600;font-size:14px}
 .pbtns{margin-left:auto;display:flex;align-items:center;gap:2px;flex-shrink:0}
+.owner-badge{flex-shrink:0;font-size:11px;padding:0 6px;border-radius:8px;border:1px solid currentColor;opacity:.7}
 /* 40px targets: a 24px icon button is a coin toss with a thumb. */
 .pbtn{background:none;border:none;color:var(--ink-soft);font-size:15px;line-height:1;
   min-width:40px;height:40px;border-radius:10px;font-family:inherit;display:flex;
@@ -859,112 +860,11 @@ function onForeground(fn){
   };
 }
 
-// ── viewport ──────────────────────────────────────────────────────────────────
-// Follow both dimensions of the visible viewport. Safari can pan it while focusing
-// an editor; forcing document scroll back to zero fights that movement. Fixed surfaces
-// share its origin instead, keeping their bottom edge at the keyboard.
-// ttn serves ccbb in a same-origin iframe. Its own visualViewport stays at the
-// iframe's layout size when the keyboard opens; only the outer window sees it.
-// Read the highest accessible viewport, without changing the host page or frame.
-var viewportWindow = window, viewportFrames = [];
-try {
-  while (viewportWindow.parent !== viewportWindow && viewportWindow.frameElement) {
-    var viewportFrame = viewportWindow.frameElement;
-    var viewportParent = viewportWindow.parent;
-    void viewportParent.document.documentElement;
-    viewportFrames.push(viewportFrame);
-    viewportWindow = viewportParent;
-  }
-} catch(e) {} // Cross-origin hosts must resize their frame themselves.
-function mobileViewport(){
-  var vv = viewportWindow.visualViewport;
-  var top = vv ? vv.offsetTop : 0;
-  var bottom = top + (vv ? vv.height : viewportWindow.innerHeight);
-  // Translate the visible rectangle into each child viewport, clipping at its edges.
-  for (var i = viewportFrames.length - 1; i >= 0; i--) {
-    var frame = viewportFrames[i];
-    // Safari focus scrolling can report a root-fixed iframe at -scrollY even
-    // though its layout anchor is still top:0. Subtracting that rect from the
-    // visual offset counts the same pan twice (396 - -396 = 792 on iPhone).
-    // offsetTop preserves the layout anchor. Frames with a containing block or
-    // normal document flow still need their current viewport-relative rect.
-    var fixedToRoot = frame.ownerDocument.defaultView.getComputedStyle(frame).position === 'fixed' && !frame.offsetParent;
-    var origin = (fixedToRoot ? frame.offsetTop : frame.getBoundingClientRect().top) + frame.clientTop;
-    top = Math.max(0, Math.min(frame.clientHeight, top - origin));
-    bottom = Math.max(top, Math.min(frame.clientHeight, bottom - origin));
-  }
-  return { height: bottom - top, offsetTop: top, scale: vv ? vv.scale : 1 };
-}
-var vvMax = {};
-function keyboardUp(){
-  var vv = viewportWindow.visualViewport;
-  if (!vv) return false;
-  // Layout width is stable through focus zoom and fractional viewport rounding.
-  var w = viewportWindow.document.documentElement.clientWidth;
-  vvMax[w] = Math.max(vvMax[w] || 0, vv.height);
-  return vvMax[w] - vv.height > 150;
-}
-function syncViewport(){
-  var vv = mobileViewport();
-  if (vv.scale > 1.01) return;
-  var doc = document.documentElement;
-  var kb = keyboardUp();
-  // Keyboard down in our own window: the CSS fallbacks (top 0, --full-h) are the screen. The
-  // visual viewport is followed only while the keyboard is up, and always in a host's iframe
-  // (ttn), whose own 100dvh is the frame's layout size.
-  if (!kb && viewportWindow === window) {
-    doc.style.removeProperty('--app-h');
-    doc.style.removeProperty('--app-top');
-  } else {
-    doc.style.setProperty('--app-h', vv.height+'px');
-    doc.style.setProperty('--app-top', vv.offsetTop+'px');
-  }
-  // With the keyboard up the composer sits right on it: the home-indicator inset and
-  // the status footer under the composer belong to the screen's edge, and the keyboard
-  // is covering that edge (see body.kb).
-  document.body.classList.toggle('kb', kb);
+${require('./ccbb-viewport').VIEWPORT_JS}
+viewportHooks.push(function(){
   if (termState && termState.fitViewport) termState.fitViewport();
   if (vpEl) vpPaint();
-}
-// Recheck while focused and through keyboard dismissal, covering missed events
-// during keyboard animations. Terminal fitting skips unchanged geometry.
-var vvPoll = null, vvPollEnd = null;
-function vvPollStart(){
-  clearTimeout(vvPollEnd);
-  if (!vvPoll) vvPoll = setInterval(syncViewport, 150);
-  syncViewport();
-}
-function vvPollStop(){
-  clearTimeout(vvPollEnd);
-  vvPollEnd = setTimeout(function(){ clearInterval(vvPoll); vvPoll = null; syncViewport(); }, 800);
-}
-document.addEventListener('focusin', vvPollStart);
-document.addEventListener('focusout', vvPollStop);
-if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', syncViewport);
-  window.visualViewport.addEventListener('scroll', syncViewport);
-}
-// Parent viewport events do not propagate into iframe documents.
-if (viewportWindow !== window) {
-  if (viewportWindow.visualViewport) {
-    viewportWindow.visualViewport.addEventListener('resize', syncViewport);
-    viewportWindow.visualViewport.addEventListener('scroll', syncViewport);
-  }
-  viewportWindow.addEventListener('resize', syncViewport);
-  viewportWindow.addEventListener('scroll', syncViewport, true);
-  window.addEventListener('pagehide', function(e){
-    if (e.persisted) return;
-    if (viewportWindow.visualViewport) {
-      viewportWindow.visualViewport.removeEventListener('resize', syncViewport);
-      viewportWindow.visualViewport.removeEventListener('scroll', syncViewport);
-    }
-    viewportWindow.removeEventListener('resize', syncViewport);
-    viewportWindow.removeEventListener('scroll', syncViewport, true);
-  });
-}
-window.addEventListener('resize', syncViewport);
-window.addEventListener('orientationchange', function(){ setTimeout(syncViewport, 250); });
-syncViewport();
+});
 
 // ── viewport readout ─────────────────────────────────────────────────────────
 // What iOS reports, on the phone itself: a Home Screen app has no inspector at hand and
@@ -1701,6 +1601,8 @@ function createMuxPanel(sid, server, snapshot){
 
   var resumeButton = snapshot ? muxStartButton(head, sid, server, 'codex', function(){removePanel(p);}) : null;
   var lastCwd = (snapshot && snapshot.state && snapshot.state.cwd) || '';
+  // Set when another app (zdte) drives the session: no terminate, and resume belongs there.
+  var owner = (snapshot && snapshot.state && snapshot.state.owner) || null;
   var client = window.createMuxView(host, {
     onExit: function(){ removePanel(p); },
     base: API + '/mux',
@@ -1711,7 +1613,14 @@ function createMuxPanel(sid, server, snapshot){
     bar: false,
     onChrome: function(c){
       lastCwd = c.cwd || lastCwd;
+      owner = (c.info && c.info.owner) || owner;
       titleEl.textContent = c.title || shortSessionId(sid);
+      if (owner && !head.querySelector('.owner-badge')) {
+        var ob = el('span', 'owner-badge'); ob.textContent = owner; ob.title = 'Driven by ' + owner;
+        titleEl.after(ob);
+      }
+      // The glyph stays (the button is icon-sized); the reason is in its title.
+      if (resumeButton && owner) { resumeButton.disabled = true; resumeButton.title = 'Resume in ' + owner; resumeButton.setAttribute('aria-label', resumeButton.title); }
       // 'exited' is the case the desktop used to miss too: the child is gone but the
       // socket is not, and "connected" alone painted a finished session green.
       var alive = c.live;
@@ -1725,7 +1634,7 @@ function createMuxPanel(sid, server, snapshot){
   // Mux sessions only: the mux owns the process, so it can end it. Confirmed first.
   function terminate(){
     if (!window.confirm('Terminate "' + (titleEl.textContent || shortSessionId(sid)) + '" on ' + SRV + '?')) return;
-    fetch(API + '/mux/api/sessions/' + encodeURIComponent(sid) + '/stop', { method:'POST' })
+    fetch(API + '/mux/api/sessions/' + encodeURIComponent(sid) + '/stop', { method:'POST', headers:{'content-type':'application/json'}, body:'{}' })
       .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(d){ if (!r.ok) throw new Error(d.error || 'Could not terminate'); }); })
       .then(function(){ removePanel(p); })
       .catch(function(e){ toast(e.message); });
@@ -1739,7 +1648,7 @@ function createMuxPanel(sid, server, snapshot){
       // otherwise a fresh tmux window in the session's directory, otherwise a login shell
       // there. Nothing about that is the phone's business.
       term: RO || snapshot ? null : function(){ openTerminal(server, sid); }, termLabel: 'Terminal', termIcon: '&gt;_',
-      terminate: RO ? false : snapshot ? null : terminate, terminateWhy: 'Not running',
+      terminate: RO ? false : snapshot || owner ? null : terminate, terminateWhy: owner ? 'Driven by ' + owner : 'Not running',
     };
   });
   var foldMenu = menu.fold;
@@ -1875,6 +1784,12 @@ function createSessionPanel(sid, server){
     titleEl.textContent = (INFO && INFO.title) || '(untitled)';
     var live = INFO && INFO.live;
     if (resumeButton) resumeButton.hidden = !INFO || !!live;
+    // Another app (zdte) holds this session's key: resuming is done there.
+    if (resumeButton && INFO && INFO.owner) {
+      resumeButton.disabled = true;
+      resumeButton.title = 'Resume in ' + INFO.owner + ' \u2014 it drives this session';
+      resumeButton.setAttribute('aria-label', resumeButton.title);
+    }
     dotEl.className = 'dot' + (live ? (INFO.liveStatus === 'idle' ? ' idle' : ' live') : '');
     renderWhen();
   }
@@ -2005,7 +1920,7 @@ function createSessionPanel(sid, server){
         msgEls[key] = mEl;
         tAppend(mEl);
       }
-      try { mEl.querySelector('.msg-body').innerHTML = marked.parse(joined); }
+      try { mEl.querySelector('.msg-body').innerHTML = safeHtml(marked.parse(joined)); }
       catch(e) { mEl.querySelector('.msg-body').textContent = joined; }
     }
     for (var j=0;j<toolBlocks.length;j++) renderToolUse(toolBlocks[j], hist);
@@ -2130,7 +2045,7 @@ function createSessionPanel(sid, server){
             }
             var d2 = el('div','sub-msg');
             d2.innerHTML = '<div class="msg-label">'+(en.role==='assistant'?'Subagent':'Input')+'</div>'+
-              '<div class="msg-body">'+(en.role==='assistant'?marked.parse(text):esc(text))+'</div>';
+              '<div class="msg-body">'+(en.role==='assistant'?safeHtml(marked.parse(text)):esc(text))+'</div>';
             bodyEl2.appendChild(d2);
           });
         })
@@ -2551,7 +2466,7 @@ function createSessionPanel(sid, server){
     } else if (d && d.kind === 'markdown') {
       cmdTitle.textContent = d.title || '';
       cmdBody.className = 'cmd-content';
-      try { cmdBody.innerHTML = marked.parse(d.content||''); }
+      try { cmdBody.innerHTML = safeHtml(marked.parse(d.content||'')); }
       catch(e) { cmdBody.textContent = d.content||''; }
     } else {
       cmdTitle.textContent = (d && d.title) || '';

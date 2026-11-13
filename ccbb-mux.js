@@ -75,7 +75,12 @@ const SPIN_FRAMES = ['\u273d', '\u273b', '\u2733', '\u2736', '\u2737', '\u2735']
 
 function uuid() { return crypto.randomUUID(); }
 function nowIso() { return new Date().toISOString(); }
-function ensureDir(d) { try { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); } catch {} }
+function ensureDir(d) {
+  try { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); } catch {}
+  // Made by something else first (ccbb web's address file, an older ccbb) at the umask's
+  // 0755: the raw logs in it are nobody else's to list.
+  if (d === MUX_DIR) try { if ((fs.statSync(d).mode & 0o077) !== 0) fs.chmodSync(d, 0o700); } catch {}
+}
 
 // ── The child's command line ──────────────────────────────────────────────────
 // Every flag here was checked against a live child; the whole line spawns and
@@ -174,6 +179,76 @@ function rememberedCompactAt(bin) {
   return Number.isFinite(v) ? v : null;
 }
 
+// ── Owned sessions ───────────────────────────────────────────────────────────
+// A session another program created and drives (zdte's agent) — `owner` on create. The
+// creator gets a key back, once, in the create response; the page can still type into
+// the session, but everything that changes what the session IS — its mode, its model,
+// whether it runs, resuming or forking it — needs that key, and a request the session
+// would park for a person is answered on the spot (see onControlRequest). The key
+// itself is never stored: only its hash, keyed by session id, so a mux restart (which
+// ends the child; the creator resumes it) still knows whose session it was.
+// A creator may bring its own key (x-ccbb-owner-key, 64 hex) for a NEW id instead of
+// being handed one: stored before it asks, the key survives a create reply that never
+// arrives. A retry of that create (same sessionId, same key) while the session runs
+// answers that session; a caller's key never claims an id that is already owned.
+const OWNERS_FILE = () => path.join(MUX_DIR, 'owners.json');
+// Internal callers (stopAll on the way out) act for nobody and are never refused.
+const SYS = Symbol('ccbb-mux-system');
+function hashKey(k) { return crypto.createHash('sha256').update(String(k)).digest('hex'); }
+function readOwners() {
+  try { const j = JSON.parse(fs.readFileSync(OWNERS_FILE(), 'utf8')); return j && typeof j === 'object' ? j : {}; } catch { return {}; }
+}
+function writeOwners(j) {
+  ensureDir(MUX_DIR);
+  const tmp = OWNERS_FILE() + '.' + process.pid + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(j, null, 1), { mode: 0o600 });
+  fs.renameSync(tmp, OWNERS_FILE());
+}
+function setOwner(id, owner, keyHash) {
+  const j = readOwners(); j[id] = { owner, keyHash, at: nowIso() }; writeOwners(j);
+}
+// The record without its hash: what a list row may say about a session on disk.
+function ownerOf(id) { const r = readOwners()[id]; return r && r.owner ? r.owner : null; }
+// Constant-time against the stored hash. A missing or empty key is simply wrong.
+function keyMatches(rec, key) {
+  if (!rec || typeof key !== 'string' || !key) return false;
+  const a = Buffer.from(hashKey(key), 'hex'), b = Buffer.from(String(rec.keyHash || ''), 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function ownerError(what) {
+  const e = new Error(`this session is driven by its owner — ${what} needs the owner key`);
+  e.code = 'EPERM'; return e;
+}
+// What a locked session may still run as a slash command from the page: the ones that
+// report, plus /compact (allowed outright, like the compact op). Anything else — /model,
+// /permissions, /clear, /config, a plugin's own — changes the session behind its owner.
+const OWNED_SLASH_OK = new Set(['compact', 'context', 'cost', 'usage', 'status', 'help', 'todos']);
+
+// Create on the PUBLIC name (common.isPublicRequest): presets only. A preset is what the
+// new-session dialog offers — a claude* binary on this host's PATH (scanBins), by name or
+// by the path the dialog shows — with the dialog's own choices: model, effort, mode,
+// working directory, Compact at, a name, and resume/fork of a session. No binary from
+// anywhere else, no extra arguments, no environment, no ownership: launching an
+// arbitrary program with arbitrary arguments stays a thing only this host can ask for.
+// Codex is refused outright until its threads can be locked down (see create).
+const PUBLIC_CREATE_KEYS = new Set(['agent', 'bin', 'model', 'effort', 'permissionMode', 'cwd',
+  'compactAt', 'name', 'label', 'resume', 'fork']);
+function presetsOnly(o) {
+  const refuse = msg => { const e = new Error(msg + ' (presets only on the public name)'); e.code = 'EPERM'; throw e; };
+  const extra = Object.keys(o).filter(k => !PUBLIC_CREATE_KEYS.has(k) && o[k] !== undefined && o[k] !== null && o[k] !== false && o[k] !== '');
+  if (extra.length) refuse('not allowed: ' + extra.join(', '));
+  if (o.agent === 'codex' || agentOfBin(o.bin) === 'codex') refuse('Codex sessions cannot be started here');
+  if (o.agent && o.agent !== 'claude') refuse('unknown agent');
+  const bin = String(o.bin || '').trim();
+  const preset = bin && scanBins().find(b => b.agent === 'claude' && (b.name === bin || b.path === bin));
+  if (!preset) refuse(bin ? `'${bin}' is not one of the binaries offered here` : 'a binary is required');
+  o.bin = preset.name;
+  // No bypassPermissions from outside, and no default that might be it (a settings
+  // defaultMode): a remote session always asks before it acts.
+  if (o.permissionMode === 'bypassPermissions') refuse('bypassPermissions is not allowed');
+  if (!o.permissionMode) o.permissionMode = 'default';
+}
+
 // The models the dialog offers. Claude has no list to ask for: these are the CLI's own
 // aliases, which a wrapper's ANTHROPIC_DEFAULT_*_MODEL maps (claude.dsa → DSA-Max…),
 // and the [1m] ones are where a Compact at over 200K means anything.
@@ -238,7 +313,21 @@ const PROVIDER_ENV = [
   'ANTHROPIC_BEDROCK_BASE_URL', 'ANTHROPIC_AUTH_TOKEN',
   'GOOGLE_APPLICATION_CREDENTIALS', 'CLOUD_ML_REGION', 'ANTHROPIC_VERTEX_PROJECT_ID',
 ];
-function childEnv(extra) {
+// cleanEnv: the child gets the caller's env and the handful a login shell would set,
+// and nothing else — not ccbb web's own environment, not the provider variables above.
+// A creator that builds the child's whole environment (zdte, whose server holds tokens
+// the agent must not see) asks for this. CLAUDE_CONFIG_DIR rides along when ccbb has
+// one: it is where this mux reads transcripts back from, and a child writing them
+// somewhere else would leave ccbb unable to seed, list or resume what it started.
+const CLEAN_ENV_KEEP = ['HOME', 'PATH', 'USER', 'LOGNAME', 'LANG', 'TMPDIR', 'CLAUDE_CONFIG_DIR'];
+function childEnv(extra, clean) {
+  if (clean) {
+    const env = {};
+    for (const k of CLEAN_ENV_KEEP) if (process.env[k] != null) env[k] = process.env[k];
+    Object.assign(env, extra || {});
+    env.CLAUDE_CODE_ENTRYPOINT = 'ccbb-mux';
+    return env;
+  }
   const env = { ...process.env };
   for (const k of PROVIDER_ENV) if (process.env[k] != null) env[k] = process.env[k];
   // Identify ccbb to the CLI the way the SDK identifies itself; some telemetry
@@ -389,7 +478,15 @@ class Session {
       contextTokens: 0, contextPeak: 0, stats: null,
       turnStartedAt: null, outTokens: 0, activity: null,
       startedAt: nowIso(), lastActivity: nowIso(), exit: null,
+      // Who drives it, when another program does (see Owned sessions). The key and its
+      // hash stay in ownerRec, which is never sent anywhere.
+      owner: null,
     };
+    this.ownerRec = opt.ownerRec || null;
+    if (this.ownerRec) this.state.owner = this.ownerRec.owner;
+    // Submits that came with an idempotency key, and what each one answered: a retry
+    // of the same key gets the first answer instead of a second turn. Session-lived.
+    this.submitKeys = new Map();
     // Whether a turn is actually in flight. The child's own 'requesting' cannot answer
     // this: it says the session is up and asking, and it says it again right after the
     // result, with nothing afterwards to take it back.
@@ -399,7 +496,7 @@ class Session {
     // A history view: the transcript read through the same normalizer, no child and no log.
     if (opt.historyOnly) { this.seedHistory(opt.resume); return; }
     ensureDir(MUX_DIR);
-    if (opt.agent !== 'codex') this.rawLog = fs.createWriteStream(path.join(MUX_DIR, this.id + '.ndjson'), { flags: 'a' });
+    if (opt.agent !== 'codex') this.rawLog = fs.createWriteStream(path.join(MUX_DIR, this.id + '.ndjson'), { flags: 'a', mode: 0o600 });
     // BEFORE spawn, deliberately: resuming in place the child appends to this very
     // file, so reading it afterwards races its own writes and replays turns it just
     // made. A fork reads the parent's file, which is exactly what it branched from.
@@ -466,14 +563,21 @@ class Session {
       // ended, so it rides along and is replayed in order with the turns it belongs to.
       if (j.type === 'queue-operation' && j.operation === 'enqueue' &&
           String(j.content || '').indexOf('<task-notification>') >= 0) { keep.push(j); return; }
+      // The seam a compaction left. Kept, with the summary after it, so a resumed session
+      // shows where it was compacted exactly as a live one does (see compact_boundary in
+      // onSystem); dropping both made a resumed page read as one uninterrupted
+      // conversation that had silently lost everything above the seam.
+      if (j.type === 'system' && j.subtype === 'compact_boundary') { if (!j.isSidechain) keep.push(j); return; }
       if (j.type !== 'user' && j.type !== 'assistant') return;
       if (j.isSidechain) return;              // a subagent's own thread, not this one's
       if (j.cwd) this._diskCwd = j.cwd;
       if (j.type === 'assistant' && j.message && j.message.model && j.message.model[0] !== '<') this._diskModel = j.message.model;
       // A compact summary is a user message whose content is the ENTIRE prior
-      // conversation. Rendered as a turn it is a wall of text nobody wrote; the
-      // turns it summarizes are still in this same file, above it.
-      if (j.isCompactSummary) return;
+      // conversation. It is not drawn as a turn: the boundary kept above it tags it
+      // (onModelMessage), so it lands behind the seam like a live one. One without a
+      // boundary in front of it is dropped, as before — a wall of text nobody wrote.
+      // Kept ahead of the transcript-only check below: the summary carries that flag too.
+      if (j.isCompactSummary) { if (keep.length && keep[keep.length - 1].type === 'system') keep.push(j); return; }
       if (j.isVisibleInTranscriptOnly) return;
       keep.push(j);
       if (keep.length > 2 * HISTORY_SEED) keep = keep.slice(keep.length - HISTORY_SEED);
@@ -490,10 +594,18 @@ class Session {
       for (const j of seed) {
         try {
           if (j.type === 'queue-operation') this.noteTaskNotification(String(j.content || ''));
+          else if (j.type === 'system') {
+            // The file's camelCase metadata, in the wire's shape the tagging reads.
+            const md = j.compactMetadata || {};
+            this._compactMeta = { trigger: md.trigger, pre_tokens: md.preTokens, post_tokens: md.postTokens, duration_ms: md.durationMs };
+          }
+          else if (j.isCompactSummary && !this._compactMeta) {}   // its boundary was cut off the tail
           else this.onModelMessage(j, j.type);
         } catch (e) {}
       }
     } finally { this._seeding = false; }
+    // A boundary whose summary fell outside the tail must not tag the first live turn.
+    this._compactMeta = null;
     // Nothing was emitted (emit() is a no-op while seeding), so seq is still 0 and
     // the ring is empty: a client's FIRST attach gets these in snapshot().messages,
     // and a RECONNECT still takes the sinceSeq delta because it already has them.
@@ -505,7 +617,7 @@ class Session {
   spawn() {
     const args = buildArgs({ ...this.opt, sessionId: this.id });
     this.child = spawn(this.opt.bin, args, {
-      cwd: this.cwd, env: childEnv(this.opt.env), stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: this.cwd, env: childEnv(this.opt.env, this.opt.cleanEnv), stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stdout.setEncoding('utf8');
     this.child.stderr.setEncoding('utf8');
@@ -731,8 +843,21 @@ class Session {
       turnStartedAt: this.state.turnStartedAt || null });
   }
 
-  submit(text, content, from) {
+  submit(text, content, from, key) {
     const body = content || text;
+    // A locked session takes text from anyone attached, but a slash command only from
+    // the short list that cannot change it (OWNED_SLASH_OK). A path typed at the start
+    // of a message — /Users/... — is not a command, and is not refused as one.
+    if (this.ownerRec && !this.isOwner(key)) {
+      // Every text block, with format characters (zero-width and the like) and spaces
+      // stripped first: none may open with a command outside the list.
+      const texts = typeof body === 'string' ? [body]
+        : Array.isArray(body) ? body.filter(b => b && b.type === 'text').map(b => b.text || '') : [];
+      for (const t of texts) {
+        const cmd = /^\/([A-Za-z][\w:-]*)(?:\s|$)/.exec(String(t).replace(/^[\s\p{Cf}]+/u, ''));
+        if (cmd && !OWNED_SLASH_OK.has(cmd[1].toLowerCase())) throw ownerError('/' + cmd[1]);
+      }
+    }
     // Attribution: the replay echo carries no idea who typed it, so remember the
     // pairing and reattach the label when the child hands the turn back. A slash command
     // is NOT recorded here: it produces no replay at all, so its entry used to sit in the
@@ -775,6 +900,11 @@ class Session {
   answerRequest(requestId, payload, from) {
     const p = this.pending.get(requestId);
     if (!p) return { ok: false, reason: 'unknown or already answered' };
+    // A locked session answers nothing on a person's say-so. Nothing should be parked
+    // here at all (onControlRequest answers them as they come), so this is the second
+    // wall: whatever was asked for — allow, picks, a plan's mode — it is a deny.
+    if (this.ownerRec) payload = p.requestKind === 'dialog' ? { behavior: 'cancelled' }
+      : { behavior: 'deny', message: 'This session is driven by its owner; requests are not answered from ccbb.', interrupt: false };
     this.pending.delete(requestId);                       // compare-and-set: first wins
     this.write({ type: 'control_response', response: { request_id: requestId, subtype: 'success', response: payload } });
     this.emit('request_resolved', { requestId, by: from, decision: payload.behavior || 'completed' });
@@ -819,13 +949,18 @@ class Session {
     this.emit('interrupt_done', { by: from, stillQueued });
     return r;
   }
-  async setPermissionMode(mode, from) {
+  // Owned sessions: whether `key` is this session's owner key (or an internal caller).
+  // An unowned session has no key to hold, and everyone holds it.
+  isOwner(key) { return !this.ownerRec || key === SYS || keyMatches(this.ownerRec, key); }
+  async setPermissionMode(mode, from, key) {
+    if (!this.isOwner(key)) throw ownerError('changing the mode');
     const r = await this.control('set_permission_mode', { mode });
     this.state.permissionMode = mode;
     this.emit('mode', { permissionMode: mode, by: from });
     return r;
   }
-  async setModel(model, from) {
+  async setModel(model, from, key) {
+    if (!this.isOwner(key)) throw ownerError('changing the model');
     const r = await this.control('set_model', { model });
     this.state.model = model;
     this.emit('model', { model, by: from });
@@ -836,7 +971,8 @@ class Session {
   // would exit 143 and leave the turn recorded as unfinished, which resurfaces on
   // the next --resume; SIGINT/interrupt ends it cleanly. The drain scales with
   // backlog up to ~30s, so a slow exit is not a hang.
-  async stop(force) {
+  async stop(force, key) {
+    if (!this.isOwner(key)) throw ownerError('stopping it');
     if (!this.child || this.child.exitCode != null) return;
     if (!force) { try { await this.interrupt('mux'); } catch {} }
     try { this.child.stdin.end(); } catch {}
@@ -942,6 +1078,17 @@ class Session {
   onControlRequest(m) {
     const r = m.request || {};
     const requestId = m.request_id;
+    // A locked session parks nothing for a person: its owner decided what it may do
+    // when it made it (the child's own permission mode and settings), so a request that
+    // gets this far is one nobody here may grant. Deny a tool, cancel a dialog, at once —
+    // a parked request in a session nobody may answer is a session stuck forever.
+    if (this.ownerRec && (r.subtype === 'can_use_tool' || r.subtype === 'request_user_dialog')) {
+      const response = r.subtype === 'can_use_tool'
+        ? { behavior: 'deny', message: 'Not permitted in this session.', interrupt: false }
+        : { behavior: 'cancelled' };
+      this.write({ type: 'control_response', response: { request_id: requestId, subtype: 'success', response } });
+      return this.emit('request_resolved', { requestId, by: 'owner policy', decision: response.behavior });
+    }
     if (r.subtype === 'can_use_tool') {
       // AskUserQuestion is a tool that happens to be a question. Split it out so
       // clients can render a question card instead of a permission card — the
@@ -965,6 +1112,10 @@ class Session {
       return this.write({ type: 'control_response', response: { request_id: requestId,
         subtype: 'error', error: `ccbb-mux does not implement ${r.subtype}` } });
     }
+    // Anything newer the child parks (an MCP elicitation, say) is refused in a locked
+    // session, for the reason above; elsewhere it is left for a client that knows it.
+    if (this.ownerRec) return this.write({ type: 'control_response', response: { request_id: requestId,
+      subtype: 'error', error: `${r.subtype} is not answered in this session` } });
     return this.emit('unknown', { childType: 'control_request/' + r.subtype, body: m });
   }
 
@@ -1467,6 +1618,15 @@ class Mux {
     this.sessions = new Map();
     this.opt = opt || {};
     this.token = common.peerToken ? common.peerToken() : null;
+    // The raw logs hold every byte the child printed, tool output included. They are
+    // written 0600 now (Session); ones an older ccbb left at the umask's 0644 are
+    // tightened here, once, along with the directory they sit in.
+    try {
+      if (fs.existsSync(MUX_DIR)) {
+        fs.chmodSync(MUX_DIR, 0o700);
+        for (const f of fs.readdirSync(MUX_DIR)) if (/\.(ndjson|json)$/.test(f)) { try { fs.chmodSync(path.join(MUX_DIR, f), 0o600); } catch {} }
+      }
+    } catch {}
     // Optional: a mux with no UI file still serves its API and sockets.
     try { this.ui = require('./ccbb-mux-web').mount(this); } catch (e) { this.ui = null; }
     this.ready = new Promise(resolve => setImmediate(resolve)).then(() => require('./ccbb-codex-session').restore(this)).catch(() => {});
@@ -1476,23 +1636,101 @@ class Mux {
   // standalone daemon used to — and a daemon dying took its children with it only
   // because it was their parent and nothing else was left to reap them.
   async stopAll() {
-    await Promise.all([...this.sessions.values()].map(s => s.stop(true).catch(() => {})));
+    await Promise.all([...this.sessions.values()].map(s => s.stop(true, SYS).catch(() => {})));
   }
 
   // For the way out. process.on('exit') runs synchronously, so there is no awaiting a
   // graceful drain there — and a claude child left behind by its dying parent keeps a
   // session id, a socket and an API bill alive with nothing attached to it.
   killAll() {
-    for (const s of this.sessions.values()) { try { if (s.child) s.child.kill('SIGKILL'); } catch {} }
+    for (const s of this.sessions.values()) { try { if (s.killNow) s.killNow(); else if (s.child) s.child.kill('SIGKILL'); } catch {} }
   }
+  recordOwner(id, rec) { setOwner(id, rec.owner, rec.keyHash); }
 
   // The host's "a row changed" hook. Set by ccbb web; absent everywhere else, which
   // is why every caller goes through here rather than testing for it.
   notifyChange() { if (this.onChange) { try { this.onChange(); } catch {} } }
 
-  create(o) {
-    o = o || {};
+  // ctx: who is asking. `public` — the request came in on the public name, and gets
+  // presets only (see presetsOnly). `key` — the x-ccbb-owner-key it carried, which is what
+  // lets it resume or fork an owned session. The new session's owner key, when one is
+  // minted or confirmed, comes back in ctx.ownerKey: the create response is the one
+  // place it is ever sent.
+  create(o, ctx) {
+    o = o || {}; ctx = ctx || {};
+    if (!o || typeof o !== 'object' || Array.isArray(o)) throw Object.assign(new Error('bad options'), { code: 'EINVAL' });
+    if (ctx.public) presetsOnly(o);
     if (o.agent && !['claude', 'codex'].includes(o.agent)) throw new Error('Unknown agent');
+    const owner = o.owner == null ? '' : String(o.owner).trim();
+    const noRemember = !!o.noRemember;
+    delete o.owner; delete o.ownerRec; delete o.noRemember;
+    o.cleanEnv = !!o.cleanEnv;
+    if (owner.length > 64) throw Object.assign(new Error('owner: at most 64 characters'), { code: 'EINVAL' });
+    // An owned Codex session runs as `codex exec`, a process per turn (ccbb-codex-exec.js),
+    // never as a thread of the shared app-server: there any client of the socket can
+    // override a turn's sandbox, a loaded thread keeps its old config, and an interrupt
+    // leaves the running command alive. Its arguments are the owner's, whole, every turn.
+    const exec = !!owner && (o.agent === 'codex' || agentOfBin(o.bin) === 'codex');
+    if (o.cleanEnv && !exec && (o.agent === 'codex' || agentOfBin(o.bin) === 'codex'))
+      throw Object.assign(new Error('cleanEnv for Codex needs an owner (exec sessions)'), { code: 'EINVAL' });
+    if (exec) {
+      const bad = ['config', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'fork', 'model', 'effort', 'permissionMode'].filter(k => o[k] != null && o[k] !== false);
+      if (bad.length) throw Object.assign(new Error('owned Codex sessions take their settings in args, not: ' + bad.join(', ')), { code: 'EINVAL' });
+      if (!Array.isArray(o.args) || !o.args.every(a => typeof a === 'string'))
+        throw Object.assign(new Error('owned Codex sessions need args (an array of strings)'), { code: 'EINVAL' });
+      if (o.args.some(a => ['resume', '-C', '--cd', '-'].includes(a) || /^--(json|cd=)/.test(a)))
+        throw Object.assign(new Error('args: resume, -C, --json and - are ccbb\'s to add'), { code: 'EINVAL' });
+      if (!o.sessionId) throw Object.assign(new Error('owned Codex sessions need a sessionId'), { code: 'EINVAL' });
+      o.agent = 'codex';
+    }
+    // An owned id is taken over — resumed, forked, or reused as a new session's id — only
+    // with its key. Checked before anything else runs: a refused resume starts nothing.
+    const owners = readOwners();
+    for (const ref of [o.resume, o.sessionId]) {
+      const rec = ref && owners[String(ref)];
+      if (rec && !keyMatches(rec, ctx.key)) {
+        const e = new Error(`session ${String(ref).slice(0, 8)} is driven by ${rec.owner} — resume it there`);
+        e.code = 'EPERM'; e.reason = 'owned'; throw e;
+      }
+    }
+    // Whose the session is, one rule over (the target id's record, the caller's key):
+    //  - the id is owned (resumed in place, or reused as a new session's id): its record
+    //    stays — the key was checked above — and the key is confirmed back;
+    //  - a new id, `owner` set, and a key in the request: that key (64 hex), so a creator
+    //    that stored its key BEFORE asking loses nothing when the reply never arrives (a
+    //    timeout, a restart of either side) — the session is still its to stop and resume;
+    //  - a new id, `owner` set, no key: one is minted and sent back, once, as before.
+    // A caller's key never takes over an owned id: that needs the id's own key (above).
+    const inPlace = o.resume && !o.fork ? owners[String(o.resume)] : null;
+    const sameId = !o.resume && o.sessionId ? owners[String(o.sessionId)] : null;
+    const held = inPlace || sameId;
+    let ownerKey = null;
+    // An owned Codex thread only ever comes back as exec, with its owner's args: the
+    // app-server would resume it on whatever config it last had, or on none.
+    if ((held || owners[String(o.resume || '').replace(/^codex:/, '')]) && o.agent === 'codex' && !exec) {
+      const e = new Error('an owned Codex session is resumed by its owner, with its arguments'); e.code = 'EPERM'; e.reason = 'owned'; throw e;
+    }
+    if (held) { o.ownerRec = { owner: owner || held.owner, keyHash: held.keyHash }; ownerKey = ctx.key; }
+    else if (owner) {
+      if (ctx.key != null && !/^[0-9a-f]{64}$/.test(String(ctx.key)))
+        throw Object.assign(new Error('owner key: 64 hex characters'), { code: 'EINVAL' });
+      ownerKey = ctx.key != null ? String(ctx.key) : crypto.randomBytes(32).toString('hex');
+      o.ownerRec = { owner, keyHash: hashKey(ownerKey) };
+    }
+    // A new session's id that is already in this mux. The same owned id with its key, while
+    // it runs, is a retry of a create whose reply was lost: it gets that session back (no
+    // second child, nothing changed). Anything else is refused — a second Session under one
+    // id would orphan the first's child, and Claude refuses a --session-id it has already
+    // used (an exited one is resumed, not created again).
+    if (o.sessionId && !o.resume && this.sessions.has(String(o.sessionId))) {
+      const cur = this.sessions.get(String(o.sessionId));
+      if (cur.ownerRec && cur.state.status !== 'exited' && keyMatches(cur.ownerRec, ctx.key)) {
+        ctx.ownerKey = ctx.key;
+        return cur;
+      }
+      const e = new Error('session ' + String(o.sessionId).slice(0, 8) + ' is already in this mux — resume it instead');
+      e.code = 'EBUSY'; e.reason = 'id-in-use'; throw e;
+    }
     // compactAt: a size, 'default' (clear), 'remembered' (a restart: whatever the dialog
     // last chose for this binary), or absent (nothing set, nothing remembered). A size or
     // 'default' from a caller is also what the dialog offers for this binary next time.
@@ -1500,14 +1738,37 @@ class Mux {
     let remember = false;
     if (o.compactAt === 'remembered') o.compactAt = rememberedCompactAt(compactBin);
     else if (o.compactAt !== undefined) { o.compactAt = parseCompactAt(o.compactAt); remember = true; }
-    const keep = () => { if (remember) rememberCompactAt(compactBin, o.compactAt ?? null); };
+    // noRemember: a creator that sets Compact at for its own sessions (zdte) is not the
+    // dialog choosing a default for this binary, and must not change what it offers next.
+    const keep = () => { if (remember && !noRemember) rememberCompactAt(compactBin, o.compactAt ?? null); };
     if (o.compactAt == null) delete o.compactAt;
+    else if (exec) o.args = [...o.args, '-c', 'model_auto_compact_token_limit=' + o.compactAt];
     else if (o.agent === 'codex') o.config = { ...(o.config || {}), model_auto_compact_token_limit: o.compactAt };
     // The second name is for the claude.* wrappers, which clear the first before setting
     // up their mode and re-export it from this one.
     else o.env = { ...(o.env || {}), CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(o.compactAt), CCBB_COMPACT_WINDOW: String(o.compactAt) };
     // A remote codex app-server resolves its cwd on its own machine, not this one.
     if (o.cwd && !(o.agent === 'codex' && process.env.CCBB_CODEX_ENDPOINT)) o.cwd = resolveCwd(o.cwd);
+    if (exec) {
+      // Nothing runs until the first submit; the id is the owner's, the thread comes later.
+      if (o.resume && this.sessions.has(String(o.sessionId))) {
+        const cur = this.sessions.get(String(o.sessionId));
+        if (cur.state.status !== 'exited') { const e = new Error('session ' + String(o.sessionId).slice(0, 8) + ' is already running in this mux'); e.code = 'EBUSY'; e.reason = 'running-in-mux'; throw e; }
+      }
+      o.bin = o.bin || 'codex';
+      o.resume = o.resume ? String(o.resume).replace(/^codex:/, '') : null;
+      const { CodexExecSession } = require('./ccbb-codex-exec');
+      const s = new CodexExecSession(this, o);
+      // A resumed thread is the owner's from here on, even one it never owned before (an
+      // M12 thread going live): under both spellings, as a new thread is on its first event.
+      try { for (const id of [s.id, ...(o.resume ? [o.resume, 'codex:' + o.resume] : [])]) setOwner(id, o.ownerRec.owner, o.ownerRec.keyHash); }
+      catch (e) { throw new Error('could not record the owner: ' + e.message); }
+      ctx.ownerKey = ownerKey;
+      this.sessions.set(s.id, s);
+      keep();
+      this.notifyChange();
+      return s;
+    }
     if (o.agent === 'codex') {
       if (!this.codexCreates) this.codexCreates = new Map();
       const key = o.resume && !o.fork ? o.resume.replace(/^codex:/, '') : uuid();
@@ -1547,6 +1808,13 @@ class Mux {
       }
     }
     const s = new Session(this, o);
+    // Persisted before the session is listed: a mux that dies a moment later must still
+    // know, on the way back, that this id is not anyone's to resume.
+    if (o.ownerRec) {
+      try { setOwner(s.id, o.ownerRec.owner, o.ownerRec.keyHash); }
+      catch (e) { s.stop(true, SYS).catch(() => {}); throw new Error('could not record the owner: ' + e.message); }
+      ctx.ownerKey = ownerKey;
+    }
     this.sessions.set(s.id, s);
     keep();
     this.notifyChange();
@@ -1604,6 +1872,13 @@ class Mux {
     };
     const url = new URL(subUrl || req.url, 'http://x');
     const p = url.pathname;
+    // Who is asking, for the two things the mux itself decides: presets on the public
+    // name (create), and the owner key of a locked session. The key is a header, never a
+    // query parameter or a body field — nothing that ends up in a URL, a log or a page.
+    const pub = !!(common.isPublicRequest && common.isPublicRequest(req));
+    const ownerKey = typeof req.headers['x-ccbb-owner-key'] === 'string' ? req.headers['x-ccbb-owner-key'] : null;
+    const owns = s => !s.isOwner || s.isOwner(ownerKey);
+    const errCode = e => e.code === 'EBUSY' ? 409 : e.code === 'EINVAL' ? 400 : e.code === 'EPERM' ? 403 : 500;
 
     if (p === '/api/codex/loaded' && req.method === 'GET') {
       (async () => {
@@ -1643,7 +1918,7 @@ class Mux {
         let agent = /^sso-hlp/i.test(path.basename(String(bin || ''))) ? 'aws' : null;
         try { bin = resolveBin(bin); agent = agent || agentOfBin(bin); if (!agent) throw Object.assign(new Error('the binary’s name must start with claude, codex or sso-hlp'), { code: 'EINVAL' }); }
         catch (e) { return agent === 'aws' ? send(200, { bin, agent, missing: true, loggedIn: false, error: e.message }) : send(400, { error: e.message }); }
-        Promise.resolve(fn(bin, agent)).then(r => send(200, r), e => send(e.code === 'ENOENT' ? 404 : e.code === 'EINVAL' ? 400 : 500, { error: e.message }));
+        Promise.resolve(fn(bin, agent)).then(r => send(200, r), e => send(e.code === 'ENOENT' ? 404 : e.code === 'EINVAL' ? 400 : e.code === 'EBUSY' ? 409 : 500, { error: e.message }));
       };
       if (req.method === 'GET') {
         const bin = url.searchParams.get('bin');
@@ -1656,7 +1931,14 @@ class Mux {
         return req.on('end', () => {
           let o = {}; try { o = JSON.parse(body || '{}'); } catch { return send(400, { error: 'bad json' }); }
           if (!o || typeof o !== 'object') return send(400, { error: 'bad json' });
-          if (p === '/api/agent-auth/login' && req.method === 'POST') return withBin(o.bin, (b, a) => auth.startLogin(b, a, { force: !!o.force }).then(login => ({ login })));
+          if (p === '/api/agent-auth/login' && req.method === 'POST') return withBin(o.bin, (b, a) => {
+            // Signing in again swaps the credentials a running turn is using under it; a
+            // session mid-turn is left to finish first. Any session of that provider —
+            // the credentials are per provider, not per binary.
+            const busy = [...this.sessions.values()].some(x => (x.state.agent || 'claude') === a && x.state.status === 'busy');
+            if (busy) return Promise.reject(Object.assign(new Error(`a ${a} session is busy — sign in again when it is idle`), { code: 'EBUSY' }));
+            return auth.startLogin(b, a, { force: !!o.force }).then(login => ({ login }));
+          });
           if (p === '/api/agent-auth/login' && req.method === 'DELETE') return withBin(o.bin, b => ({ login: auth.cancelLogin(b) }));
           if (p === '/api/agent-auth/login/code' && req.method === 'POST') return withBin(o.bin, b => auth.submitCode(b, o.code || '').then(login => ({ login })));
           send(405, { error: 'method not allowed' });
@@ -1670,27 +1952,62 @@ class Mux {
       req.on('data', d => { body += d; if (body.length > 1e6) req.destroy(); });
       return req.on('end', async () => {
         let o = {}; try { o = JSON.parse(body || '{}'); } catch { return send(400, { error: 'bad json' }); }
-        let s;
-        try { s = await this.create(o); }
-        catch (e) { return send(e.code === 'EBUSY' ? 409 : e.code === 'EINVAL' ? 400 : 500, { error: e.message, reason: e.reason || null }); }
-        send(200, { session: s.state });
+        let s; const ctx = { public: pub, key: ownerKey };
+        try { s = await this.create(o, ctx); }
+        catch (e) { return send(errCode(e), { error: e.message, reason: e.reason || null }); }
+        // ownerKey only here, only for an owned session: the one response it is sent in.
+        send(200, ctx.ownerKey ? { session: s.state, ownerKey: ctx.ownerKey } : { session: s.state });
       });
     }
     const mStop = /^\/api\/sessions\/([^/]+)\/stop$/.exec(p);
     if (mStop && req.method === 'POST') {
       const s = this.get(mStop[1]); if (!s) return send(404, { error: 'no such session' });
+      if (!owns(s)) return send(403, { error: 'this session is driven by its owner — stopping it needs the owner key', reason: 'owned' });
       if (s.agent === 'codex') require('./ccbb-codex-session').forget(s.nativeId);
-      s.stop(url.searchParams.get('force') === '1').then(() => {
+      s.stop(url.searchParams.get('force') === '1', ownerKey).then(() => {
         this.sessions.delete(s.id); send(200, { ok: true });
       }).catch(e => send(409, { error: e.message }));
       return;
+    }
+    // A turn over HTTP — how an owner that is not a page drives its session. One body:
+    // {text, idempotencyKey}. A repeat of an idempotency key this session has already
+    // taken answers what the first one did and submits nothing; a retry after a timeout
+    // is then never a second turn. Kept for the session's life (bounded), not across a
+    // restart: a restarted mux is a new child, and the turn it lost is the owner's to redo.
+    const mSubmit = /^\/api\/sessions\/([^/]+)\/submit$/.exec(p);
+    if (mSubmit && req.method === 'POST') {
+      let body = '';
+      req.on('data', d => { body += d; if (body.length > 1e6) req.destroy(); });
+      return req.on('end', () => {
+        let o; try { o = JSON.parse(body || '{}'); } catch { return send(400, { error: 'bad json' }); }
+        if (!o || typeof o !== 'object' || typeof o.text !== 'string' || !o.text.trim()) return send(400, { error: 'text required' });
+        const idem = o.idempotencyKey == null ? '' : String(o.idempotencyKey);
+        if (idem.length > 200) return send(400, { error: 'idempotencyKey: at most 200 characters' });
+        const s = this.get(mSubmit[1]); if (!s) return send(404, { error: 'no such session' });
+        if (s.ownerRec && !owns(s)) return send(403, { error: 'this session is driven by its owner — submitting over HTTP needs the owner key', reason: 'owned' });
+        const keys = s.submitKeys || (s.submitKeys = new Map());
+        const fail = e => send(errCode(e), { error: e.message });
+        // The promise is what is kept, so a duplicate that arrives while the first is
+        // still in flight waits for that answer instead of racing it.
+        if (idem && keys.has(idem)) return keys.get(idem).then(r => send(200, { ...r, duplicate: true }), fail);
+        if (s.state.status === 'exited') return send(409, { error: 'session has exited' });
+        const run = Promise.resolve().then(() => s.submit(o.text, null, 'http', ownerKey)).then(ok => ({ ok: !!ok, seq: s.seq }));
+        if (idem) {
+          keys.set(idem, run);
+          run.catch(() => keys.delete(idem));          // a refused submit took nothing; a retry may
+          if (keys.size > 1000) keys.delete(keys.keys().next().value);
+        }
+        run.then(r => send(200, r), fail);
+      });
     }
     const mGet = /^\/api\/sessions\/([^/]+)$/.exec(p);
     if (mGet && req.method === 'GET') {
       const s = this.get(mGet[1]); if (!s) return send(404, { error: 'no such session' });
       return send(200, s.snapshot());
     }
-    if (p === '/api/health') return send(200, { ok: true, sessions: this.sessions.size, pid: process.pid });
+    // Where this mux keeps its files: an owner that cleans up after its sessions (zdte deletes
+    // a session's raw log) finds them here rather than guessing from its own environment.
+    if (p === '/api/health') return send(200, { ok: true, sessions: this.sessions.size, pid: process.pid, muxDir: MUX_DIR, configDir: CLAUDE_DIR });
     // The browser client. It is MOUNTED rather than given its own server so the
     // page, its assets and the WebSocket share one origin and one token — and so
     // that adding a second renderer costs the mux exactly this one delegation. It
@@ -1711,6 +2028,8 @@ class Mux {
       // for a browser, which has no process on this host to find.
       pid: Number(url.searchParams.get('pid')) || null,
       window: common.parseWindow(url.searchParams.get('win')),
+      // Arrived on the public name: its `new` is held to presets (Mux.create).
+      public: !!(common.isPublicRequest && common.isPublicRequest(req)),
       session: null,
       send: obj => { if (ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); } catch {} } },
     };
@@ -1740,8 +2059,12 @@ class Mux {
     }
     if (m.op === 'list') return reply({ sessions: this.list() });
     if (m.op === 'new') {
-      let s; try { s = await this.create(m.options || {}); } catch (e) { return reply({ error: e.message, reason: e.reason || null }); }
-      return reply({ session: s.state });
+      // No owner key over the socket: a page never holds one, so an owned id cannot be
+      // resumed or forked from here (create refuses it), and an owner minted here comes
+      // back in this reply only.
+      const ctx = { public: client.public, key: null };
+      let s; try { s = await this.create(m.options || {}, ctx); } catch (e) { return reply({ error: e.message, reason: e.reason || null }); }
+      return reply(ctx.ownerKey ? { session: s.state, ownerKey: ctx.ownerKey } : { session: s.state });
     }
 
     const s = client.session;
@@ -1760,7 +2083,8 @@ class Mux {
           // the ExitPlanMode tool and THEN switches the session to acceptEdits.
           // Doing only the first leaves the next edit prompting again, which
           // reads as the accept not having taken.
-          if (r.ok && m.planMode && s.state.agent !== 'codex') await s.setPermissionMode(m.planMode, client.label);
+          // Not in a locked session: its answer was a deny whatever was asked (answerRequest).
+          if (r.ok && m.planMode && s.state.agent !== 'codex' && !s.ownerRec && !(client.public && m.planMode === 'bypassPermissions')) await s.setPermissionMode(m.planMode, client.label);
           return reply(r);
         }
         return reply(await s.answerRequest(m.requestId, m.payload || { behavior: 'cancelled' }, client.label));
@@ -1774,7 +2098,8 @@ class Mux {
       case 'close': {
         s.detach(client);
         client.session = null;
-        const last = s.clients.size === 0 && s.state.agent !== 'codex';
+        // A locked session's life is its owner's: closing the page only leaves it.
+        const last = s.clients.size === 0 && s.state.agent !== 'codex' && !s.ownerRec;
         reply({ ok: true, stopped: last });
         if (last) s.stop(false).then(() => { this.sessions.delete(s.id); this.notifyChange(); }, () => {});
         return;
@@ -1783,13 +2108,16 @@ class Mux {
       // POST /api/sessions/<id>/stop does, without a client needing the HTTP address and
       // token. Reply first, for the same reason as close.
       case 'stop': {
+        if (s.ownerRec) return reply({ error: ownerError('stopping it').message, reason: 'owned' });
         if (s.agent === 'codex') require('./ccbb-codex-session').forget(s.nativeId);
         reply({ ok: true });
         s.stop(false).then(() => { this.sessions.delete(s.id); this.notifyChange(); }, () => {});
         return;
       }
       case 'interrupt': await s.interrupt(client.label); return reply({ ok: true });
-      case 'set_mode':  await s.setPermissionMode(m.mode, client.label); return reply({ ok: true });
+      case 'set_mode':
+        if (client.public && m.mode === 'bypassPermissions') return reply({ error: 'bypassPermissions is not allowed on the public name' });
+        await s.setPermissionMode(m.mode, client.label); return reply({ ok: true });
       case 'set_model': await s.setModel(m.model, client.label); return reply({ ok: true });
       case 'steer': return reply({ ok: await s.steer(m.text, client.label) });
       case 'rename': await s.rename(m.title); return reply({ ok: true });
@@ -2030,6 +2358,8 @@ function claudeHistory(id, q) {
     if (s._diskModel) s.state.model = s._diskModel;
     s.state.status = 'history';
     s.state.agent = 'claude';
+    // Whose it is, so the page offers "Resume in <owner>" rather than a ▶ that is refused.
+    s.state.owner = ownerOf(id);
     h = { at: Date.now(), session: s };
     claudeHistories.delete(id);
     claudeHistories.set(id, h);
@@ -2043,4 +2373,4 @@ function claudeHistory(id, q) {
 
 module.exports = { parseCompactAt, binKey, runNew, claudeHistory, runStop, agentOfBin, muxSessionsQuiet, resolveRef, pickSession, parseCommand, Mux, Session, buildArgs, answersToUpdatedInput, lineReader,
   TURN_VERBS, SPIN_VERBS, SPIN_FRAMES,
-  muxAddress, MUX_DIR };
+  muxAddress, MUX_DIR, ownerOf, childEnv };

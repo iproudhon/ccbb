@@ -28,6 +28,8 @@
     "ccbb-proxy.js",
     "docs/proxy.md",
     "ccbb-mobile.js",
+    "ccbb-viewport.js",
+    "ccbb-codex-exec.js",
     "LICENSE",
     "ccbb-codex-session.js",
     "ccbb-newsession-ui.js",
