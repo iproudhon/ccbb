@@ -1101,6 +1101,7 @@ function apply(ev) {
     }
     case 'mode':   S.info.permissionMode = ev.permissionMode; return paintChrome();
     case 'model':  S.info.model = ev.model; return paintChrome();
+    case 'compact_at': S.info.compactAt = ev.compactAt; S.info.compactSource = ev.source; return paintChrome();
     case 'commands': S.info.commands = ev.commands || []; return;
     case 'submitted':
       if (!ev.accepted) note('submission refused — the child is not accepting input');

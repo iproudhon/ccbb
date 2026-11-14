@@ -34,6 +34,13 @@ function withOwner(info, id) {
   const owner = muxLib && muxLib.ownerOf ? muxLib.ownerOf(id) : null;
   return owner && info && !info.error ? Object.assign({}, info, { owner }) : info;
 }
+// Compact at as the child reports it (get_context_usage) for a Claude session this mux
+// runs; /proc, Linux only, for one started in a terminal.
+function withMuxProc(proc, id) {
+  const s = mux && mux.sessions.get(id);
+  if (!s || !s.state.compactSource || s.state.status === 'exited') return proc;
+  return Object.assign({ bin: path.basename(s.state.bin || 'claude'), via: '', model: s.state.model }, proc || {}, { compactAt: s.state.compactAt });
+}
 // The phone front-end. Same server, same API, its own page — see ccbb-mobile.js.
 const { mobilePageHtml, isMobileUA, serveVendor, setMuxAssets } = require('./ccbb-mobile');
 const {
@@ -6711,7 +6718,7 @@ function runWeb(args) {
       return send(res, 200, { ok: true });
     }
     if (method === 'GET' && (m = pathname.match(/^\/api\/session-info\/([^/]+)$/)))
-      return send(res, 200, withOwner(getSessionInfo(m[1]), m[1]));
+      return send(res, 200, withOwner((i => i && !i.error ? Object.assign({}, i, { proc: withMuxProc(i.proc, m[1]) }) : i)(getSessionInfo(m[1])), m[1]));
     // History, whole or windowed. `head`/`tail` open a session without shipping its middle;
     // `from`/`to` fill the gap in, or fetch only what was appended since `total`. Plain
     // /history (no params) still returns everything, which is what the bots want.
@@ -6741,7 +6748,7 @@ function runWeb(args) {
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/live$/)))
       return send(res, 200, sessionLiveness(m[1]));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/stats$/)))
-      return send(res, 200, Object.assign({}, getSessionStats(m[1]), { proc: require('./ccbb-common').sessionProc(m[1]) }));
+      return send(res, 200, Object.assign({}, getSessionStats(m[1]), { proc: withMuxProc(require('./ccbb-common').sessionProc(m[1]), m[1]) }));
     if (method === 'GET' && (m = pathname.match(/^\/api\/session\/([^/]+)\/pane$/))) {
       const loc = paneForSession(m[1]);
       return send(res, 200, { pane: loc ? loc.pane : null });

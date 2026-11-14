@@ -637,6 +637,8 @@ class Session {
       try { this.rawLog.end(); } catch {}
     });
     this.child.on('error', e => this.emit('stderr', { text: `spawn failed: ${e.message}` }));
+    // Answered before any turn; init does not come until the first one.
+    this.refreshCompactAt();
     // A resumed session opens with a history that already cost money; a fresh one has a
     // transcript the moment the child writes its first line. Either way the numbers a
     // client shows come from the same place ccbb's own session pages read them.
@@ -964,7 +966,22 @@ class Session {
     const r = await this.control('set_model', { model });
     this.state.model = model;
     this.emit('model', { model, by: from });
+    this.refreshCompactAt();
     return r;
+  }
+
+  // The auto-compact window the child is actually using — env, --autocompact,
+  // /autocompact, settings or the model's own — asked of the child, so it is right on
+  // any OS and after a /model or /autocompact typed mid-session. A child too old to
+  // answer leaves what create() set. Only a change is announced.
+  async refreshCompactAt() {
+    const r = await this.control('get_context_usage', { detail: 'summary' });
+    const u = r && r.subtype === 'success' && r.response;
+    if (!u || !(u.maxTokens > 0)) return;
+    const compactAt = u.isAutoCompactEnabled === false ? 'off' : u.maxTokens;
+    if (compactAt === this.state.compactAt && u.autocompactSource === this.state.compactSource) return;
+    Object.assign(this.state, { compactAt, compactSource: u.autocompactSource || null });
+    this.emit('compact_at', { compactAt, source: this.state.compactSource });
   }
 
   // Graceful close: end the turn first, then let the child drain. A SIGTERM here
@@ -1028,6 +1045,7 @@ class Session {
         this.endTurn();
         this.settlePendingCmd();
         this._firstResult = true;
+        this.refreshCompactAt();
         const u = m.usage || {};
         // Provisional: the turn's own numbers, so the footer moves the instant the turn
         // ends. refreshStats replaces them with the transcript's a moment later, which is

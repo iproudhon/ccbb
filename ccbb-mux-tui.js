@@ -1376,6 +1376,7 @@ class TuiClient {
       case 'mode':  this.state.permissionMode = e.permissionMode;
         this.statusLine.update(this.state, this.lastUsage);
         return this.out(A.gray(`  mode → ${e.permissionMode} (${e.by})`));
+      case 'compact_at': this.state.compactAt = e.compactAt; this.state.compactSource = e.source; return;
       case 'model': this.state.model = e.model;
         this.statusLine.update(this.state, this.lastUsage);
         return this.out(A.gray(`  model → ${e.model} (${e.by})`));
@@ -1419,9 +1420,8 @@ class TuiClient {
         this.state.planWindowsAt = e.at || Date.parse(e.ts) || Date.now();
         this.statusLine.update(this.state, this.lastUsage);
         return this.paint();
-      case 'goal': case 'autocompact':
       case 'tool_pending': return this.pendingTool(e);
-      case 'turn_start': case 'unknown':
+      case 'goal': case 'autocompact': case 'turn_start': case 'unknown':
         return;
       default: return;
     }

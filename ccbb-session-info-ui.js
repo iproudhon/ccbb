@@ -83,7 +83,8 @@ function siGridHtml(m) {
   row('Binary', m.bin ? esc(m.bin) + (m.binNote ? ' ' + dim(esc(m.binNote)) : '') : dim('—'));
   var model = m.model || (st && st.context && st.context.model) || (st && st.models && st.models[0] && st.models[0].model) || '';
   row('Model', model ? esc(prettyModel(model)) + (prettyModel(model) !== model ? ' ' + dim(esc(model)) : '') : dim('—'));
-  row('Compact at', typeof m.compactAt === 'number' ? nsK(m.compactAt) : m.compactAt === 'default' ? 'Default' : dim('—'));
+  row('Compact at', (typeof m.compactAt === 'number' ? nsK(m.compactAt) : m.compactAt === 'default' ? 'Default' : m.compactAt === 'off' ? 'Off' : dim('—'))
+    + (m.compactSource && m.compactAt !== 'default' ? ' ' + dim(esc(m.compactSource)) : ''));
   if (m.mode) row('Mode', esc(m.mode));
   row('Status', m.status || '');
   var started = m.startedAt || (st && st.startedAt), last = (st && st.lastActivity) || m.lastActivity;
@@ -156,7 +157,7 @@ function siMuxModel(c, sessionId) {
   return {
     cwd: c.cwd || i.cwd || '', sessionId: sessionId,
     bin: i.bin || (codex ? 'codex' : 'claude'), model: i.model || null,
-    compactAt: i.compactAt || 'default', mode: c.permissionMode || null, status: status,
+    compactAt: i.compactAt || 'default', compactSource: i.compactSource || null, mode: c.permissionMode || null, status: status,
     clients: (c.clients || []).map(function (x) { return x.label + ' (' + x.kind + ')'; }).join(', '),
     startedAt: i.startedAt, lastActivity: i.lastActivity,
     st: c.stats || siLiveStats(i), sub: c.sub || null, approx: codex, lastAt: i.lastResultAt || 0, extra: extra,
