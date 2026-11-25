@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn, spawnSync } = require('child_process');
+const { spawn, spawnSync, execFile } = require('child_process');
 
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const CONFIG_FILE = path.join(CLAUDE_DIR, 'ccbb-config.json');
@@ -407,8 +407,14 @@ function contextMaxFor(model) { return 200000; }
 //
 //   1. `cachedUsageUtilization` in Claude Code's own .claude.json — free and offline,
 //      but only as fresh as the last time Claude Code itself asked.
-//   2. GET /api/oauth/usage with the OAuth access token from .credentials.json —
-//      always current, at the cost of one authenticated call on the user's login.
+//   2. GET /api/oauth/usage with the OAuth access token — always current, at the cost
+//      of one authenticated call on the user's login. The token lives in .credentials.json
+//      on Linux, but on macOS Claude Code keeps it in the login Keychain ("Claude
+//      Code-credentials") and the file, if present, is a stale leftover; both are read
+//      and the one expiring later wins. The Keychain is read asynchronously and never
+//      on a response's path, at most once a minute — or once an hour after a read fails
+//      for any reason but "not found" (a denied access prompt must not come back every
+//      minute).
 //
 // Both are read; whichever reading is newer wins. (2) refreshes into ccbb's own cache
 // file in the background and NEVER blocks a response — a caller gets the best value on
@@ -458,9 +464,9 @@ function subscriptionAccount() {
     tier: String(a.organizationRateLimitTier || a.userRateLimitTier || ''),
   };
 }
-function oauthCreds() {
+function parseOauth(text) {
   try {
-    const o = (JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8')) || {}).claudeAiOauth;
+    const o = (JSON.parse(text) || {}).claudeAiOauth;
     if (!o || !o.accessToken) return null;
     return {
       token: String(o.accessToken),
@@ -468,6 +474,42 @@ function oauthCreds() {
       subscriptionType: String(o.subscriptionType || ''),
     };
   } catch { return null; }
+}
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+const KEYCHAIN_MAX_AGE_MS = 60 * 1000;
+const KEYCHAIN_BACKOFF_MS = 60 * 60 * 1000;
+const SECURITY_NOT_FOUND = 44;   // `security` exit status for errSecItemNotFound
+let keychainCreds = { at: 0, creds: null, loading: false, retryAt: 0 };
+function keychainDue() {
+  if (process.platform !== 'darwin' || keychainCreds.loading) return false;
+  const now = Date.now();
+  return now >= keychainCreds.retryAt && now - keychainCreds.at > KEYCHAIN_MAX_AGE_MS;
+}
+function refreshKeychainCreds(done) {
+  if (keychainCreds.loading) return;
+  keychainCreds.loading = true;
+  execFile('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
+    { timeout: 3000, maxBuffer: 1 << 20 }, (err, stdout) => {
+      const now = Date.now();
+      // Denied, timed out (a prompt left open), locked keychain…: keep the last good
+      // token and stay away for an hour. Not found just means no Keychain login.
+      const failed = err && err.code !== SECURITY_NOT_FOUND;
+      keychainCreds = {
+        at: now,
+        creds: failed ? keychainCreds.creds : err ? null : parseOauth(String(stdout).trim()),
+        loading: false,
+        retryAt: failed ? now + KEYCHAIN_BACKOFF_MS : 0,
+      };
+      try { done && done(); } catch {}
+    });
+}
+function oauthCreds() {
+  let file = null;
+  try { file = parseOauth(fs.readFileSync(CREDENTIALS_FILE, 'utf8')); } catch {}
+  const kc = keychainCreds.creds;
+  if (!file) return kc;
+  if (!kc) return file;
+  return kc.expiresAt >= file.expiresAt ? kc : file;
 }
 // Both sources return the same payload shape, so one normalizer serves both. Returns
 // null when neither window is present — an empty object would read as "0% used".
@@ -492,8 +534,14 @@ function maybeRefreshUsage() {
     if (fileAgeMs(USAGE_FILE) <= USAGE_MAX_AGE_MS) return;
     if (fileAgeMs(USAGE_ATTEMPT_FILE) <= USAGE_RETRY_MS) return;
     const account = subscriptionAccount();
+    if (!account) return;
+    if (keychainCreds.loading) return;   // its callback re-enters here
+    if (keychainDue()) {
+      refreshKeychainCreds(maybeRefreshUsage);
+      return;
+    }
     const creds = oauthCreds();
-    if (!account || !creds) return;
+    if (!creds) return;
     if (creds.expiresAt && creds.expiresAt <= Date.now()) return;
     usageRefreshing = true;
     // Stamped BEFORE the request, so a hung fetch can't let a second one start.
@@ -537,6 +585,9 @@ function getSubscription() {
   const account = subscriptionAccount();
   if (!account) return null;
   maybeRefreshUsage();
+  // The plan label below comes from the token too; keep it current even while the
+  // usage file is fresh and maybeRefreshUsage() has no reason to look.
+  if (keychainDue()) refreshKeychainCreds(maybeRefreshUsage);
   const readings = [];
   let live = null;
   try { live = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch {}

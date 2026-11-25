@@ -480,6 +480,7 @@ Usage:
   ccbb ls --mux            list only the sessions the mux is running
   ccbb stop [name|id]      end a mux session (ccbb stop -h)
   ccbb hooks <cmd>         install/remove Claude Code prompt-capture hooks (see: ccbb hooks)
+  ccbb autostart <cmd>     install|uninstall|status: run 'ccbb web' at login (macOS)
 
 With no command, 'ls' is assumed.`);
 }
@@ -497,6 +498,7 @@ function main() {
   if (cmd === 'stop') return require('./ccbb-mux').runStop(rest);
   if (cmd === 'attach') return require('./ccbb-mux-tui').runAttach(rest);
   if (cmd === 'hooks') return require('./ccbb-hooks').runHooks(rest);
+  if (cmd === 'autostart') return require('./ccbb-autostart').runAutostart(rest);
   if (cmd === 'web') return require('./ccbb-web').runWeb(rest);
   console.error(`ccbb: unknown command '${cmd}'. Try: ccbb help`);
   process.exit(1);

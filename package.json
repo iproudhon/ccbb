@@ -20,6 +20,7 @@
   "files": [
     "ccbb.js",
     "ccbb-common.js",
+    "ccbb-autostart.js",
     "ccbb-agent-codex.js",
     "ccbb-mux.js",
     "ccbb-mux-tui.js",
